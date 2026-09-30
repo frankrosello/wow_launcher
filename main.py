@@ -4,6 +4,7 @@ import json
 from html.parser import HTMLParser
 import os
 from pathlib import Path
+import plistlib
 import queue
 import re
 import subprocess
@@ -13,12 +14,15 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 import webbrowser
 
 import psutil
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
+
+from addon_manager import AddonManager
 
 
 BG = "#100f12"
@@ -36,13 +40,30 @@ GAME_VERSIONS = (
 # Optional clients: hidden until auto-detected, or added with the EXTRA button in Options.
 EXTRA_VERSIONS = ("Crusader Storm",)
 ALL_VERSIONS = (*GAME_VERSIONS, *EXTRA_VERSIONS)
+# Games started through a loader that may exit once the real client is running.
+LOADER_VERSIONS = ("Crusader Storm",)
+# Several games share WowClassic.exe / Wow.exe, so the exe's file version (major number)
+# decides which game a folder belongs to: 1.x Era, 2.x TBC, 5.x MoP Classic.
+# Only used when auto-detecting folders; a path you chose or saved is always trusted.
+# Crusader Storm is not listed: it is found by its own Crusader-Storm.exe loader.
+CLIENT_MAJOR_VERSIONS = {
+	"Classic Era": (1,),
+	"TBC Anniversary": (2,),
+	"Mists of Pandaria Classic": (5,),
+}
+# Used for playtime when several games claim the same running exe.
+RUNNING_CLIENT_MAJORS = {**CLIENT_MAJOR_VERSIONS, "Crusader Storm": (2,)}
+IS_MAC = sys.platform == "darwin"
+# Windows .exe names first, then the macOS .app bundle names (Mac clients are app bundles).
 EXECUTABLES = {
-	"WoW Forever Beta": ("WowB.exe",),
-	"Retail": ("Wow.exe",),
-	"Classic Era": ("WowClassic.exe",),
-	"Mists of Pandaria Classic": ("WowClassic.exe",),
-	"TBC Anniversary": ("WowClassic.exe",),
-	"Crusader Storm": ("Crusader-Storm.exe",),
+	"WoW Forever Beta": ("WowB.exe", "World of Warcraft Classic Beta.app",
+						 "World of Warcraft Beta.app"),
+	"Retail": ("Wow.exe", "World of Warcraft.app"),
+	"Classic Era": ("WowClassic.exe", "World of Warcraft Classic.app"),
+	"Mists of Pandaria Classic": ("WowClassic.exe", "World of Warcraft Classic.app"),
+	"TBC Anniversary": ("WowClassic.exe", "World of Warcraft Classic.app"),
+	# Its own loader; it starts the client.
+	"Crusader Storm": ("Crusader-Storm.exe", "CrusaderStorm.app"),
 }
 INSTALL_SUBDIRECTORIES = {
 	"WoW Forever Beta": ("_classic_beta_", ""),
@@ -248,7 +269,8 @@ SCAN_HINTS = ("warcraft", "wow", "blizzard", "battle", "game", "classic", "retai
 SCAN_SKIP_NAMES = frozenset((
 	"windows", "$recycle.bin", "system volume information", "programdata", "appdata",
 	"node_modules", ".git", "recovery", "$windows.~bt", "$winreagent", "windowsapps",
-	"winsxs", "perflogs", "msocache", "documents and settings", "intel", "amd"))
+	"winsxs", "perflogs", "msocache", "documents and settings", "intel", "amd",
+	"library", "system", "private", "cores", ".trash", ".fseventsd", ".spotlight-v100"))
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 WOW_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/news"
 WOW_CLASSIC_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/classic"
@@ -291,6 +313,117 @@ def app_dir():
 	return Path(__file__).resolve().parent
 
 
+def in_official_install(path):
+	"""True if the path is inside a 'World of Warcraft' folder (Blizzard's install name)."""
+	parts = re.split(r"[\\/]", str(path))[:-1]
+	# A Mac app called "World of Warcraft.app" is a client, not the install folder.
+	return any("world of warcraft" in part.casefold() and not part.casefold().endswith(".app")
+			   for part in parts)
+
+
+# Flavor folders inside "World of Warcraft": _retail_, _classic_era_, _classic_ (MoP Classic),
+# _classic_beta_ (WoW Forever), _anniversary_ (TBC) and so on. Built from the auto-detect table.
+OFFICIAL_FLAVOR_FOLDERS = {
+	folder.casefold(): version
+	for version in GAME_VERSIONS for folder in AUTO_DETECT_SUBDIRECTORIES[version]}
+
+
+def official_game_for(path):
+	"""Official game for a client at World of Warcraft/<flavor folder>/..., else None."""
+	parts = re.split(r"[\\/]", str(path))
+	for index, part in enumerate(parts):
+		if "world of warcraft" in part.casefold() and not part.casefold().endswith(".app"):
+			for child in parts[index + 1:-1]:
+				game = OFFICIAL_FLAVOR_FOLDERS.get(child.casefold())
+				if game is not None:
+					return game
+			return None
+	return None
+
+
+def path_key(path):
+	"""Comparable form of a path (case-insensitive so Windows and macOS both match)."""
+	return os.path.normcase(os.path.abspath(str(path))).casefold()
+
+
+def client_path(executable):
+	"""A running macOS client is .../Name.app/Contents/MacOS/Name; return the .app itself."""
+	text = str(executable)
+	index = text.lower().find(".app/")
+	return text[:index + 4] if index != -1 else text
+
+
+def is_wow_client(path):
+	"""True for a WoW client: Wow*.exe on Windows, World of Warcraft*.app on macOS."""
+	name = os.path.basename(str(path)).casefold()
+	if name.endswith(".app"):
+		return name.startswith("world of warcraft")
+	return name.startswith("wow") and name.endswith(".exe")
+
+
+def is_client_file(candidate):
+	"""A client is a file, or on macOS an .app bundle (which is a folder)."""
+	return candidate.is_file() or (
+		candidate.suffix.casefold() == ".app" and candidate.is_dir())
+
+
+def bundle_version(path):
+	"""(major, minor, patch, build) from a macOS .app bundle's Info.plist, else None."""
+	try:
+		with open(Path(path) / "Contents" / "Info.plist", "rb") as handle:
+			info = plistlib.load(handle)
+	except Exception:
+		return None
+	text = str(info.get("CFBundleShortVersionString") or info.get("CFBundleVersion") or "")
+	numbers = [int(part) for part in re.findall(r"\d+", text)][:4]
+	return tuple(numbers + [0] * (4 - len(numbers))) if numbers else None
+
+
+_EXE_VERSION_CACHE = {}
+
+
+def exe_version(path):
+	"""(major, minor, patch, build) from a Windows .exe's version resource, else None."""
+	if os.name != "nt":
+		return bundle_version(path) if str(path).casefold().endswith(".app") else None
+	try:
+		key = (str(path), Path(path).stat().st_mtime_ns)
+	except OSError:
+		return None
+	if key in _EXE_VERSION_CACHE:
+		return _EXE_VERSION_CACHE[key]
+	result = None
+	try:
+		import ctypes
+		from ctypes import wintypes
+		version_dll = ctypes.WinDLL("version", use_last_error=True)
+		get_size = version_dll.GetFileVersionInfoSizeW
+		get_size.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD))
+		get_size.restype = wintypes.DWORD
+		get_info = version_dll.GetFileVersionInfoW
+		get_info.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p)
+		get_info.restype = wintypes.BOOL
+		query = version_dll.VerQueryValueW
+		query.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR,
+						  ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT))
+		query.restype = wintypes.BOOL
+		size = get_size(str(path), None)
+		if size:
+			buffer = ctypes.create_string_buffer(size)
+			pointer, length = ctypes.c_void_p(), wintypes.UINT()
+			if (get_info(str(path), 0, size, buffer)
+					and query(buffer, "\\", ctypes.byref(pointer), ctypes.byref(length))
+					and length.value >= 52):
+				# VS_FIXEDFILEINFO: signature, struct version, then FileVersionMS / LS.
+				fields = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32 * 4)).contents
+				most, least = fields[2], fields[3]
+				result = (most >> 16, most & 0xFFFF, least >> 16, least & 0xFFFF)
+	except (AttributeError, OSError, ValueError):
+		result = None
+	_EXE_VERSION_CACHE[key] = result
+	return result
+
+
 # Where the floating panels sit (fractions of the window); shadows are drawn to match.
 HERO_PLACE = {"relx": .045, "rely": .27, "relwidth": .91, "relheight": .56}
 FOOTER_PLACE = {"relx": .045, "rely": .835, "relwidth": .91, "relheight": .125}
@@ -313,41 +446,69 @@ LOGO_SHADOW_LAYERS = (
 )
 
 
+_PANEL_SHADOW_CACHE = {}
+_BUTTON_SHADOW_CACHE = {}
+
+
+def panel_shadow_overlay(size, rects, layers):
+	"""Transparent RGBA image holding just the panel shadows; built once per size."""
+	key = (size, tuple(rects), layers)
+	overlay = _PANEL_SHADOW_CACHE.get(key)
+	if overlay is None:
+		overlay = Image.new("RGBA", size, (0, 0, 0, 0))
+		for offset_x, offset_y, blur, opacity in layers:
+			mask = Image.new("L", size, 0)
+			draw = ImageDraw.Draw(mask)
+			for left, top, right, bottom in rects:
+				draw.rectangle((left + offset_x, top + offset_y,
+								right + offset_x - 1, bottom + offset_y - 1), fill=255)
+			mask = mask.filter(ImageFilter.GaussianBlur(blur)).point(
+				lambda value, opacity=opacity: int(value * opacity))
+			shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+			shadow.putalpha(mask)
+			overlay.alpha_composite(shadow)
+		_PANEL_SHADOW_CACHE[key] = overlay
+	return overlay
+
+
 def add_panel_shadows(image, rects, layers=PANEL_SHADOW_LAYERS):
 	"""Darken the artwork around rectangles so widgets placed over it look like they float."""
 	if not rects:
 		return image
-	for offset_x, offset_y, blur, opacity in layers:
-		mask = Image.new("L", image.size, 0)
-		draw = ImageDraw.Draw(mask)
-		for left, top, right, bottom in rects:
-			draw.rectangle((left + offset_x, top + offset_y,
-							right + offset_x - 1, bottom + offset_y - 1), fill=255)
-		mask = mask.filter(ImageFilter.GaussianBlur(blur)).point(
-			lambda value, opacity=opacity: int(value * opacity))
-		shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
-		shadow.putalpha(mask)
-		image.alpha_composite(shadow)
+	image.alpha_composite(panel_shadow_overlay(image.size, rects, layers))
 	return image
+
+
+def button_shadow_overlay(size, points, layers):
+	"""Shadow around a button outline with the button body left clear; cached per shape."""
+	key = (size, tuple(points), layers)
+	overlay = _BUTTON_SHADOW_CACHE.get(key)
+	if overlay is None:
+		overlay = Image.new("RGBA", size, (0, 0, 0, 0))
+		for offset_x, offset_y, blur, opacity in layers:
+			mask = Image.new("L", size, 0)
+			shifted = [value + (offset_x if index % 2 == 0 else offset_y)
+					   for index, value in enumerate(points)]
+			ImageDraw.Draw(mask).polygon(shifted, fill=255)
+			mask = mask.filter(ImageFilter.GaussianBlur(blur)).point(
+				lambda value, opacity=opacity: int(value * opacity))
+			shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+			shadow.putalpha(mask)
+			overlay.alpha_composite(shadow)
+		body = Image.new("L", size, 0)
+		ImageDraw.Draw(body).polygon(list(points), fill=255)
+		alpha = overlay.getchannel("A")
+		alpha.paste(0, (0, 0), body)
+		overlay.putalpha(alpha)
+		if len(_BUTTON_SHADOW_CACHE) > 200:
+			_BUTTON_SHADOW_CACHE.clear()
+		_BUTTON_SHADOW_CACHE[key] = overlay
+	return overlay
 
 
 def add_button_shadow(image, points, layers=BUTTON_SHADOW_LAYERS):
 	"""Darken `image` around a button outline (flat x, y point list), leaving the body clear."""
-	original = image.copy()
-	for offset_x, offset_y, blur, opacity in layers:
-		mask = Image.new("L", image.size, 0)
-		shifted = [value + (offset_x if index % 2 == 0 else offset_y)
-				   for index, value in enumerate(points)]
-		ImageDraw.Draw(mask).polygon(shifted, fill=255)
-		mask = mask.filter(ImageFilter.GaussianBlur(blur)).point(
-			lambda value, opacity=opacity: int(value * opacity))
-		shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
-		shadow.putalpha(mask)
-		image.alpha_composite(shadow)
-	# Keep the area under the button itself unshadowed so translucent bodies stay clean.
-	body = Image.new("L", image.size, 0)
-	ImageDraw.Draw(body).polygon(list(points), fill=255)
-	image.paste(original, (0, 0), body)
+	image.alpha_composite(button_shadow_overlay(image.size, points, layers))
 	return image
 
 
@@ -899,6 +1060,11 @@ class LauncherUI:
 		self.art_text_fade = 1.0
 		self.running_version = None
 		self.session_started_at = None
+		self.scan_results = queue.Queue()
+		self.learn_requests = queue.Queue()
+		self.scan_running = False
+		self.last_scan_request = float("-inf")
+		self.watches = []
 		self.last_playtime_poll = time.monotonic()
 		self.last_playtime_save = self.last_playtime_poll
 		self.playtime_poll_id = None
@@ -911,6 +1077,11 @@ class LauncherUI:
 		self.refresh_friz_font()
 		self.game_logos = {}
 		self.game_backgrounds = {}
+		self._background_cache = {}
+		self._prewarmed = set()
+		self._slide_cache = {}
+		self._shaded_cache = {}
+		self._news_page_cache = {}
 		self.fallback_logo = self.load_image(resource_path("wow_logo.png"), "RGBA", (1100, 340))
 		self.base_background = self.load_image(resource_path("image.png"), "RGBA", (2200, 1400))
 		self.active_art_version = GAME_VERSIONS[0]
@@ -1146,7 +1317,7 @@ class LauncherUI:
 		actions.place(relx=.41, rely=.08, relwidth=.36, relheight=.84)
 		for label, command in (
 				("OPEN FOLDER", self.open_game_folder),
-				("ADD-ONS", self.open_addons_folder),
+				("ADD-ONS", self.open_addon_manager),
 				("CONFIG", self.open_game_config)):
 			StoneButton(actions, text=label, command=command,
 						font=self.ui_font(8, bold=True), padx=7, pady=5,
@@ -1162,6 +1333,8 @@ class LauncherUI:
 	def load_settings(self):
 		self.playtime_seconds = {version: 0.0 for version in ALL_VERSIONS}
 		self.enabled_extras = set()
+		self.learned_clients = {}
+		self.tracked_clients = {}  # pid -> (game, create_time)
 		self.setup_complete = False
 		try:
 			data = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -1185,6 +1358,12 @@ class LauncherUI:
 			saved_extras = data.get("extras_enabled", [])
 			if isinstance(saved_extras, list):
 				self.enabled_extras = {name for name in saved_extras if name in EXTRA_VERSIONS}
+			saved_clients = data.get("client_exes", {})
+			if isinstance(saved_clients, dict):
+				self.learned_clients = {
+					name: {str(item) for item in items}
+					for name, items in saved_clients.items()
+					if name in LOADER_VERSIONS and isinstance(items, list)}
 			if "setup_complete" in data:
 				self.setup_complete = bool(data["setup_complete"])
 			else:
@@ -1212,6 +1391,11 @@ class LauncherUI:
 			Path("D:/Games/World of Warcraft"),
 		):
 			roots.add(root)
+		if IS_MAC:
+			roots.update((
+				Path("/Applications/World of Warcraft"),
+				Path.home() / "Applications" / "World of Warcraft",
+				Path("/Applications"), Path.home() / "Applications"))
 
 		discovered = []
 		for version, install_path in self.game_paths.items():
@@ -1231,7 +1415,7 @@ class LauncherUI:
 			for root in sorted(roots, key=lambda item: len(item.parts)):
 				for subdirectory in AUTO_DETECT_SUBDIRECTORIES[version]:
 					candidate = root / subdirectory
-					if self.find_executable(version, str(candidate)) is None:
+					if self.find_executable(version, str(candidate), check_version=True) is None:
 						continue
 					found_path = str(candidate)
 					break
@@ -1294,6 +1478,9 @@ class LauncherUI:
 			candidate = folder / executable_name
 			if candidate.is_file():
 				return candidate
+		for app in sorted(folder.glob("World of Warcraft*.app")):
+			if app.is_dir():
+				return app
 		return None
 
 	def dynamic_version_label(self, folder_name):
@@ -1342,7 +1529,7 @@ class LauncherUI:
 		self.hero_subtitle.config(text=self.game_copy["subtitle"])
 		self.art_text, self.art_text_fade = self.slide_text(), 1.0
 		if self.current_art_frame is not None:
-			self.render_art_frame(self.current_art_frame)
+			self.draw_art_text()
 
 	def fade_hero_text(self, title, subtitle):
 		"""Fade the hero title/subtitle out, swap the text, fade it back in."""
@@ -1382,7 +1569,7 @@ class LauncherUI:
 			else:
 				self.art_text, self.art_text_fade = self.slide_text(), 2 * t - 1
 			if self.current_art_frame is not None:
-				self.render_art_frame(self.current_art_frame)
+				self.draw_art_text()
 			if index < steps:
 				self.root.after(35, lambda: step(index + 1))
 
@@ -1394,10 +1581,91 @@ class LauncherUI:
 			sources.append(WOW_CLASSIC_NEWS_URL)
 		return sources
 
+	NEWS_CACHE_SECONDS = 600
+
+	def news_source_articles(self, source_url, allow_network):
+		"""(articles, failed) for one news page, cached for a few minutes. Returns None
+		when a download would be needed but is not allowed."""
+		cached = self._news_page_cache.get(source_url)
+		if cached is not None and time.monotonic() - cached[0] < self.NEWS_CACHE_SECONDS:
+			return [dict(article) for article in cached[1]], False
+		if not allow_network:
+			return None
+		try:
+			request = Request(source_url, headers=NEWS_HEADERS)
+			with urlopen(request, timeout=8) as response:
+				page = response.read(2_000_000).decode("utf-8", "replace")
+		except Exception:
+			return [], True
+		found = []
+		for parser_class in (OfficialNewsParser, NewsLinkParser):
+			if len(found) >= 6:
+				break  # the slower fallback parser is only needed when the first finds little
+			parser = parser_class()
+			try:
+				parser.feed(page)
+				parser.close()
+			except Exception:
+				pass
+			found.extend(parser.items)
+		if found:
+			self._news_page_cache[source_url] = (time.monotonic(), found)
+		return [dict(article) for article in found], not found
+
+	def build_news(self, version, allow_network=True):
+		"""(selected articles, error count, matched) or None if it needs the network."""
+		sources = self.news_sources_for(version)
+		if allow_network:
+			with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+				results = list(pool.map(
+					lambda url: self.news_source_articles(url, True), sources))
+		else:
+			results = [self.news_source_articles(url, False) for url in sources]
+			if any(result is None for result in results):
+				return None
+		articles = {}
+		feed_errors = 0
+		for source_url, (found, failed) in zip(sources, results):
+			feed_errors += 1 if failed else 0
+			for article in found:
+				article["url"] = urljoin(source_url, article["url"])
+				id_match = NEWS_ID_PATTERN.search(article["url"])
+				key = id_match.group(1) if id_match else article["url"]
+				existing = articles.get(key)
+				if existing is None:
+					articles[key] = article
+				elif not existing["summary"] and article["summary"]:
+					existing["summary"] = article["summary"]
+
+		terms = GAME_NEWS_TERMS.get(version, (version.casefold(),))
+		ranked = []
+		for article in articles.values():
+			text = f"{article['title']} {article['summary']}".casefold()
+			for rank, term in enumerate(terms):
+				if term in text:
+					ranked.append((rank, article))
+					break
+		ranked.sort(key=lambda item: item[0])
+		matched = bool(ranked)
+		selected = [article for _rank, article in ranked][:6]
+		for article in articles.values():
+			if len(selected) >= 6:
+				break
+			if article not in selected:
+				selected.append(article)
+		return selected, feed_errors, matched
+
 	def load_game_news(self):
 		version = self.version.get()
 		self.news_generation += 1
 		generation = self.news_generation
+		try:
+			cached = self.build_news(version, allow_network=False)
+		except Exception:
+			cached = None
+		if cached is not None and cached[0]:
+			self.render_game_news(version, *cached)
+			return
 		self.news_status_label.config(text="UPDATING…", fg=self.theme["muted"])
 		self.show_news_message(f"Loading {version} news from Blizzard…")
 		thread = threading.Thread(
@@ -1406,59 +1674,13 @@ class LauncherUI:
 		thread.start()
 
 	def fetch_game_news(self, version, generation):
-		articles = {}
-		feed_errors = 0
-		selected = []
-		matched = False
+		selected, errors, matched = [], 1, False
 		try:
-			for source_url in self.news_sources_for(version):
-				try:
-					request = Request(source_url, headers=NEWS_HEADERS)
-					with urlopen(request, timeout=8) as response:
-						page = response.read(2_000_000).decode("utf-8", "replace")
-				except Exception:
-					feed_errors += 1
-					continue
-				found = []
-				for parser in (OfficialNewsParser(), NewsLinkParser()):
-					try:
-						parser.feed(page)
-						parser.close()
-					except Exception:
-						pass
-					found.extend(parser.items)
-				if not found:
-					feed_errors += 1
-				for article in found:
-					article["url"] = urljoin(source_url, article["url"])
-					id_match = NEWS_ID_PATTERN.search(article["url"])
-					key = id_match.group(1) if id_match else article["url"]
-					existing = articles.get(key)
-					if existing is None:
-						articles[key] = article
-					elif not existing["summary"] and article["summary"]:
-						existing["summary"] = article["summary"]
-
-			terms = GAME_NEWS_TERMS.get(version, (version.casefold(),))
-			ranked = []
-			for article in articles.values():
-				text = f"{article['title']} {article['summary']}".casefold()
-				for rank, term in enumerate(terms):
-					if term in text:
-						ranked.append((rank, article))
-						break
-			ranked.sort(key=lambda item: item[0])
-			matched = bool(ranked)
-			selected = [article for _rank, article in ranked][:6]
-			for article in articles.values():
-				if len(selected) >= 6:
-					break
-				if article not in selected:
-					selected.append(article)
+			selected, errors, matched = self.build_news(version)
 		except Exception:
-			feed_errors += 1
+			pass
 		finally:
-			self.news_queue.put((generation, version, selected, feed_errors, matched))
+			self.news_queue.put((generation, version, selected, errors, matched))
 
 	def poll_news_queue(self):
 		if not self.root.winfo_exists():
@@ -1679,28 +1901,138 @@ class LauncherUI:
 		if animate:
 			self.animate_news_cards(self.news_cards)
 
-	def find_running_game(self):
+	def find_running_game(self, selected):
 		executable_versions = {}
+		folder_versions = {}
+		loader_keys = {}
 		for version in self.game_versions:
 			executable = self.find_executable(version, self.game_paths.get(version, ""))
-			if executable is not None:
-				key = os.path.normcase(os.path.abspath(str(executable)))
+			if executable is None:
+				continue
+			key = path_key(executable)
+			if version in LOADER_VERSIONS:
+				# A custom server's exe is only a loader. It is not counted as playing;
+				# the WoW client it starts is, so remember where to look for that client.
+				loader_keys[key] = version
+				folder_versions[path_key(executable.parent).rstrip(os.sep) + os.sep] = version
+				for learned in tuple(self.learned_clients.get(version, ())):
+					executable_versions.setdefault(path_key(learned), []).append(version)
+			else:
 				executable_versions.setdefault(key, []).append(version)
-		if not executable_versions:
-			return None
-		for process in psutil.process_iter(["exe"]):
+
+		processes = []
+		for process in psutil.process_iter(["pid", "ppid", "name", "exe", "create_time"]):
 			try:
-				process_executable = process.info.get("exe")
+				info = process.info
 			except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
 				continue
-			if not process_executable:
+			if info.get("exe") and info.get("pid") is not None:
+				# macOS clients run as .../Name.app/Contents/MacOS/Name; use the .app.
+				info["exe"] = client_path(info["exe"])
+				processes.append(info)
+
+		# Follow the WoW client a loader starts, by process id, wherever it is installed.
+		live = {info["pid"]: info for info in processes}
+		for pid, (_game, created) in list(self.tracked_clients.items()):
+			info = live.get(pid)
+			if (info is None or info.get("create_time") != created
+					or not self.process_alive(pid)):
+				del self.tracked_clients[pid]
+		loader_pids = {
+			info["pid"]: loader_keys[path_key(info["exe"])]
+			for info in processes if path_key(info["exe"]) in loader_keys}
+		for info in processes:
+			pid = info["pid"]
+			if pid in self.tracked_clients:
 				continue
-			key = os.path.normcase(os.path.abspath(process_executable))
-			matches = executable_versions.get(key)
-			if matches:
-				selected = self.version.get()
-				return selected if selected in matches else matches[0]
+			parent = info.get("ppid")
+			game = loader_pids.get(parent)
+			if game is None and parent in self.tracked_clients:
+				game = self.tracked_clients[parent][0]
+			if (game is not None and is_wow_client(info["exe"])
+					and official_game_for(info["exe"]) is None and self.process_alive(pid)):
+				self.tracked_clients[pid] = (game, info.get("create_time"))
+				self.learn_client(game, info["exe"])
+		for watch in list(self.watches):
+			if time.monotonic() > watch["deadline"]:
+				self.discard_watch(watch)
+				continue
+			for info in processes:
+				executable = info["exe"]
+				if ((info.get("create_time") or 0) < watch["started"] - 2
+						or not is_wow_client(executable)
+						or in_official_install(executable)
+						or path_key(executable) == watch["loader_key"]):
+					continue
+				self.tracked_clients[info["pid"]] = (watch["version"], info.get("create_time"))
+				self.learn_client(watch["version"], executable)
+				self.discard_watch(watch)
+				break
+		if self.tracked_clients:
+			games = {game for game, _created in self.tracked_clients.values()}
+			return selected if selected in games else sorted(games)[0]
+
+		for info in processes:
+			key = path_key(info["exe"])
+			if key in loader_keys:
+				continue
+			# A client inside World of Warcraft/<flavor folder>/ is always the official game
+			# that folder belongs to, whether or not it is configured or started by a loader.
+			official = official_game_for(info["exe"])
+			if official is not None:
+				if is_wow_client(info["exe"]) and self.process_alive(info["pid"]):
+					return official
+				continue
+			candidates = list(executable_versions.get(key, ()))
+			# A client outside World of Warcraft is a custom server's, matched through its
+			# loader's folder.
+			if not in_official_install(info["exe"]) and is_wow_client(info["exe"]):
+				for prefix, game in folder_versions.items():
+					if key.startswith(prefix) and game not in candidates:
+						candidates.append(game)
+			if not candidates or not self.process_alive(info["pid"]):
+				continue
+			if len(candidates) > 1:
+				# Near-identical games sharing an exe (e.g. WowClassic.exe): use its version.
+				candidates = self.narrow_by_version(candidates, info["exe"])
+			return selected if selected in candidates else candidates[0]
 		return None
+
+	def process_alive(self, pid):
+		"""False once a process has really exited. Windows keeps an exited process listed
+		while another process (such as a loader) still holds a handle to it, and Unix keeps
+		an unreaped child as a zombie, so being listed does not mean it is still running."""
+		try:
+			if not psutil.pid_exists(pid):
+				return False
+			return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+		except psutil.AccessDenied:
+			return True  # it exists; we just are not allowed to inspect it
+		except psutil.NoSuchProcess:
+			return False
+
+	def discard_watch(self, watch):
+		try:
+			self.watches.remove(watch)
+		except ValueError:
+			pass
+
+	def learn_client(self, version, executable):
+		"""Queue a custom server's client exe to be remembered (applied on the UI thread)."""
+		if in_official_install(executable):
+			return  # could be mistaken for the official game; it is tracked by pid instead
+		key = path_key(executable)
+		if key not in self.learned_clients.get(version, ()):
+			self.learn_requests.put((version, key))
+
+	def narrow_by_version(self, candidates, executable):
+		"""Keep the games whose expected major version matches the running exe's version."""
+		client = exe_version(executable)
+		if client is None:
+			return candidates
+		fitting = [version for version in candidates
+				   if client[0] in RUNNING_CLIENT_MAJORS.get(version, (client[0],))]
+		return fitting or candidates
 
 	def format_session_time(self, seconds):
 		seconds = max(0, int(seconds))
@@ -1738,20 +2070,55 @@ class LauncherUI:
 			text=self.format_total_time(self.playtime_seconds.get(version, 0)),
 			fg=self.theme["text"])
 
+	def request_process_scan(self):
+		"""Look for running game processes on a worker thread (psutil is slow on Windows)."""
+		if self.scan_running:
+			return
+		self.scan_running = True
+		threading.Thread(target=self.process_scan_worker,
+						 args=(self.version.get(),), daemon=True).start()
+
+	def process_scan_worker(self, selected):
+		try:
+			result = ("ok", self.find_running_game(selected))
+		except Exception as error:  # never let one bad scan stop playtime polling
+			result = ("error", str(error))
+		self.scan_results.put(result)
+
 	def poll_game_processes(self):
 		now = time.monotonic()
 		delta = max(0.0, now - self.last_playtime_poll)
 		self.last_playtime_poll = now
-		running_version = self.find_running_game()
-		if running_version != self.running_version:
-			self.running_version = running_version
-			self.session_started_at = now if running_version is not None else None
-		elif running_version is not None:
-			self.playtime_seconds[running_version] = (
-				self.playtime_seconds.get(running_version, 0.0) + delta)
+		if self.running_version is not None:
+			self.playtime_seconds[self.running_version] = (
+				self.playtime_seconds.get(self.running_version, 0.0) + delta)
+		while True:
+			try:
+				version, key = self.learn_requests.get_nowait()
+			except queue.Empty:
+				break
+			known = self.learned_clients.setdefault(version, set())
+			if key not in known:
+				known.add(key)
+				self.persist_settings()
+		while True:
+			try:
+				kind, value = self.scan_results.get_nowait()
+			except queue.Empty:
+				break
+			self.scan_running = False
+			if kind == "error":
+				self.set_status(f"Playtime check failed: {value}")
+			elif value != self.running_version:
+				self.running_version = value
+				self.session_started_at = now if value is not None else None
+		if not self.scan_running and now - self.last_scan_request >= 2.0:
+			self.last_scan_request = now
+			self.request_process_scan()
 		self.update_playtime_display(now)
 		if now - self.last_playtime_save >= 15:
-			self.persist_settings()
+			if self.running_version is not None:
+				self.persist_settings()
 			self.last_playtime_save = now
 		self.playtime_poll_id = self.root.after(1000, self.poll_game_processes)
 
@@ -1762,6 +2129,8 @@ class LauncherUI:
 				"playtime_seconds": self.playtime_seconds,
 				"setup_complete": self.setup_complete,
 				"extras_enabled": sorted(self.enabled_extras),
+				"client_exes": {name: sorted(paths)
+								for name, paths in self.learned_clients.items()},
 			}, indent=2), encoding="utf-8")
 		except OSError as error:
 			self.set_status(f"Could not save launcher settings: {error}")
@@ -1920,6 +2289,30 @@ class LauncherUI:
 		return rects
 
 	def compose_game_background(self, version, size):
+		key = (version, size)
+		result = self._background_cache.get(key)
+		if result is None:
+			result = self._compose_game_background(version, size)
+			self._background_cache[key] = result
+		return result
+
+	def prewarm_backgrounds(self, size):
+		"""Compose every game's background in the background so switching is instant."""
+		if size in self._prewarmed:
+			return
+		self._prewarmed.add(size)
+		versions = list(self.game_versions)
+
+		def work():
+			for version in versions:
+				try:
+					self.compose_game_background(version, size)
+				except Exception:
+					pass
+
+		threading.Thread(target=work, daemon=True).start()
+
+	def _compose_game_background(self, version, size):
 		width, height = size
 		background_image = self.selected_background(version)
 		if background_image is None:
@@ -1960,11 +2353,9 @@ class LauncherUI:
 		if width <= 1 or height <= 1:
 			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
 			return
-		start = self.current_art_frame or ImageOps.fit(
-			self.slideshow_images[self.slideshow_index - 1], (width, height),
-			method=Image.Resampling.LANCZOS)
-		end = ImageOps.fit(self.slideshow_images[self.slideshow_index], (width, height),
-						method=Image.Resampling.LANCZOS)
+		start = self.current_art_frame or self.fitted_slide(
+			(self.slideshow_index - 1) % len(self.slideshow_images), (width, height))
+		end = self.fitted_slide(self.slideshow_index, (width, height))
 		self.art_transition_generation += 1
 		self.art_transitioning = True
 		self.animate_slideshow_transition(
@@ -1979,7 +2370,11 @@ class LauncherUI:
 			self.art_text, self.art_text_fade = old_text, 1 - 2 * t
 		else:
 			self.art_text, self.art_text_fade = self.slide_text(), 2 * t - 1
-		self.render_art_frame(Image.blend(start, end, t))
+		if t < 1:
+			shaded = Image.blend(self.shade_art(start), self.shade_art(end), t)
+			self.render_art_frame(start, shaded=shaded)
+		else:
+			self.render_art_frame(end)
 		if frame_index < steps:
 			self.slideshow_after_id = self.root.after(
 				35, lambda: self.animate_slideshow_transition(
@@ -1988,7 +2383,15 @@ class LauncherUI:
 			self.art_transitioning = False
 			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
 
-	def find_executable(self, version, install_path):
+	def client_matches(self, version, executable):
+		"""True if the exe's file version fits this game (or can't be read, so we allow it)."""
+		allowed = CLIENT_MAJOR_VERSIONS.get(version)
+		if allowed is None:
+			return True
+		client = exe_version(executable)
+		return client is None or client[0] in allowed
+
+	def find_executable(self, version, install_path, check_version=False):
 		base = Path(install_path).expanduser()
 		if not base.is_dir():
 			return None
@@ -1996,9 +2399,13 @@ class LauncherUI:
 			return self.find_wow_executable(base)
 		for subdirectory in INSTALL_SUBDIRECTORIES.get(version, ("",)):
 			folder = base / subdirectory if subdirectory else base
-			for executable in EXECUTABLES.get(version, ()):
-				candidate = folder / executable
-				if candidate.is_file():
+			candidates = [folder / name for name in EXECUTABLES.get(version, ())]
+			if IS_MAC and subdirectory and version not in LOADER_VERSIONS:
+				# Mac flavor folders hold a "World of Warcraft ... .app"; accept any spelling.
+				candidates.extend(sorted(folder.glob("World of Warcraft*.app")))
+			for candidate in candidates:
+				if is_client_file(candidate) and (
+						not check_version or self.client_matches(version, candidate)):
 					return candidate
 		return None
 
@@ -2018,8 +2425,8 @@ class LauncherUI:
 			self.switch_game_art(version)
 
 	def draw_background_frame(self, frame):
-		self.displayed_background = frame.copy()
-		self._background_photo = ImageTk.PhotoImage(frame, master=self.root)
+		self.displayed_background = frame
+		self._background_photo = ImageTk.PhotoImage(frame.convert("RGB"), master=self.root)
 		self.background.delete("all")
 		self.background.create_image(0, 0, image=self._background_photo, anchor="nw")
 		if self.options_button is not None:
@@ -2115,19 +2522,39 @@ class LauncherUI:
 		def add_extra():
 			"""Pick the extra client's .exe; its row appears here and is enabled on SAVE."""
 			name = EXTRA_VERSIONS[0]
-			executable = EXECUTABLES[name][0]
 			current = entries[name].get().strip() if name in entries else ""
 			initial = current if current and Path(current).is_dir() else str(Path.home())
-			selected = filedialog.askopenfilename(
-				parent=window, initialdir=initial, title=f"Select {executable}",
-				filetypes=[(executable, executable), ("Executables", "*.exe")])
-			if not selected:
-				return
-			if Path(selected).name.casefold() != executable.casefold():
-				options_status.config(text=f"Please choose {executable}.",
-									  fg=self.theme["error"])
-				return
-			folder = str(Path(selected).parent)
+			if IS_MAC:
+				# Mac clients are app bundles (folders), so pick the folder holding the loader.
+				folder = filedialog.askdirectory(
+					parent=window, initialdir=initial, title=f"Select the {name} folder")
+				if not folder:
+					return
+				if self.find_executable(name, folder) is None:
+					options_status.config(
+						text="No " + " or ".join(EXECUTABLES[name][1:]) + " found there.",
+						fg=self.theme["error"])
+					return
+			else:
+				windows_names = [exe for exe in EXECUTABLES[name]
+								 if exe.casefold().endswith(".exe")]
+				selected = filedialog.askopenfilename(
+					parent=window, initialdir=initial, title=f"Select the {name} client",
+					filetypes=[("WoW client", " ".join(windows_names)),
+							   ("Executables", "*.exe")])
+				if not selected:
+					return
+				if Path(selected).name.casefold() not in {n.casefold() for n in windows_names}:
+					options_status.config(
+						text="Please choose " + " or ".join(windows_names) + ".",
+						fg=self.theme["error"])
+					return
+				if not self.client_matches(name, Path(selected)):
+					options_status.config(
+						text=f"That client's version doesn't match {name}.",
+						fg=self.theme["error"])
+					return
+				folder = str(Path(selected).parent)
 			if name in entries:
 				entries[name].set(folder)
 			else:
@@ -2178,7 +2605,8 @@ class LauncherUI:
 			except (AttributeError, OSError):
 				pass
 			return [Path("C:/")]
-		return [Path.home(), Path("/mnt"), Path("/media"), Path("/opt"), Path("/Applications")]
+		return [Path.home(), Path("/mnt"), Path("/media"), Path("/opt"),
+				Path("/Applications"), Path("/Volumes")]
 
 	def scan_for_installs(self, results, cancel):
 		"""Breadth-first search for WoW client folders. Runs in a thread; never touches Tk."""
@@ -2210,7 +2638,7 @@ class LauncherUI:
 					name = entry.name.casefold()
 					if name in folder_versions:
 						for version in folder_versions[name]:
-							if self.find_executable(version, entry.path) is not None:
+							if self.find_executable(version, entry.path, check_version=True) is not None:
 								results.put(("found", version, entry.path))
 						continue
 					child_depth = depth + 1
@@ -2454,6 +2882,7 @@ class LauncherUI:
 		self.active_art_version = self.version.get() if hasattr(self, "version") else GAME_VERSIONS[0]
 		self.draw_background_frame(
 			self.compose_game_background(self.active_art_version, (width, height)))
+		self.prewarm_backgrounds((width, height))
 
 	def draw_art(self, event):
 		canvas = self.art
@@ -2461,12 +2890,14 @@ class LauncherUI:
 		if w <= 1 or h <= 1:
 			return
 		canvas.delete("all")
-		artwork = (self.slideshow_images[self.slideshow_index]
-				   if self.slideshow_images else self.selected_background(self.active_art_version))
+		if self.slideshow_images:
+			artwork = self.fitted_slide(self.slideshow_index, (w, h))
+		else:
+			artwork = self.selected_background(self.active_art_version)
+			if artwork is not None:
+				artwork = ImageOps.fit(artwork, (w, h), method=Image.Resampling.LANCZOS)
 		if artwork is not None:
-			self.current_art_frame = ImageOps.fit(
-				artwork, (w, h), method=Image.Resampling.LANCZOS)
-			self.render_art_frame(self.current_art_frame)
+			self.render_art_frame(artwork)
 			return
 		canvas.create_rectangle(0, 0, w, h, fill=self.theme["panel_alt"], outline="")
 		canvas.create_oval(w*.05, h*.03, w*.9, h*1.15,
@@ -2499,24 +2930,56 @@ class LauncherUI:
 						  fill=self.theme["accent"], font=self.ui_font(12, italic=True),
 						  width=w-36, justify="center")
 
-	def render_art_frame(self, artwork):
+	def fitted_slide(self, index, size):
+		key = (index, size)
+		frame = self._slide_cache.get(key)
+		if frame is None:
+			frame = ImageOps.fit(self.slideshow_images[index], size,
+								 method=Image.Resampling.LANCZOS)
+			self._slide_cache[key] = frame
+		return frame
+
+	def shade_art(self, artwork):
+		"""Darken the lower part of the artwork with real transparency (Tk's canvas stipple
+		is drawn solid on macOS). The result is cached per image and theme."""
+		key = (id(artwork), self.theme["art_shadow"])
+		hit = self._shaded_cache.get(key)
+		if hit is not None and hit[0] is artwork:
+			return hit[1]
 		width, height = artwork.size
+		overlay = Image.new("RGBA", artwork.size, (0, 0, 0, 0))
+		ImageDraw.Draw(overlay).rectangle(
+			(0, int(height * .69), width, height),
+			fill=(*hex_rgb(self.theme["art_shadow"]), 128))
+		result = Image.alpha_composite(artwork.convert("RGBA"), overlay).convert("RGB")
+		if len(self._shaded_cache) > 12:
+			self._shaded_cache.clear()
+		self._shaded_cache[key] = (artwork, result)
+		return result
+
+	def render_art_frame(self, artwork, shaded=None):
 		self.current_art_frame = artwork
-		self.art_photo = ImageTk.PhotoImage(artwork, master=self.root)
+		if shaded is None:
+			shaded = self.shade_art(artwork)
+		self.art_photo = ImageTk.PhotoImage(shaded, master=self.root)
 		self.art.delete("all")
 		self.art.create_image(0, 0, image=self.art_photo, anchor="nw")
-		self.art.create_rectangle(0, height*.69, width, height, fill=self.theme["art_shadow"],
-							  stipple="gray50", outline="")
+		self.draw_art_text()
+
+	def draw_art_text(self):
+		"""(Re)draw just the headline and tagline; the image is left untouched."""
+		width, height = self.art.winfo_width(), self.art.winfo_height()
+		self.art.delete("art_text")
 		headline, tagline = self.art_text
 		fade = self.art_text_fade
-		if fade > .03:
+		if fade > .03 and width > 1:
 			self.art.create_text(width*.5, height*.79, text=headline,
 							 fill=blend_hex(self.theme["art_shadow"], self.theme["bright"], fade),
-							 font=self.ui_font(16, bold=True),
+							 font=self.ui_font(16, bold=True), tags="art_text",
 							 width=width-36, justify="center")
 			self.art.create_text(width*.5, height*.88, text=tagline,
 							 fill=blend_hex(self.theme["art_shadow"], self.theme["accent"], fade),
-							 font=self.ui_font(12, italic=True),
+							 font=self.ui_font(12, italic=True), tags="art_text",
 							 width=width-36, justify="center")
 
 	def selected_game_directory(self):
@@ -2563,6 +3026,12 @@ class LauncherUI:
 		if directory is not None:
 			self.open_directory(directory / "Interface" / "AddOns", "AddOns")
 
+	def open_addon_manager(self):
+		directory = self.selected_game_directory()
+		if directory is not None:
+			AddonManager(self, directory / "Interface" / "AddOns",
+						 self.version.get(), StoneButton)
+
 	def open_game_config(self):
 		directory = self.selected_game_directory()
 		if directory is not None:
@@ -2585,12 +3054,24 @@ class LauncherUI:
 				parent=self.root)
 			return
 		try:
-			subprocess.Popen([str(executable)], cwd=str(executable.parent))
+			# macOS clients are .app bundles, which are opened rather than executed directly.
+			command = (["open", str(executable)] if executable.suffix.casefold() == ".app"
+					   else [str(executable)])
+			subprocess.Popen(command, cwd=str(executable.parent))
 		except OSError as error:
 			self.set_status(f"Could not start {version}")
 			messagebox.showerror("Could not launch game", str(error), parent=self.root)
 			return
 		self.set_status(f"Launching {version}…")
+		if version in LOADER_VERSIONS:
+			self.watch_for_client(version, executable)
+
+	def watch_for_client(self, version, loader):
+		"""After a loader launch, watch for the WoW client it starts (it may live outside
+		the loader's folder). The background process scan does the checking."""
+		self.watches.append({
+			"version": version, "loader_key": path_key(loader),
+			"started": time.time(), "deadline": time.monotonic() + 90})
 
 	def set_status(self, message):
 		self.status.config(text=message)
