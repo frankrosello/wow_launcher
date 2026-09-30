@@ -1,0 +1,17 @@
+{
+  "game_paths": {
+    "WoW Forever Beta": "D:/World of Warcraft/_classic_beta_",
+    "Retail": "",
+    "Classic Era": "D:/World of Warcraft/_classic_era_",
+    "Mists of Pandaria Classic": "",
+    "TBC Anniversary": "D:/World of Warcraft/_anniversary_"
+  },
+  "playtime_seconds": {
+    "WoW Forever Beta": 0.0,
+    "Retail": 0.0,
+    "Classic Era": 62.986840100000336,
+    "Mists of Pandaria Classic": 79.99048539999785,
+    "TBC Anniversary": 0.0
+  },
+  "setup_complete": true
+}
