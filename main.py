@@ -1159,9 +1159,6 @@ class LauncherUI:
 		self.status = tk.Label(root, text="Launcher ready", bg=BG, fg=MUTED,
 							   font=self.ui_font(8))
 		self.status.place(relx=.046, rely=.985, anchor="sw")
-		self.credit = tk.Label(root, text="Created by Frank Rosello, version 1.0", bg=BG,
-							   fg=MUTED, font=self.ui_font(8))
-		self.credit.place(relx=.954, rely=.985, anchor="se")
 		self.root.protocol("WM_DELETE_WINDOW", self.close_launcher)
 		self.playtime_poll_id = self.root.after(1000, self.poll_game_processes)
 		self.news_poll_id = self.root.after(250, self.poll_news_queue)
@@ -2587,8 +2584,27 @@ class LauncherUI:
 		self._background_photo = ImageTk.PhotoImage(frame.convert("RGB"), master=self.root)
 		self.background.delete("all")
 		self.background.create_image(0, 0, image=self._background_photo, anchor="nw")
+		self.draw_credit()
 		if self.options_button is not None:
 			self.options_button.redraw()
+
+	def draw_credit(self):
+		"""White credit text with a drop shadow, drawn straight onto the background art."""
+		width, height = self.background.winfo_width(), self.background.winfo_height()
+		if width <= 1 or height <= 1:
+			return
+		self.background.delete("credit")
+		x, y = width * .954, height * .985
+		font = self.ui_font(8, bold=True)
+		text = "Created by Frank Rosello, version 1.0"
+		for offset_x in range(4):
+			for offset_y in range(4):
+				if offset_x or offset_y:
+					self.background.create_text(
+						x + offset_x, y + offset_y, text=text, fill="#000000",
+						font=font, anchor="se", tags="credit")
+		self.background.create_text(x, y, text=text, fill="#ffffff", font=font,
+									anchor="se", tags="credit")
 
 	def switch_game_art(self, version):
 		self.active_art_version = version
