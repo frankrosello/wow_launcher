@@ -1,11 +1,11 @@
 {
   "game_paths": {
-    "WoW Forever Beta": "/Applications/World of Warcraft/_classic_beta_",
+    "WoW Forever Beta": "D:/World of Warcraft/_classic_beta_",
     "Retail": "",
-    "Classic Era": "/Applications/World of Warcraft/_classic_era_",
+    "Classic Era": "D:/World of Warcraft/_classic_era_",
     "Mists of Pandaria Classic": "",
-    "TBC Anniversary": "",
-    "Crusader Storm": "/Users/frankrosello/Downloads/Crusader-Storm"
+    "TBC Anniversary": "D:\\World of Warcraft\\_anniversary_",
+    "Crusader Storm": ""
   },
   "playtime_seconds": {
     "WoW Forever Beta": 159.00995974999387,
@@ -16,9 +16,7 @@
     "Crusader Storm": 79.05153341699042
   },
   "setup_complete": true,
-  "extras_enabled": [
-    "Crusader Storm"
-  ],
+  "extras_enabled": [],
   "client_exes": {
     "Crusader Storm": [
       "/users/frankrosello/downloads/crusader-storm/_classic_/world of warcraft classic.app"

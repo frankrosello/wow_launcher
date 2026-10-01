@@ -1,0 +1,1 @@
+Launcher-sized background previews are stored here to keep game switching responsive. They are derived from the full-resolution source images in the parent folder and rendered at the launcher's fixed 1100x700 size. If a preview is missing, the launcher loads the source image instead.

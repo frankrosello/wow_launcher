@@ -20,9 +20,9 @@ from urllib.request import Request, urlopen
 import webbrowser
 
 import psutil
-from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
-from addon_manager import AddonManager
+from addon_manager import AddonManager, Overlay
 
 
 BG = "#100f12"
@@ -417,7 +417,14 @@ def exe_version(path):
 				# VS_FIXEDFILEINFO: signature, struct version, then FileVersionMS / LS.
 				fields = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32 * 4)).contents
 				most, least = fields[2], fields[3]
-				result = (most >> 16, most & 0xFFFF, least >> 16, least & 0xFFFF)
+				major_word, minor_word = most >> 16, most & 0xFFFF
+				patch_word, build_digit = least >> 16, least & 0xFFFF
+				if major_word >= 100:
+					# WoW stores 1.15 as 115, 2.5 as 205, and 1.60 as 160.
+					major, minor = divmod(major_word, 100)
+					result = (major, minor, minor_word, patch_word * 10 + build_digit)
+				else:
+					result = (major_word, minor_word, patch_word, build_digit)
 	except (AttributeError, OSError, ValueError):
 		result = None
 	_EXE_VERSION_CACHE[key] = result
@@ -448,6 +455,7 @@ LOGO_SHADOW_LAYERS = (
 
 _PANEL_SHADOW_CACHE = {}
 _BUTTON_SHADOW_CACHE = {}
+_ROUNDED_MASK_CACHE = {}
 
 
 def panel_shadow_overlay(size, rects, layers):
@@ -559,6 +567,32 @@ def make_gradient(width, height, top, bottom):
 		tuple(round(a + (b - a) * (y / max(1, height - 1))) for a, b in zip(top, bottom))
 		for y in range(height)])
 	return column.resize((width, height), Image.Resampling.NEAREST)
+
+
+def make_rounded_mask(width, height, radius, scale=3):
+	"""Build a smooth rounded-rectangle mask by supersampling only the four corners."""
+	radius = max(1, min(radius, width // 2, height // 2))
+	extent = radius + 1
+	corner_size = extent * 2
+	large_size = corner_size * scale
+	corner = Image.new("L", (large_size, large_size), 0)
+	ImageDraw.Draw(corner).rounded_rectangle(
+		(0, 0, large_size - 1, large_size - 1),
+		radius=radius * scale, fill=255)
+	corner = corner.resize((corner_size, corner_size), Image.Resampling.LANCZOS)
+	corner = corner.crop((0, 0, extent, extent))
+	mask = Image.new("L", (width, height), 0)
+	mask.paste(corner, (0, 0))
+	mask.paste(corner.transpose(Image.Transpose.FLIP_LEFT_RIGHT), (width - extent, 0))
+	mask.paste(corner.transpose(Image.Transpose.FLIP_TOP_BOTTOM), (0, height - extent))
+	mask.paste(corner.transpose(Image.Transpose.ROTATE_180),
+				(width - extent, height - extent))
+	draw = ImageDraw.Draw(mask)
+	if width > 2 * extent:
+		draw.rectangle((extent, 0, width - extent - 1, height - 1), fill=255)
+	if height > 2 * extent:
+		draw.rectangle((0, extent, width - 1, height - extent - 1), fill=255)
+	return mask
 
 
 class OfficialNewsParser(HTMLParser):
@@ -725,7 +759,6 @@ class StoneButton(tk.Canvas):
 		self.bind("<Button-1>", lambda _event: self.focus_set(), add="+")
 		self.bind("<FocusIn>", self.redraw)
 		self.bind("<FocusOut>", self.redraw)
-		self.update_idletasks()
 		self.configure(
 			width=self.button_font.measure(text) + padx * 2 + 24 + BUTTON_SHADOW_PAD * 2,
 			height=self.button_font.metrics("linespace") + pady * 2 + 18 + BUTTON_SHADOW_PAD * 2)
@@ -765,16 +798,25 @@ class StoneButton(tk.Canvas):
 		self.create_line(inset + cut + 2, inset + 4,
 					 width - inset - cut - 2, inset + 4,
 					 fill="#a2a49f", width=1)
-		self.create_polygon(
+		face_points = (
 			inset + cut + 2, inset + 6, width - inset - cut - 2, inset + 6,
 			width - inset - 6, inset + cut + 2, width - inset - 6,
 			height - inset - cut - 2, width - inset - cut - 2, height - inset - 6,
 			inset + cut + 2, height - inset - 6,
 			inset + 6, height - inset - cut - 2, inset + 6, inset + cut + 2,
-			fill=button_theme.get("button_pressed", BUTTON_RED_PRESSED) if self.pressed else (
-				button_theme.get("button_hover", BUTTON_RED_HOVER) if self.hovered
-				else button_theme.get("button_face", BUTTON_RED)),
-			outline="#170d0b", width=1)
+		)
+		face = button_theme.get("button_pressed", BUTTON_RED_PRESSED) if self.pressed else (
+			button_theme.get("button_hover", BUTTON_RED_HOVER) if self.hovered
+			else button_theme.get("button_face", BUTTON_RED))
+		face_gradient = make_gradient(
+			width, height, hex_rgb(shade(face, .2)), hex_rgb(shade(face, -.3)))
+		face_mask = Image.new("L", (width, height), 0)
+		ImageDraw.Draw(face_mask).polygon(face_points, fill=255)
+		face_image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+		face_image.paste(face_gradient, (0, 0), face_mask)
+		self._face_photo = ImageTk.PhotoImage(face_image, master=self)
+		self.create_image(0, 0, image=self._face_photo, anchor="nw")
+		self.create_polygon(*face_points, fill="", outline="#170d0b", width=1)
 		self.create_line(inset + cut + 4, inset + 7,
 					 width - inset - cut - 4, inset + 7,
 					 fill=button_theme.get("button_highlight", "#a52217"), width=1)
@@ -1051,6 +1093,7 @@ class LauncherUI:
 		self.last_news = None
 		self.news_layout_height = 0
 		self.news_resize_id = None
+		self.selection_generation = 0
 		self.dynamic_versions = {}
 		self.game_paths = self.load_settings()
 		self.discovered_versions = self.discover_game_versions()
@@ -1079,8 +1122,16 @@ class LauncherUI:
 		self.game_backgrounds = {}
 		self._background_cache = {}
 		self._prewarmed = set()
+		self._background_executor = ThreadPoolExecutor(max_workers=1)
+		self._background_future = None
+		self._background_queue = queue.Queue()
+		self._background_frames = None
+		self._background_frame_index = 0
+		self._background_requested = None
+		self._background_poll_id = None
 		self._slide_cache = {}
 		self._shaded_cache = {}
+		self._art_mask_cache = {}
 		self._news_page_cache = {}
 		self.fallback_logo = self.load_image(resource_path("wow_logo.png"), "RGBA", (1100, 340))
 		self.base_background = self.load_image(resource_path("image.png"), "RGBA", (2200, 1400))
@@ -1108,9 +1159,13 @@ class LauncherUI:
 		self.status = tk.Label(root, text="Launcher ready", bg=BG, fg=MUTED,
 							   font=self.ui_font(8))
 		self.status.place(relx=.046, rely=.985, anchor="sw")
+		self.credit = tk.Label(root, text="Created by Frank Rosello, version 1.0", bg=BG,
+							   fg=MUTED, font=self.ui_font(8))
+		self.credit.place(relx=.954, rely=.985, anchor="se")
 		self.root.protocol("WM_DELETE_WINDOW", self.close_launcher)
 		self.playtime_poll_id = self.root.after(1000, self.poll_game_processes)
 		self.news_poll_id = self.root.after(250, self.poll_news_queue)
+		self._background_poll_id = self.root.after(30, self.poll_background_queue)
 		self.update_install_status()
 		self.apply_theme(GAME_VERSIONS[0])
 		self.update_game_copy()
@@ -1191,6 +1246,82 @@ class LauncherUI:
 		surface.adopt()
 		return surface
 
+	def add_rounded_surface(self, frame, role, radius=8):
+		outside = str(frame.master.cget("bg"))
+		frame.configure(bg=outside, bd=0, highlightthickness=0)
+		canvas = tk.Canvas(frame, bg=outside, highlightthickness=0, bd=0)
+		canvas.place(x=0, y=0, relwidth=1, relheight=1)
+		canvas.tk.call("lower", canvas._w)
+		section = {"frame": frame, "canvas": canvas, "role": role,
+				   "outside": outside, "radius": radius, "backdrop_photo": None}
+		if not hasattr(self, "rounded_sections"):
+			self.rounded_sections = []
+			self.root.bind("<Configure>", self.refresh_rounded_surfaces, add="+")
+		self.rounded_sections.append(section)
+		frame.bind("<Configure>", self.refresh_rounded_surfaces, add="+")
+		self.draw_rounded_surface(section)
+		return section
+
+	def draw_rounded_surface(self, section):
+		frame, canvas = section["frame"], section["canvas"]
+		if not frame.winfo_exists():
+			return
+		width, height = frame.winfo_width(), frame.winfo_height()
+		if width < 4 or height < 4:
+			return
+		theme = self.theme
+		section["outside"] = str(frame.master.cget("bg"))
+		fill = theme[section["role"]]
+		border = blend_hex(fill, theme["border"], .32)
+		position = (frame.winfo_x(), frame.winfo_y())
+		backdrop_key = id(self.displayed_background) if frame.master is self.root else None
+		signature = (width, height, position, section["outside"], fill, border, backdrop_key)
+		if section.get("signature") == signature:
+			return
+		canvas.configure(bg=section["outside"], width=width, height=height)
+		canvas.delete("all")
+		if frame.master is self.root and self.displayed_background is not None:
+			x, y = frame.winfo_x(), frame.winfo_y()
+			x2 = min(x + width, self.displayed_background.width)
+			y2 = min(y + height, self.displayed_background.height)
+			if x >= 0 and y >= 0 and x2 > x and y2 > y:
+				backdrop = self.displayed_background.crop((x, y, x2, y2))
+				if backdrop.size != (width, height):
+					padded = Image.new("RGBA", (width, height), section["outside"])
+					padded.alpha_composite(backdrop, (0, 0))
+					backdrop = padded
+				section["backdrop_photo"] = ImageTk.PhotoImage(backdrop, master=canvas)
+				canvas.create_image(0, 0, image=section["backdrop_photo"], anchor="nw")
+		mask_key = (width, height, section["radius"])
+		masks = _ROUNDED_MASK_CACHE.get(mask_key)
+		if masks is None:
+			outer = make_rounded_mask(width, height, section["radius"])
+			inner = make_rounded_mask(width - 2, height - 2,
+									  max(1, section["radius"] - 1))
+			padded_inner = Image.new("L", (width, height), 0)
+			padded_inner.paste(inner, (1, 1))
+			inner = padded_inner
+			masks = (inner, ImageChops.subtract(outer, inner))
+			if len(_ROUNDED_MASK_CACHE) >= 12:
+				_ROUNDED_MASK_CACHE.clear()
+			_ROUNDED_MASK_CACHE[mask_key] = masks
+		image = Image.new("RGBA", (width, height), (*hex_rgb(fill), 0))
+		image.putalpha(masks[0])
+		outline = Image.new("RGBA", (width, height), (*hex_rgb(border), 0))
+		outline.putalpha(masks[1])
+		image.alpha_composite(outline)
+		section["photo"] = ImageTk.PhotoImage(image, master=canvas)
+		canvas.create_image(0, 0, image=section["photo"], anchor="nw")
+		canvas.tk.call("lower", canvas._w)
+		section["signature"] = signature
+
+	def refresh_rounded_surfaces(self, _event=None):
+		for section in getattr(self, "rounded_sections", ()):
+			try:
+				self.draw_rounded_surface(section)
+			except tk.TclError:
+				continue
+
 	def clear_children(self, frame):
 		for child in frame.winfo_children():
 			if not getattr(child, "_gradient_bg", False):
@@ -1220,17 +1351,16 @@ class LauncherUI:
 		return patch
 
 	def build_hero(self):
-		self.hero = tk.Frame(self.root, bg=PANEL, highlightbackground="#806b42",
-							 highlightthickness=2)
+		self.hero = tk.Frame(self.root, bg=PANEL, bd=0, highlightthickness=0)
 		self.hero.place(**HERO_PLACE)
 
-		self.art = tk.Canvas(self.hero, bg="#171820", highlightthickness=0)
-		self.art.place(relwidth=.49, relheight=1)
+		self.art = tk.Canvas(self.hero, bg="#211c18", highlightthickness=0)
+		self.art.place(x=2, y=2, relwidth=.49, relheight=1, height=-4)
 		self.art.bind("<Configure>", self.draw_art)
 
-		panel = tk.Frame(self.hero, bg="#211c18", highlightbackground="#8a7044",
-						highlightthickness=1)
-		panel.place(relx=.49, relwidth=.51, relheight=1)
+		panel = tk.Frame(self.hero, bg="#211c18", bd=0, highlightthickness=0)
+		panel.place(relx=.49, x=2, y=2, relwidth=.51, relheight=1,
+					width=-4, height=-4)
 
 		inner = tk.Frame(panel, bg="#211c18")
 		inner.pack(fill="both", expand=True, padx=24, pady=12)
@@ -1257,30 +1387,27 @@ class LauncherUI:
 		self.version_menu = version_menu
 		version_menu.pack(fill="x")
 
-		news = tk.Frame(inner, bg="#171512", highlightbackground="#51432f",
-						highlightthickness=1, padx=10, pady=5)
+		news = tk.Frame(inner, bg="#211c18", bd=0, highlightthickness=0, padx=0, pady=0)
 		news.pack(fill="both", expand=True, pady=(8, 0))
-		news_header = tk.Frame(news, bg="#171512")
+		news_header = tk.Frame(news, bg="#211c18")
 		news_header.pack(fill="x", pady=(0, 2))
-		tk.Label(news_header, text="\u25c6  LATEST NEWS", bg="#171512", fg=GOLD,
+		tk.Label(news_header, text="\u25c6  LATEST NEWS", bg="#211c18", fg=GOLD,
 				 font=self.ui_font(8, bold=True)).pack(side="left")
 		self.news_status_label = tk.Label(news_header, text="CONNECTING…",
-									  bg="#171512", fg=MUTED,
+									  bg="#211c18", fg=MUTED,
 									  font=self.ui_font(7))
 		self.news_status_label.pack(side="right")
-		self.news_items_frame = tk.Frame(news, bg="#171512")
+		self.news_items_frame = tk.Frame(news, bg="#211c18")
 		self.news_items_frame.pack(fill="both", expand=True)
 		self.news_items_frame.bind("<Configure>", self.on_news_area_resized)
-		self.news_surface = self.add_gradient(news, "panel_alt")
 		self.show_news_message("Fetching official news…")
-		self.add_gradient(panel, "panel")
+		self.add_rounded_surface(self.hero, "panel", radius=10)
 
 	def build_footer(self):
-		footer = tk.Frame(self.root, bg="#181614", highlightbackground="#806b42",
-						  highlightthickness=2)
+		footer = tk.Frame(self.root, bg="#181614", bd=0, highlightthickness=0)
 		footer.place(**FOOTER_PLACE)
 
-		playtime = tk.Frame(footer, bg="#181614", highlightthickness=0,
+		playtime = tk.Frame(footer, bg="#181614", bd=0, highlightthickness=0,
 							padx=12, pady=3)
 		playtime.place(relx=.018, rely=.05, relwidth=.37, relheight=.9)
 		playtime_header = tk.Frame(playtime, bg="#181614")
@@ -1328,7 +1455,8 @@ class LauncherUI:
 							font=self.ui_font(16, bold=True), padx=22, pady=8,
 							bg="#181614", theme_provider=lambda: self.theme)
 		self.play.place(relx=.98, rely=.5, relwidth=.2, relheight=.92, anchor="e")
-		self.add_gradient(footer, "surface")
+		self.playtime_surface = self.add_rounded_surface(playtime, "surface", radius=7)
+		self.add_rounded_surface(footer, "surface", radius=9)
 
 	def load_settings(self):
 		self.playtime_seconds = {version: 0.0 for version in ALL_VERSIONS}
@@ -1535,7 +1663,7 @@ class LauncherUI:
 		"""Fade the hero title/subtitle out, swap the text, fade it back in."""
 		self.hero_text_generation += 1
 		generation = self.hero_text_generation
-		half = 6
+		half = 3
 
 		def step(index):
 			if generation != self.hero_text_generation or not self.root.winfo_exists():
@@ -1547,7 +1675,7 @@ class LauncherUI:
 			for label, role in ((self.hero_title, "accent"), (self.hero_subtitle, "muted")):
 				label.config(fg=blend_hex(str(label.cget("bg")), self.theme[role], k))
 			if index < half * 2:
-				self.root.after(30, lambda: step(index + 1))
+				self.root.after(20, lambda: step(index + 1))
 
 		step(0)
 
@@ -1555,7 +1683,7 @@ class LauncherUI:
 		"""Cross-fade the text over the artwork when the game version changes."""
 		self.art_text_generation += 1
 		generation = self.art_text_generation
-		old, steps = self.art_text, 10
+		old, steps = self.art_text, 6
 		if self.art_transitioning:
 			# The slideshow is already animating the text; it picks up the new copy.
 			return
@@ -1571,7 +1699,7 @@ class LauncherUI:
 			if self.current_art_frame is not None:
 				self.draw_art_text()
 			if index < steps:
-				self.root.after(35, lambda: step(index + 1))
+				self.root.after(20, lambda: step(index + 1))
 
 		step(1)
 
@@ -1659,13 +1787,6 @@ class LauncherUI:
 		version = self.version.get()
 		self.news_generation += 1
 		generation = self.news_generation
-		try:
-			cached = self.build_news(version, allow_network=False)
-		except Exception:
-			cached = None
-		if cached is not None and cached[0]:
-			self.render_game_news(version, *cached)
-			return
 		self.news_status_label.config(text="UPDATING…", fg=self.theme["muted"])
 		self.show_news_message(f"Loading {version} news from Blizzard…")
 		thread = threading.Thread(
@@ -1699,21 +1820,28 @@ class LauncherUI:
 		self.last_news = None
 		self.news_anim_generation += 1
 		self.clear_children(self.news_items_frame)
-		label = tk.Label(self.news_items_frame, text=message, bg="#171512", fg=self.theme["muted"],
+		label = tk.Label(self.news_items_frame, text=message, bg="#211c18", fg=self.theme["muted"],
 				 font=self.ui_font(8, italic=True), anchor="w", justify="left",
 				 wraplength=405)
 		label.pack(fill="x", pady=(3, 0))
-		self.news_surface.track(label)
 
 	def fit_text(self, text, font, width, max_lines):
 		"""Wrap text to the pixel width and end with an ellipsis if it needs more lines."""
 		def clip(line):
 			if font.measure(line) <= width:
 				return line
-			while line and font.measure(line + "\u2026") > width:
-				line = line[:-1]
-			return line.rstrip() + "\u2026"
+			low, high = 0, len(line)
+			while low < high:
+				middle = (low + high + 1) // 2
+				if font.measure(line[:middle].rstrip() + "\u2026") <= width:
+					low = middle
+				else:
+					high = middle - 1
+			return line[:low].rstrip() + "\u2026"
 
+		text = " ".join(str(text).split())
+		if len(text) > 4000:
+			text = text[:4000].rsplit(" ", 1)[0] + "\u2026"
 		lines, current, truncated = [], "", False
 		for word in text.split():
 			candidate = f"{current} {word}".strip()
@@ -1743,7 +1871,7 @@ class LauncherUI:
 
 	def news_card_height(self, lines):
 		"""Estimated pixel height of one news card showing `lines` description lines."""
-		height = 2 + 4 + 2 + self.ui_font(9, bold=True).metrics("linespace") + 4
+		height = 8 + self.ui_font(9, bold=True).metrics("linespace") + 6
 		if lines:
 			height += 2 + lines * self.ui_font(8).metrics("linespace") + 4
 		return height
@@ -1783,23 +1911,24 @@ class LauncherUI:
 	def build_news_cards(self, articles, lines):
 		theme = self.theme
 		surface, hover_surface = theme["surface"], theme["control"]
+		base = theme["panel"]
 		records = []
 		for article in articles:
 			summary_text = self.news_summary(article)
-			card = tk.Frame(self.news_items_frame, bg=surface,
-							highlightbackground=theme["control"], highlightthickness=1,
+			card = tk.Frame(self.news_items_frame, bg=base,
+							highlightbackground=base, highlightthickness=1,
 							padx=0, pady=2, cursor="hand2")
 			card.pack(fill="both", expand=True, pady=1)
-			accent_bar = tk.Frame(card, bg=theme["accent_dark"], width=3, cursor="hand2")
+			accent_bar = tk.Frame(card, bg=base, width=3, cursor="hand2")
 			accent_bar.pack(side="left", fill="y")
-			chevron = tk.Label(card, text="\u203a", bg=surface, fg=theme["muted"],
+			chevron = tk.Label(card, text="\u203a", bg=base, fg=base,
 							   font=self.ui_font(12, bold=True), cursor="hand2")
 			chevron.pack(side="right", padx=(2, 8))
-			body = tk.Frame(card, bg=surface, cursor="hand2")
+			body = tk.Frame(card, bg=base, cursor="hand2")
 			body.pack(side="left", expand=True, fill="x", padx=(9, 2))
 			title_font = self.ui_font(9, bold=True)
 			title = tk.Label(body, text=self.fit_text(article["title"], title_font,
-							 NEWS_TEXT_WIDTH - 8, 1), bg=surface, fg=theme["bright"],
+								 NEWS_TEXT_WIDTH - 8, 1), bg=base, fg=base,
 							 font=title_font, anchor="w", justify="left", cursor="hand2")
 			title.pack(fill="x")
 			text_widgets = [body, title, chevron]
@@ -1807,7 +1936,7 @@ class LauncherUI:
 				summary_font = self.ui_font(8)
 				summary = tk.Label(body, text=self.fit_text(
 					summary_text, summary_font, NEWS_TEXT_WIDTH - 8, lines),
-					bg=surface, fg=theme["muted"], font=summary_font, anchor="w",
+					bg=base, fg=base, font=summary_font, anchor="w",
 					justify="left", cursor="hand2")
 				summary.pack(fill="x", pady=(2, 0))
 				text_widgets.append(summary)
@@ -1832,36 +1961,39 @@ class LauncherUI:
 							"title": title, "summary": summary if lines else None})
 		return records
 
+	def set_news_card_progress(self, record, progress):
+		theme = self.theme
+		base = theme["panel"]
+		surface = theme["surface"]
+		k = min(1.0, max(0.0, progress))
+		record["card"].configure(
+			bg=blend_hex(base, surface, k),
+			highlightbackground=blend_hex(base, theme["control"], k))
+		record["bar"].configure(bg=blend_hex(base, theme["accent_dark"], k))
+		record["chevron"].configure(
+			bg=blend_hex(base, surface, k), fg=blend_hex(base, theme["muted"], k))
+		for key, color_key in (("title", "bright"), ("summary", "muted")):
+			widget = record.get(key)
+			if widget is not None:
+				widget.configure(bg=blend_hex(base, surface, k),
+								 fg=blend_hex(base, theme[color_key], k))
+
 	def animate_news_cards(self, cards):
 		"""Fade each news card in, staggered top to bottom."""
 		self.news_anim_generation += 1
 		generation = self.news_anim_generation
-		surface = self.theme["surface"]
-		steps, stagger, frame_ms = 8, 90, 30
-
-		def apply(record, k):
-			theme = self.theme
-			try:
-				record["card"].configure(
-					highlightbackground=blend_hex(surface, theme["control"], k))
-				record["bar"].configure(bg=blend_hex(surface, theme["accent_dark"], k))
-				record["chevron"].configure(fg=blend_hex(surface, theme["muted"], k))
-				record["title"].configure(fg=blend_hex(surface, theme["bright"], k))
-				if record["summary"] is not None:
-					record["summary"].configure(fg=blend_hex(surface, theme["muted"], k))
-			except tk.TclError:
-				pass
+		steps, stagger, frame_ms = 5, 45, 20
 
 		def run(record, step):
 			if generation != self.news_anim_generation:
 				return
 			k = step / steps
-			apply(record, k * (2 - k))  # ease-out
+			self.set_news_card_progress(record, k * (2 - k))  # ease-out
 			if step < steps:
 				self.root.after(frame_ms, lambda: run(record, step + 1))
 
 		for record in cards:
-			apply(record, 0)  # start invisible
+			self.set_news_card_progress(record, 0)
 		for index, record in enumerate(cards):
 			self.root.after(index * stagger, lambda record=record: run(record, 1))
 
@@ -1879,23 +2011,13 @@ class LauncherUI:
 		self.news_status_label.config(
 			text="OFFICIAL · UPDATED NOW" if matched else "LATEST WOW NEWS",
 			fg=self.theme["success"] if matched else self.theme["muted"])
-		available = self.news_items_frame.winfo_height()
-		self.news_layout_height = available
-		minimum = min(3, len(articles))
+		actual_height = self.news_items_frame.winfo_height()
+		available = max(1, actual_height - 12)
+		self.news_layout_height = actual_height
 		if plan is None:
 			plan = self.plan_news_layout(articles, available)
 		count, lines = plan
 		self.news_cards = self.build_news_cards(articles[:count], lines)
-
-		# Verify against the real widget sizes and back off if the estimate was too generous.
-		self.news_items_frame.update_idletasks()
-		if available > 1 and self.news_items_frame.winfo_reqheight() > available:
-			if lines > 0:
-				return self.render_game_news(
-					version, articles, errors, matched, (count, lines - 1), animate)
-			if count > minimum:
-				return self.render_game_news(
-					version, articles, errors, matched, (count - 1, 0), animate)
 		if errors and not matched:
 			self.news_status_label.config(text="PARTIAL FEED", fg=self.theme["warning"])
 		if animate:
@@ -2139,6 +2261,8 @@ class LauncherUI:
 
 	def close_launcher(self):
 		self.persist_settings()
+		if hasattr(self, "_background_executor"):
+			self._background_executor.shutdown(wait=False, cancel_futures=True)
 		self.root.destroy()
 
 	def ui_font(self, size, bold=False, italic=False):
@@ -2191,6 +2315,7 @@ class LauncherUI:
 				self.refresh_version_menu()
 			if self.current_art_frame is not None:
 				self.render_art_frame(self.current_art_frame)
+			self.refresh_rounded_surfaces()
 
 		for surface in self.surfaces:
 			if not surface.dead:
@@ -2242,11 +2367,11 @@ class LauncherUI:
 	def load_image(self, path, mode, max_size=None):
 		try:
 			with Image.open(path) as source:
+				if max_size:
+					source.thumbnail(max_size, Image.Resampling.LANCZOS, reducing_gap=3.0)
 				image = source.convert(mode)
 		except (OSError, ValueError):
 			return None
-		if max_size:
-			image.thumbnail(max_size, Image.Resampling.BICUBIC)
 		return image
 
 	def find_art_file(self, folder_name, stem):
@@ -2274,8 +2399,14 @@ class LauncherUI:
 		if version not in self.game_backgrounds:
 			background = None
 			if version in GAME_ART:
-				path = self.find_art_file("backgrounds", GAME_ART[version][1])
-				background = self.load_image(path, "RGBA", (2200, 1400)) if path else None
+				background_stem = GAME_ART[version][1]
+				preview = resource_path("backgrounds", "launcher_previews",
+										f"{background_stem}.webp")
+				if preview.is_file():
+					background = self.load_image(preview, "RGBA")
+				else:
+					path = self.find_art_file("backgrounds", background_stem)
+					background = self.load_image(path, "RGBA", (2200, 1400)) if path else None
 			self.game_backgrounds[version] = background
 		return self.game_backgrounds[version] or self.base_background
 
@@ -2295,6 +2426,22 @@ class LauncherUI:
 			result = self._compose_game_background(version, size)
 			self._background_cache[key] = result
 		return result
+
+	def compose_game_preview(self, version, size):
+		"""Fast interim backdrop; the full per-game art is composed off-thread afterward."""
+		width, height = size
+		if self.base_background is None:
+			preview = Image.new("RGBA", size, self.theme["window"])
+		else:
+			preview = ImageOps.fit(
+				self.base_background, size, method=Image.Resampling.BILINEAR)
+		logo = self.game_logos.get(version) or self.fallback_logo
+		if logo is not None:
+			logo = logo.copy()
+			logo.thumbnail(GAME_LOGO_SIZES.get(version, (540, 165)),
+						   Image.Resampling.BILINEAR)
+			preview.alpha_composite(logo, ((width - logo.width) // 2, max(0, int(height * .025))))
+		return preview
 
 	def prewarm_backgrounds(self, size):
 		"""Compose every game's background in the background so switching is instant."""
@@ -2359,7 +2506,7 @@ class LauncherUI:
 		self.art_transition_generation += 1
 		self.art_transitioning = True
 		self.animate_slideshow_transition(
-			start, end, self.art_transition_generation, 1, 10, self.art_text)
+			start, end, self.art_transition_generation, 1, 5, self.art_text)
 
 	def animate_slideshow_transition(self, start, end, generation, frame_index, steps,
 									 old_text):
@@ -2377,7 +2524,7 @@ class LauncherUI:
 			self.render_art_frame(end)
 		if frame_index < steps:
 			self.slideshow_after_id = self.root.after(
-				35, lambda: self.animate_slideshow_transition(
+				20, lambda: self.animate_slideshow_transition(
 					start, end, generation, frame_index + 1, steps, old_text))
 		else:
 			self.art_transitioning = False
@@ -2385,6 +2532,8 @@ class LauncherUI:
 
 	def client_matches(self, version, executable):
 		"""True if the exe's file version fits this game (or can't be read, so we allow it)."""
+		if official_game_for(executable) == version:
+			return True
 		allowed = CLIENT_MAJOR_VERSIONS.get(version)
 		if allowed is None:
 			return True
@@ -2418,11 +2567,20 @@ class LauncherUI:
 	def on_version_changed(self, *_args):
 		self.update_install_status()
 		version = self.version.get()
+		self.selection_generation += 1
+		generation = self.selection_generation
 		self.update_game_copy(animate=True)
-		self.apply_theme(version)
-		self.load_game_news()
 		if version != self.active_art_version:
 			self.switch_game_art(version)
+
+		def refresh_selected_game():
+			if (generation != self.selection_generation or not self.root.winfo_exists()
+					or version != self.version.get()):
+				return
+			self.apply_theme(version)
+			self.load_game_news()
+
+		self.root.after_idle(refresh_selected_game)
 
 	def draw_background_frame(self, frame):
 		self.displayed_background = frame
@@ -2437,25 +2595,74 @@ class LauncherUI:
 		width, height = self.background.winfo_width(), self.background.winfo_height()
 		if width <= 1 or height <= 1:
 			return
-		new_background = self.compose_game_background(version, (width, height))
-		old_background = self.displayed_background
+		size = (width, height)
+		request = (version, size)
+		if request == self._background_requested:
+			return
+		self._background_requested = request
 		self.background_transition_generation += 1
 		generation = self.background_transition_generation
-		if old_background is None or old_background.size != new_background.size:
-			self.draw_background_frame(new_background)
-			return
-		self.animate_background_transition(
-			old_background, new_background, generation, frame_index=1, steps=10)
+		old_background = self.displayed_background
+		if old_background is not None and old_background.size != size:
+			old_background = None
+		elif old_background is not None:
+			old_background = old_background.copy()
+		if request not in self._background_cache:
+			preview = self.compose_game_preview(version, size)
+			self.draw_background_frame(preview)
+			old_background = preview.copy()
+		if self._background_future is not None:
+			self._background_future.cancel()
 
-	def animate_background_transition(self, start, end, generation, frame_index, steps):
+		future = self._background_executor.submit(self.compose_game_background, version, size)
+		self._background_future = future
+
+		def completed(result):
+			try:
+				new_background = result.result()
+				if old_background is None:
+					frames = (new_background,)
+				else:
+					frames = tuple(Image.blend(old_background, new_background, amount)
+									for amount in (.35, .7, 1.0))
+					if frames[-1] is not new_background:
+						frames = (*frames[:-1], new_background)
+				self._background_queue.put((generation, version, frames, None))
+			except Exception as error:
+				self._background_queue.put((generation, version, (), error))
+
+		future.add_done_callback(completed)
+
+	def poll_background_queue(self):
+		if not self.root.winfo_exists():
+			return
+		while True:
+			try:
+				generation, version, frames, error = self._background_queue.get_nowait()
+			except queue.Empty:
+				break
+			if generation != self.background_transition_generation or version != self.version.get():
+				continue
+			if error is not None:
+				self.set_status(f"Could not load {version} background: {error}")
+				continue
+			self._background_frames = frames
+			self._background_frame_index = 0
+			self.display_next_background_frame(generation)
+		self._background_poll_id = self.root.after(40, self.poll_background_queue)
+
+	def display_next_background_frame(self, generation):
 		if generation != self.background_transition_generation:
 			return
-		frame = Image.blend(start, end, frame_index / steps)
+		frames = self._background_frames
+		if not frames or self._background_frame_index >= len(frames):
+			return
+		frame = frames[self._background_frame_index]
+		self._background_frame_index += 1
 		self.draw_background_frame(frame)
-		if frame_index < steps:
+		if self._background_frame_index < len(frames):
 			self.background_transition_id = self.root.after(
-				35, lambda: self.animate_background_transition(
-					start, end, generation, frame_index + 1, steps))
+				45, lambda: self.display_next_background_frame(generation))
 
 	def refresh_version_menu(self):
 		if not hasattr(self, "version_menu"):
@@ -2473,17 +2680,9 @@ class LauncherUI:
 			fg=self.theme["text"] if selected_installed else self.theme["disabled"])
 
 	def open_options(self):
-		extra_height = 58  # how much the window grows for each extra row
-		window = tk.Toplevel(self.root)
-		window.title("Game Installations — Options")
+		extra_height = 58  # how much the panel grows for each extra row
 		shown_extras = sum(1 for name in EXTRA_VERSIONS if name in self.enabled_extras)
-		window.geometry(f"820x{540 + extra_height * shown_extras}")
-		window.minsize(700, 500)
-		window.configure(bg=BG)
-		window.transient(self.root)
-		window.grab_set()
-		if os.name == "nt":
-			self.set_windows_icon(window)
+		window = Overlay(self.root, 820, 540 + extra_height * shown_extras)
 
 		body = tk.Frame(window, bg="#211c18", highlightbackground="#806b42",
 						highlightthickness=2, padx=22, pady=18)
@@ -2560,8 +2759,7 @@ class LauncherUI:
 			else:
 				row = add_row(name, folder)
 				window.update_idletasks()
-				window.geometry(
-					f"{window.winfo_width()}x{window.winfo_height() + extra_height}")
+				window.resize(window.winfo_height() + extra_height)
 				self.apply_theme(self.version.get(), subtree=row)
 			options_status.config(text=f"{name} added. Press SAVE to keep it.",
 								  fg=self.theme["success"])
@@ -2651,15 +2849,7 @@ class LauncherUI:
 
 	def open_setup_wizard(self):
 		"""First launch: search every drive for game installs and let the user confirm them."""
-		window = tk.Toplevel(self.root)
-		window.title("First-Time Setup")
-		window.geometry("820x680")
-		window.minsize(700, 640)
-		window.configure(bg=BG)
-		window.transient(self.root)
-		window.grab_set()
-		if os.name == "nt":
-			self.set_windows_icon(window)
+		window = Overlay(self.root, 820, 680)
 
 		body = tk.Frame(window, bg="#211c18", highlightbackground="#806b42",
 						highlightthickness=2, padx=22, pady=18)
@@ -2878,11 +3068,8 @@ class LauncherUI:
 		width, height = event.width, event.height
 		if width <= 1 or height <= 1:
 			return
-		self.background_transition_generation += 1
 		self.active_art_version = self.version.get() if hasattr(self, "version") else GAME_VERSIONS[0]
-		self.draw_background_frame(
-			self.compose_game_background(self.active_art_version, (width, height)))
-		self.prewarm_backgrounds((width, height))
+		self.switch_game_art(self.active_art_version)
 
 	def draw_art(self, event):
 		canvas = self.art
@@ -2961,7 +3148,16 @@ class LauncherUI:
 		self.current_art_frame = artwork
 		if shaded is None:
 			shaded = self.shade_art(artwork)
-		self.art_photo = ImageTk.PhotoImage(shaded, master=self.root)
+		image = shaded.convert("RGBA")
+		width, height = image.size
+		mask = self._art_mask_cache.get((width, height))
+		if mask is None:
+			mask = make_rounded_mask(width, height, 10)
+			mask_draw = ImageDraw.Draw(mask)
+			mask_draw.rectangle((10, 0, width - 1, height - 1), fill=255)
+			self._art_mask_cache[(width, height)] = mask
+		image.putalpha(mask)
+		self.art_photo = ImageTk.PhotoImage(image, master=self.root)
 		self.art.delete("all")
 		self.art.create_image(0, 0, image=self.art_photo, anchor="nw")
 		self.draw_art_text()

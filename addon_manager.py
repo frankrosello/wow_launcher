@@ -1,4 +1,4 @@
-"""Addon manager window for the WoW launcher."""
+"""Addon manager panel for the WoW launcher (drawn on top of the launcher window)."""
 import os
 from pathlib import Path
 import queue
@@ -18,6 +18,61 @@ TOC_SUFFIX = re.compile(
 	r"[_-](mainline|classic|vanilla|tbc|bcc|wrath|wotlk|cata|mists|standard)$", re.I)
 GITHUB_REPO = re.compile(r"^https?://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.I)
 DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0 WoW-Launcher-AddonManager"}
+OVERLAY_BG = "#100f12"
+
+
+class Overlay(tk.Frame):
+	"""A panel drawn on top of the launcher window instead of a separate window.
+	The launcher behind it is blurred and darkened while the panel is open."""
+
+	def __init__(self, root, width, height):
+		root.update_idletasks()
+		width = min(width, max(200, root.winfo_width() - 20))
+		height = min(height, max(200, root.winfo_height() - 20))
+		self.scrim = self.make_scrim(root)
+		super().__init__(root, bg=OVERLAY_BG)
+		self.place(relx=.5, rely=.5, anchor="center", width=width, height=height)
+		self.lift()
+		self.grab_set()   # block clicks on the launcher underneath, like a modal window
+		self.focus_set()
+		self.bind("<Escape>", lambda _event: self.destroy())
+		self.bind("<Destroy>", self.remove_scrim, add="+")
+
+	@staticmethod
+	def make_scrim(root):
+		"""Full-window layer showing a blurred, darkened snapshot of the launcher."""
+		scrim = tk.Label(root, bd=0, highlightthickness=0, bg="#0b0b0d")
+		try:
+			from PIL import Image, ImageFilter, ImageGrab, ImageTk
+			root.update()
+			left, top = root.winfo_rootx(), root.winfo_rooty()
+			size = (root.winfo_width(), root.winfo_height())
+			shot = ImageGrab.grab(bbox=(left, top, left + size[0], top + size[1]))
+			shot = shot.convert("RGB").resize(size)
+			shot = shot.filter(ImageFilter.GaussianBlur(5))
+			shot = Image.blend(shot, Image.new("RGB", size, (8, 8, 10)), .55)
+			scrim._photo = ImageTk.PhotoImage(shot, master=scrim)
+			scrim.configure(image=scrim._photo)
+		except Exception:
+			pass  # no screen capture available: the plain dark layer is used instead
+		scrim.place(x=0, y=0, relwidth=1, relheight=1)
+		scrim.lift()
+		return scrim
+
+	def remove_scrim(self, event):
+		if event.widget is self:
+			try:
+				self.scrim.destroy()
+			except tk.TclError:
+				pass
+
+	def resize(self, height):
+		self.place_configure(height=min(height, self.master.winfo_height() - 20))
+
+	def protocol(self, name=None, handler=None):
+		"""Mimics Toplevel.protocol: the handler runs on Escape instead of a plain close."""
+		if name == "WM_DELETE_WINDOW" and handler is not None:
+			self.bind("<Escape>", lambda _event: handler())
 
 
 def clean_text(text):
@@ -83,15 +138,7 @@ class AddonManager:
 	# ---------- UI ----------
 	def build(self, version):
 		app = self.app
-		window = self.window = tk.Toplevel(app.root)
-		window.title("Addon Manager")
-		window.geometry("940x620")
-		window.minsize(800, 480)
-		window.configure(bg="#100f12")
-		window.transient(app.root)
-		window.grab_set()
-		if os.name == "nt":
-			app.set_windows_icon(window)
+		window = self.window = Overlay(app.root, 940, 620)
 
 		body = tk.Frame(window, bg="#211c18", highlightbackground="#806b42",
 						highlightthickness=2, padx=22, pady=18)
@@ -169,9 +216,13 @@ class AddonManager:
 		button("REMOVE", self.remove_selected, "right")
 		button("ENABLE / DISABLE", self.toggle_selected, "right")
 
-		window.protocol("WM_DELETE_WINDOW", self.close)
+		window.bind("<Destroy>", self.on_destroy, add="+")
 		app.add_gradient(body, "panel")
 		app.apply_theme(app.version.get(), subtree=window)
+
+	def on_destroy(self, event):
+		if event.widget is self.window:
+			self.closed = True
 
 	def close(self):
 		self.closed = True
