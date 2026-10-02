@@ -4,9 +4,26 @@ from pathlib import Path
 
 project_dir = Path(SPECPATH)
 
-datas = [
-    (str(project_dir / "assets"), "assets"),
-]
+datas = []
+
+for folder in [
+    "backgrounds",
+    "fonts",
+    "logos",
+    "screenshots",
+]:
+    path = project_dir / folder
+    if path.exists():
+        datas.append((str(path), folder))
+
+for filename in [
+    "wow_logo.png",
+    "wowicon.png",
+    "image.png",
+]:
+    path = project_dir / filename
+    if path.exists():
+        datas.append((str(path), "."))
 
 hiddenimports = [
     "psutil",
@@ -31,39 +48,32 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(
-    a.pure,
-)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="WoWLauncher",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
 )
 
 app = BUNDLE(
     exe,
+    a.binaries,
+    a.datas,
     name="WoWLauncher.app",
-    icon=str(project_dir / "assets" / "wow.icns"),
     bundle_identifier="com.frankrosello.wowlauncher",
-    version="1.0.0",
     info_plist={
         "CFBundleName": "WoW Launcher",
         "CFBundleDisplayName": "WoW Launcher",
         "CFBundleIdentifier": "com.frankrosello.wowlauncher",
         "CFBundleVersion": "1.0.0",
         "CFBundleShortVersionString": "1.0.0",
-        "NSPrincipalClass": "NSApplication",
-        "NSAppleScriptEnabled": False,
     },
 )
