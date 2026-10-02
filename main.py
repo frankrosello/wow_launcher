@@ -353,6 +353,18 @@ def official_game_for(path):
 	return None
 
 
+def flavor_game_for(path):
+	"""Game implied by the client's flavor folder, only for official clients inside a
+	'World of Warcraft' folder. Custom servers (Crusader Storm etc.) are never judged by
+	a folder name, even if it looks like _classic_."""
+	if not in_official_install(path):
+		return None
+	parts = re.split(r"[\\/]", str(path))
+	if len(parts) >= 2:
+		return OFFICIAL_FLAVOR_FOLDERS.get(parts[-2].casefold())
+	return None
+
+
 def path_key(path):
 	"""Comparable form of a path (case-insensitive so Windows and macOS both match)."""
 	return os.path.normcase(os.path.abspath(str(path))).casefold()
@@ -2256,7 +2268,10 @@ class LauncherUI:
 			self.learn_requests.put((version, key))
 
 	def narrow_by_version(self, candidates, executable):
-		"""Keep the games whose expected major version matches the running exe's version."""
+		"""Pick among games sharing an exe: flavor folder first, then file version."""
+		flavor = flavor_game_for(executable)
+		if flavor in candidates:
+			return [flavor]
 		client = exe_version(executable)
 		if client is None:
 			return candidates
@@ -2744,9 +2759,13 @@ class LauncherUI:
 			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
 
 	def client_matches(self, version, executable):
-		"""True if the exe's file version fits this game (or can't be read, so we allow it)."""
+		"""True if the exe fits this game. The flavor folder decides when present;
+		otherwise the exe's file version (or allow it if unreadable)."""
 		if official_game_for(executable) == version:
 			return True
+		flavor = flavor_game_for(executable)
+		if flavor is not None:
+			return flavor == version
 		allowed = CLIENT_MAJOR_VERSIONS.get(version)
 		if allowed is None:
 			return True

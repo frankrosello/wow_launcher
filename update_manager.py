@@ -14,6 +14,16 @@ VERSION_URLS = (               # UNVERIFIED: confirm these still serve version t
 	"http://{region}.patch.battle.net:1119/{product}/versions",
 )
 REGIONS = ("us", "eu", "kr", "tw", "cn")
+# .build.info "Product" values for the games whose product is known. A folder without
+# its own .build.info falls back to the install root's file, which lists every game's
+# product, so the row has to be picked by game rather than taking the first one.
+GAME_PRODUCTS = {
+	"Retail": ("wow",),
+	"Classic Era": ("wow_classic_era",),
+	"Mists of Pandaria Classic": ("wow_classic",),
+	"TBC Anniversary": ("wow_anniversary",),
+}
+KNOWN_PRODUCTS = {product for products in GAME_PRODUCTS.values() for product in products}
 IDLE_LABEL = "CHECK UPDATES"
 OUTDATED_LABEL = "UPDATE AVAILABLE"
 
@@ -42,7 +52,18 @@ def find_build_info(folder):
 	return None
 
 
-def read_installed(folder):
+def rows_for_game(rows, game):
+	"""Rows of a shared .build.info that belong to `game`: its known product if it has
+	one, otherwise whatever product no other known game claims."""
+	wanted = GAME_PRODUCTS.get(game)
+	if wanted:
+		matched = [row for row in rows if row.get("Product", "").strip() in wanted]
+		if matched:
+			return matched
+	return [row for row in rows if row.get("Product", "").strip() not in KNOWN_PRODUCTS]
+
+
+def read_installed(folder, game=None):
 	"""{'product', 'version', 'region'} from the game's .build.info, else None."""
 	path = find_build_info(folder)
 	if path is None:
@@ -51,6 +72,9 @@ def read_installed(folder):
 		rows = parse_bpsv(path.read_text(encoding="utf-8", errors="replace"))
 	except OSError:
 		return None
+	if game is not None and path.parent != Path(folder):
+		# Found in a parent folder: it is shared by several games, so pick this game's row.
+		rows = rows_for_game(rows, game)
 	active = [row for row in rows if row.get("Active", "1") == "1"] or rows
 	if not active:
 		return None
@@ -99,9 +123,9 @@ def needs_update(installed, latest):
 	return installed.strip() != latest.strip()
 
 
-def check_game(executable):
+def check_game(executable, game=None):
 	"""Compare installed vs newest build. Runs on a worker thread (network)."""
-	installed = read_installed(Path(executable).parent)
+	installed = read_installed(Path(executable).parent, game)
 	if installed is None:
 		return {"state": "unsupported"}
 	try:
@@ -174,7 +198,7 @@ class UpdateController:
 
 	def check_worker(self, version, executable, manual):
 		try:
-			result = check_game(executable)
+			result = check_game(executable, version)
 		except Exception as error:
 			result = {"state": "error", "message": str(error)}
 		self.messages.put((version, result, manual))
