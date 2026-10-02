@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -23,6 +24,7 @@ import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from addon_manager import AddonManager, Overlay
+from update_manager import UpdateController
 
 
 BG = "#100f12"
@@ -272,6 +274,16 @@ SCAN_SKIP_NAMES = frozenset((
 	"winsxs", "perflogs", "msocache", "documents and settings", "intel", "amd",
 	"library", "system", "private", "cores", ".trash", ".fseventsd", ".spotlight-v100"))
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+# Each game has its own four rotating screenshots in the screenshots folder:
+# <prefix>screenshot1.png .. <prefix>screenshot4.png (e.g. classicscreenshot1.png).
+SLIDESHOW_PREFIXES = {
+	"Classic Era": "classic",
+	"Retail": "retail",
+	"TBC Anniversary": "tbc",
+	"Crusader Storm": "tbc",   # a TBC-based client: shares the TBC set
+	"Mists of Pandaria Classic": "mop",
+	"WoW Forever Beta": "forever",
+}
 WOW_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/news"
 WOW_CLASSIC_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/classic"
 NEWS_TEXT_WIDTH = 395
@@ -595,6 +607,20 @@ def make_rounded_mask(width, height, radius, scale=3):
 	return mask
 
 
+def split_launch_args(text):
+	"""Launch-argument text -> list of arguments. Spaces separate arguments and quotes
+	keep a value with spaces together, e.g.  -config "C:\\My Games\\Config.wtf"."""
+	text = (text or "").strip()
+	if not text:
+		return []
+	try:
+		parts = shlex.split(text, posix=False)   # posix=False keeps Windows backslashes
+	except ValueError:                           # unbalanced quote: fall back to plain spaces
+		parts = text.split()
+	return [part[1:-1] if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'" else part
+			for part in parts]
+
+
 class OfficialNewsParser(HTMLParser):
 	"""Extract official WoW article cards (ArticleTile divs or blz-card elements)."""
 
@@ -744,6 +770,7 @@ class StoneButton(tk.Canvas):
 		self.hovered = False
 		self.pressed = False
 		self.background_provider = background_provider
+		self.disabled = False
 		self.theme_provider = theme_provider or (lambda: {})
 		super().__init__(parent, bg=kwargs.pop("bg", "#181614"),
 					 highlightthickness=0, bd=0, cursor="hand2", takefocus=True,
@@ -805,7 +832,7 @@ class StoneButton(tk.Canvas):
 			inset + cut + 2, height - inset - 6,
 			inset + 6, height - inset - cut - 2, inset + 6, inset + cut + 2,
 		)
-		face = button_theme.get("button_pressed", BUTTON_RED_PRESSED) if self.pressed else (
+		face = "#4a4a48" if self.disabled else button_theme.get("button_pressed", BUTTON_RED_PRESSED) if self.pressed else (
 			button_theme.get("button_hover", BUTTON_RED_HOVER) if self.hovered
 			else button_theme.get("button_face", BUTTON_RED))
 		face_gradient = make_gradient(
@@ -829,7 +856,8 @@ class StoneButton(tk.Canvas):
 								  (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)):
 			self.create_text(x + offset_x, y + offset_y, text=self.label,
 							  fill=BUTTON_TEXT_OUTLINE, font=self.button_font)
-		self.create_text(x, y, text=self.label, fill=BUTTON_TEXT, font=self.button_font)
+		self.create_text(x, y, text=self.label, font=self.button_font,
+							  fill="#9a9c97" if self.disabled else BUTTON_TEXT)
 
 	def shadowed_backdrop(self, width, height, outline_points, background):
 		"""Backdrop image (art behind the button, or its solid color) with the drop shadow."""
@@ -894,6 +922,8 @@ class StoneButton(tk.Canvas):
 		self.redraw()
 
 	def on_press(self, _event=None):
+		if self.disabled:
+			return
 		self.pressed = True
 		self.redraw()
 
@@ -916,12 +946,19 @@ class StoneButton(tk.Canvas):
 		return "break"
 
 	def invoke(self, _event=None):
-		self.command()
+		if not self.disabled:
+			self.command()
 		return "break"
 
 	def set_label(self, text):
 		self.label = text
 		self.redraw()
+
+	def set_disabled(self, disabled):
+		if self.disabled != disabled:
+			self.disabled = disabled
+			self.configure(cursor="arrow" if disabled else "hand2")
+			self.redraw()
 
 
 class GradientSurface:
@@ -1073,6 +1110,7 @@ class GradientSurface:
 class LauncherUI:
 	def __init__(self, root):
 		self.root = root
+		root.launcher = self   # lets popups read the current theme
 		root.title(APP_TITLE)
 		root.geometry("1100x700")
 		root.minsize(860, 580)
@@ -1140,7 +1178,9 @@ class LauncherUI:
 		self.options_button = None
 		self.background_transition_id = None
 		self.background_transition_generation = 0
-		self.slideshow_images = self.load_slideshow_images()
+		self._slideshow_cache = {}   # screenshot set key -> loaded images
+		self.slideshow_key = SLIDESHOW_PREFIXES.get(GAME_VERSIONS[0], "")
+		self.slideshow_images = self.slideshow_for(GAME_VERSIONS[0])
 		self.slideshow_index = 0
 		self.art_photo = None
 		self.current_art_frame = None
@@ -1154,6 +1194,7 @@ class LauncherUI:
 		self.build_header()
 		self.build_hero()
 		self.build_footer()
+		self.updates = UpdateController(self, excluded=LOADER_VERSIONS)
 		if self.slideshow_images:
 			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
 		self.status = tk.Label(root, text="Launcher ready", bg=BG, fg=MUTED,
@@ -1243,14 +1284,18 @@ class LauncherUI:
 		surface.adopt()
 		return surface
 
-	def add_rounded_surface(self, frame, role, radius=8):
-		outside = str(frame.master.cget("bg"))
+	def add_rounded_surface(self, frame, role, radius=8, outside_role=None, backdrop=None):
+		"""Round a frame's corners. `outside_role` names the theme color shown in the corners
+		(default: the parent's color); `backdrop` returns a PIL image the size of the parent
+		to show in the corners instead (used by the popup panels)."""
+		outside = self.theme[outside_role] if outside_role else str(frame.master.cget("bg"))
 		frame.configure(bg=outside, bd=0, highlightthickness=0)
 		canvas = tk.Canvas(frame, bg=outside, highlightthickness=0, bd=0)
 		canvas.place(x=0, y=0, relwidth=1, relheight=1)
 		canvas.tk.call("lower", canvas._w)
 		section = {"frame": frame, "canvas": canvas, "role": role,
-				   "outside": outside, "radius": radius, "backdrop_photo": None}
+				   "outside": outside, "radius": radius, "backdrop_photo": None,
+				   "outside_role": outside_role, "backdrop": backdrop}
 		if not hasattr(self, "rounded_sections"):
 			self.rounded_sections = []
 			self.root.bind("<Configure>", self.refresh_rounded_surfaces, add="+")
@@ -1267,22 +1312,31 @@ class LauncherUI:
 		if width < 4 or height < 4:
 			return
 		theme = self.theme
-		section["outside"] = str(frame.master.cget("bg"))
+		if section.get("outside_role"):
+			section["outside"] = theme[section["outside_role"]]
+		else:
+			section["outside"] = str(frame.master.cget("bg"))
 		fill = theme[section["role"]]
 		border = blend_hex(fill, theme["border"], .32)
 		position = (frame.winfo_x(), frame.winfo_y())
-		backdrop_key = id(self.displayed_background) if frame.master is self.root else None
+		if section.get("backdrop") is not None:
+			base_image = section["backdrop"]()
+		elif frame.master is self.root:
+			base_image = self.displayed_background
+		else:
+			base_image = None
+		backdrop_key = id(base_image) if base_image is not None else None
 		signature = (width, height, position, section["outside"], fill, border, backdrop_key)
 		if section.get("signature") == signature:
 			return
 		canvas.configure(bg=section["outside"], width=width, height=height)
 		canvas.delete("all")
-		if frame.master is self.root and self.displayed_background is not None:
+		if base_image is not None:
 			x, y = frame.winfo_x(), frame.winfo_y()
-			x2 = min(x + width, self.displayed_background.width)
-			y2 = min(y + height, self.displayed_background.height)
+			x2 = min(x + width, base_image.width)
+			y2 = min(y + height, base_image.height)
 			if x >= 0 and y >= 0 and x2 > x and y2 > y:
-				backdrop = self.displayed_background.crop((x, y, x2, y2))
+				backdrop = base_image.crop((x, y, x2, y2))
 				if backdrop.size != (width, height):
 					padded = Image.new("RGBA", (width, height), section["outside"])
 					padded.alpha_composite(backdrop, (0, 0))
@@ -1313,11 +1367,28 @@ class LauncherUI:
 		section["signature"] = signature
 
 	def refresh_rounded_surfaces(self, _event=None):
-		for section in getattr(self, "rounded_sections", ()):
+		if not hasattr(self, "rounded_sections"):
+			return
+		alive = []
+		for section in self.rounded_sections:
+			try:
+				if not section["frame"].winfo_exists():
+					continue  # its popup was closed
+			except tk.TclError:
+				continue
 			try:
 				self.draw_rounded_surface(section)
 			except tk.TclError:
-				continue
+				pass  # try again on the next refresh instead of giving up on it
+			alive.append(section)
+		self.rounded_sections[:] = alive
+
+	def style_popup(self, window, body):
+		"""The Overlay paints its own rounded, bordered panel; nothing to add."""
+
+	def style_popup_row(self, row):
+		"""A recessed rounded strip, like the playtime box on the main screen."""
+		self.add_rounded_surface(row, "surface", radius=7, outside_role="panel")
 
 	def clear_children(self, frame):
 		for child in frame.winfo_children():
@@ -1330,6 +1401,13 @@ class LauncherUI:
 					bg=BG, background_provider=self.backdrop_patch,
 					theme_provider=lambda: self.theme, style="subtle")
 		self.options_button.place(**OPTIONS_PLACE)
+		self.update_button = StoneButton(
+			self.root, text="UPDATE AVAILABLE", command=lambda: self.updates.check_selected(),
+			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
+			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme,
+			style="subtle")
+		self.update_button.place(relx=.96, rely=.045, anchor="ne",
+								x=-(self.options_button.winfo_reqwidth() + 6))
 
 	def backdrop_patch(self, widget, width, height):
 		if self.displayed_background is None:
@@ -1403,6 +1481,7 @@ class LauncherUI:
 	def build_footer(self):
 		footer = tk.Frame(self.root, bg="#181614", bd=0, highlightthickness=0)
 		footer.place(**FOOTER_PLACE)
+		self.footer = footer
 
 		playtime = tk.Frame(footer, bg="#181614", bd=0, highlightthickness=0,
 							padx=12, pady=3)
@@ -1461,6 +1540,7 @@ class LauncherUI:
 		self.learned_clients = {}
 		self.tracked_clients = {}  # pid -> (game, create_time)
 		self.setup_complete = False
+		self.launch_args = {}   # game -> argument text passed to the client
 		try:
 			data = json.loads(self.settings_path.read_text(encoding="utf-8"))
 			folders = data.get("game_paths", {})
@@ -1489,6 +1569,11 @@ class LauncherUI:
 					name: {str(item) for item in items}
 					for name, items in saved_clients.items()
 					if name in LOADER_VERSIONS and isinstance(items, list)}
+			saved_args = data.get("launch_args", {})
+			if isinstance(saved_args, dict):
+				self.launch_args = {str(name): value.strip()
+									for name, value in saved_args.items()
+									if isinstance(value, str) and value.strip()}
 			if "setup_complete" in data:
 				self.setup_complete = bool(data["setup_complete"])
 			else:
@@ -2247,6 +2332,7 @@ class LauncherUI:
 				"game_paths": self.game_paths,
 				"playtime_seconds": self.playtime_seconds,
 				"setup_complete": self.setup_complete,
+				"launch_args": self.launch_args,
 				"extras_enabled": sorted(self.enabled_extras),
 				"client_exes": {name: sorted(paths)
 								for name, paths in self.learned_clients.items()},
@@ -2257,6 +2343,7 @@ class LauncherUI:
 		return True
 
 	def close_launcher(self):
+		self.updates.shutdown()
 		self.persist_settings()
 		if hasattr(self, "_background_executor"):
 			self._background_executor.shutdown(wait=False, cancel_futures=True)
@@ -2480,14 +2567,57 @@ class LauncherUI:
 			background.alpha_composite(shadowed, (max(0, left), max(0, top)))
 		return background
 
-	def load_slideshow_images(self):
-		image_dir = resource_path("screenshots")
+	def slideshow_for(self, version):
+		"""The screenshots for one game, loaded the first time that game is shown."""
+		key = SLIDESHOW_PREFIXES.get(version, "")
+		if key not in self._slideshow_cache:
+			self._slideshow_cache[key] = self.load_slideshow_images(key)
+		return self._slideshow_cache[key]
+
+	def load_slideshow_images(self, prefix):
+		"""<prefix>screenshot1..4 from the screenshots folder. Games without a prefix
+		(auto-detected custom clients) use the older shared screenshot1..4 files."""
 		images = []
-		for image_path in (image_dir / f"screenshot{number}.png" for number in range(1, 5)):
-			image = self.load_image(image_path, "RGB", (1000, 800))
+		for number in range(1, 5):
+			path = self.find_art_file("screenshots", f"{prefix}screenshot{number}")
+			if path is None:
+				continue
+			image = self.load_image(path, "RGB", (1000, 800))
 			if image is not None:
 				images.append(image)
 		return images
+
+	def switch_slideshow(self, version):
+		"""Show the selected game's own screenshots, cross-fading from the current one."""
+		key = SLIDESHOW_PREFIXES.get(version, "")
+		if key == self.slideshow_key:
+			return
+		self.slideshow_key = key
+		self.slideshow_images = self.slideshow_for(version)
+		self.slideshow_index = 0
+		if self.slideshow_after_id is not None:
+			self.root.after_cancel(self.slideshow_after_id)
+			self.slideshow_after_id = None
+		self.art_transition_generation += 1
+		self.art_transitioning = False
+		width, height = self.art.winfo_width(), self.art.winfo_height()
+		if width <= 1 or height <= 1:
+			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
+			return
+		size = (width, height)
+		if self.slideshow_images:
+			end = self.fitted_slide(0, size)
+		else:
+			# No screenshots for this game: fall back to its background art.
+			background = self.selected_background(version)
+			end = (ImageOps.fit(background, size, method=Image.Resampling.LANCZOS)
+				   if background is not None else None)
+		if end is None:
+			return
+		start = self.current_art_frame or end
+		self.art_transitioning = True
+		self.animate_slideshow_transition(
+			start, end, self.art_transition_generation, 1, 5, self.art_text)
 
 	def advance_slideshow(self):
 		if not self.slideshow_images or not self.root.winfo_exists():
@@ -2563,9 +2693,12 @@ class LauncherUI:
 
 	def on_version_changed(self, *_args):
 		self.update_install_status()
+		if hasattr(self, "updates"):
+			self.updates.refresh_view()
 		version = self.version.get()
 		self.selection_generation += 1
 		generation = self.selection_generation
+		self.switch_slideshow(version)
 		self.update_game_copy(animate=True)
 		if version != self.active_art_version:
 			self.switch_game_art(version)
@@ -2587,6 +2720,9 @@ class LauncherUI:
 		self.draw_credit()
 		if self.options_button is not None:
 			self.options_button.redraw()
+		update_button = getattr(self, "update_button", None)
+		if update_button is not None:
+			update_button.redraw()
 
 	def draw_credit(self):
 		"""White credit text with a drop shadow, drawn straight onto the background art."""
@@ -2696,39 +2832,88 @@ class LauncherUI:
 			fg=self.theme["text"] if selected_installed else self.theme["disabled"])
 
 	def open_options(self):
-		extra_height = 58  # how much the panel grows for each extra row
+		extra_height = 66  # how much the panel grows for each extra row
 		shown_extras = sum(1 for name in EXTRA_VERSIONS if name in self.enabled_extras)
-		window = Overlay(self.root, 820, 540 + extra_height * shown_extras)
+		window = Overlay(self.root, 820, 580 + extra_height * shown_extras)
 
-		body = tk.Frame(window, bg="#211c18", highlightbackground="#806b42",
-						highlightthickness=2, padx=22, pady=18)
-		body.pack(fill="both", expand=True, padx=14, pady=14)
+		def stone(parent, text, command, size=8, padx=8, pady=4):
+			return StoneButton(parent, text=text, command=command,
+							   font=self.ui_font(size, bold=True), padx=padx, pady=pady,
+							   bg="#211c18", theme_provider=lambda: self.theme)
+
+		body = window.make_body()
 		tk.Label(body, text="GAME INSTALLATIONS", bg="#211c18", fg=GOLD,
-				 font=self.ui_font(16, bold=True)).pack(anchor="w")
+				 font=self.ui_font(15, bold=True)).pack(anchor="w")
 		tk.Label(body,
-				 text="Choose the folder for each game. The launcher will find its WoW executable.",
-				 bg="#211c18", fg="#c7baa0", font=self.ui_font(9, italic=True)
-				 ).pack(anchor="w", pady=(4, 14))
+				 text="Point each game at its folder. A green READY tag means the launcher "
+					  "found the game there.",
+				 bg="#211c18", fg="#c7baa0", font=self.ui_font(9)
+				 ).pack(anchor="w", pady=(3, 10))
+		tk.Frame(body, bg="#78613c", height=1).pack(fill="x", pady=(0, 6))
 
 		entries = {}
+		arg_vars = {}   # game -> StringVar holding its launch arguments
+
+		# Bottom first so it is never pushed off the panel: buttons, then the status line.
+		footer = tk.Frame(body, bg="#211c18")
+		footer.pack(fill="x", side="bottom", pady=(10, 0))
+		options_status = tk.Label(body, text="Settings are saved on this computer.",
+								  bg="#211c18", fg=MUTED, font=self.ui_font(8), anchor="w")
+		options_status.pack(fill="x", side="bottom", pady=(8, 0))
+		auto_button = stone(footer, "AUTO SEARCH", lambda: toggle_scan())
+		auto_button.pack(side="left", padx=(0, 8))
+		stone(footer, "EXTRA", lambda: add_extra()).pack(side="left")
+		stone(footer, "SAVE", lambda: self.save_options(window, entries, options_status, arg_vars),
+			  size=9, padx=12).pack(side="right")
+		stone(footer, "CANCEL", window.destroy).pack(side="right", padx=(0, 8))
+
+		rows_frame = tk.Frame(body, bg="#211c18")
+		rows_frame.pack(fill="both", expand=True)
+
+		def refresh_chip(version, path_var, chip):
+			text = path_var.get().strip()
+			if text and self.find_executable(version, text) is not None:
+				chip.config(text="\u25cf READY", fg=self.theme["success"])
+			elif text:
+				chip.config(text="\u25cf NOT FOUND", fg=self.theme["warning"])
+			else:
+				chip.config(text="\u25cf NOT SET", fg=self.theme["disabled"])
 
 		def add_row(version, path=None):
-			row = tk.Frame(body, bg="#302922", highlightbackground="#51432f",
-						   highlightthickness=1, padx=8, pady=6)
+			row = tk.Frame(rows_frame, bg="#181614", padx=8, pady=5)
 			row.pack(fill="x", pady=3)
-			tk.Label(row, text=version, width=25, anchor="w", bg="#302922",
+			tk.Label(row, text=version, width=24, anchor="w", bg="#181614",
 					 fg=TEXT, font=self.ui_font(9, bold=True)).pack(side="left", padx=(2, 8))
 			path_var = tk.StringVar(
 				value=self.game_paths.get(version, "") if path is None else path)
 			entry = tk.Entry(row, textvariable=path_var, bg="#171512", fg=TEXT,
-							 insertbackground=TEXT, relief="sunken", bd=1,
-							 font=self.ui_font(9))
+							 insertbackground=TEXT, relief="flat", bd=1,
+							 highlightthickness=1, highlightbackground="#51432f",
+							 highlightcolor="#806b42", font=self.ui_font(9))
 			entry.pack(side="left", fill="x", expand=True, padx=4, ipady=4)
+			chip = tk.Label(row, text="", width=12, anchor="w", bg="#181614",
+							fg=MUTED, font=self.ui_font(7, bold=True))
+			chip.pack(side="left", padx=(6, 0))
+			stone(row, "BROWSE", lambda variable=path_var: self.browse_folder(
+				window, variable), pady=2).pack(side="left", padx=(6, 2))
+			args_var = tk.StringVar(value=self.launch_args.get(version, ""))
+			args_button = stone(
+				row, "ARGS \u25cf", lambda v=version, var=args_var: self.edit_launch_args(
+					window, v, var), pady=2)
+			args_button.pack(side="left", padx=(2, 2))
+
+			def refresh_args(*_a, var=args_var, button=args_button):
+				# A dot marks games that have launch arguments set.
+				button.set_label("ARGS \u25cf" if var.get().strip() else "ARGS")
+
+			args_var.trace_add("write", refresh_args)
+			refresh_args()
+			arg_vars[version] = args_var
+			path_var.trace_add("write", lambda *_a, v=version, var=path_var, c=chip:
+							   refresh_chip(v, var, c))
+			refresh_chip(version, path_var, chip)
 			entries[version] = path_var
-			StoneButton(row, text="BROWSE", command=lambda variable=path_var: self.browse_folder(
-				window, variable), font=self.ui_font(8, bold=True), padx=8, pady=4,
-				bg="#302922", theme_provider=lambda: self.theme
-				).pack(side="left", padx=(6, 2))
+			self.style_popup_row(row)
 			return row
 
 		for version in self.game_versions:
@@ -2780,24 +2965,86 @@ class LauncherUI:
 			options_status.config(text=f"{name} added. Press SAVE to keep it.",
 								  fg=self.theme["success"])
 
-		footer = tk.Frame(body, bg="#211c18")
-		footer.pack(fill="x", side="bottom", pady=(12, 0))
-		StoneButton(footer, text="EXTRA", command=add_extra,
-					font=self.ui_font(8, bold=True), padx=8, pady=4,
-					bg="#211c18", theme_provider=lambda: self.theme
-					).pack(side="left", padx=(0, 10))
-		options_status = tk.Label(footer, text="Settings are saved on this computer.",
-								 bg="#211c18", fg=MUTED, font=self.ui_font(8))
-		options_status.pack(side="left")
-		StoneButton(footer, text="CANCEL", command=window.destroy,
-					font=self.ui_font(8, bold=True), padx=8, pady=4,
-					bg="#211c18", theme_provider=lambda: self.theme
-					).pack(side="right", padx=(6, 0))
-		StoneButton(footer, text="SAVE", command=lambda: self.save_options(
-			window, entries, options_status), font=self.ui_font(9, bold=True),
-					padx=12, pady=4, bg="#211c18",
-					theme_provider=lambda: self.theme).pack(side="right")
-		self.add_gradient(body, "panel")
+		# --- AUTO SEARCH: scan every drive for installs and fill in the rows -----------
+		scan = {"cancel": threading.Event(), "queue": queue.Queue(),
+				"scanning": False, "found": 0}
+
+		def short_path(path, limit=60):
+			return path if len(path) <= limit else "\u2026" + path[-(limit - 1):]
+
+		def apply_found(version, path):
+			"""Fill a row with a found install, but never replace a folder that already works."""
+			if version in entries:
+				current = entries[version].get().strip()
+				if current and self.find_executable(version, current) is not None:
+					return
+				entries[version].set(path)
+			elif version in EXTRA_VERSIONS:
+				row = add_row(version, path)
+				window.update_idletasks()
+				window.resize(window.winfo_height() + extra_height)
+				self.apply_theme(self.version.get(), subtree=row)
+			else:
+				return
+			scan["found"] += 1
+
+		def poll_scan():
+			if not window.winfo_exists():
+				return
+			while True:
+				try:
+					kind, *payload = scan["queue"].get_nowait()
+				except queue.Empty:
+					break
+				if kind == "progress":
+					path, checked = payload
+					options_status.config(
+						text=f"Searching {short_path(path)} \u00b7 {checked:,} folders",
+						fg=self.theme["muted"])
+				elif kind == "found":
+					version, path = payload
+					apply_found(version, path)
+				elif kind == "done":
+					_checked, cancelled = payload
+					scan["scanning"] = False
+					auto_button.set_label("AUTO SEARCH")
+					if cancelled:
+						message, good = "Search stopped.", scan["found"] > 0
+					elif scan["found"]:
+						message, good = (f"Found {scan['found']} install(s). "
+										 "Press SAVE to keep them."), True
+					else:
+						message, good = "No new installs found.", False
+					options_status.config(
+						text=message,
+						fg=self.theme["success"] if good else self.theme["warning"])
+			if scan["scanning"]:
+				window.after(100, poll_scan)
+
+		def start_scan():
+			scan["cancel"] = threading.Event()
+			scan["queue"] = queue.Queue()
+			scan["scanning"] = True
+			scan["found"] = 0
+			auto_button.set_label("STOP SEARCH")
+			options_status.config(text="Searching\u2026", fg=self.theme["muted"])
+			threading.Thread(target=self.scan_for_installs,
+							 args=(scan["queue"], scan["cancel"]), daemon=True).start()
+			poll_scan()
+
+		def toggle_scan():
+			if scan["scanning"]:
+				scan["cancel"].set()
+				auto_button.set_label("STOPPING\u2026")
+			else:
+				start_scan()
+
+		def on_options_destroyed(event):
+			if event.widget is window:
+				scan["cancel"].set()
+
+		window.bind("<Destroy>", on_options_destroyed, add="+")
+		self.style_popup(window, body)
 		self.apply_theme(self.version.get(), subtree=window)
 
 	def scan_roots(self):
@@ -2867,39 +3114,39 @@ class LauncherUI:
 		"""First launch: search every drive for game installs and let the user confirm them."""
 		window = Overlay(self.root, 820, 680)
 
-		body = tk.Frame(window, bg="#211c18", highlightbackground="#806b42",
-						highlightthickness=2, padx=22, pady=18)
-		body.pack(fill="both", expand=True, padx=14, pady=14)
+		body = window.make_body()
 		tk.Label(body, text="FIRST-TIME SETUP", bg="#211c18", fg=GOLD,
-				 font=self.ui_font(16, bold=True)).pack(anchor="w")
+				 font=self.ui_font(15, bold=True)).pack(anchor="w")
 		tk.Label(body,
 				 text="Welcome! The launcher is searching your drives for World of Warcraft "
 					  "installs. Review what it finds, and use BROWSE to pick any folder it misses.",
-				 bg="#211c18", fg="#c7baa0", font=self.ui_font(9, italic=True),
-				 wraplength=740, justify="left").pack(anchor="w", pady=(4, 6))
+				 bg="#211c18", fg="#c7baa0", font=self.ui_font(9),
+				 wraplength=740, justify="left").pack(anchor="w", pady=(3, 8))
+		tk.Frame(body, bg="#78613c", height=1).pack(fill="x", pady=(0, 6))
 		scan_status = tk.Label(body, text="Preparing search\u2026", bg="#211c18", fg=MUTED,
 							   font=self.ui_font(8, bold=True), anchor="w")
-		scan_status.pack(fill="x", pady=(0, 8))
+		scan_status.pack(fill="x", pady=(0, 6))
 
 		rows = {}
 		for version in self.game_versions:
-			row = tk.Frame(body, bg="#302922", highlightbackground="#51432f",
-						   highlightthickness=1, padx=8, pady=6)
+			row = tk.Frame(body, bg="#181614", padx=8, pady=6)
 			row.pack(fill="x", pady=3)
-			tk.Label(row, text=version, width=25, anchor="w", bg="#302922",
+			tk.Label(row, text=version, width=25, anchor="w", bg="#181614",
 					 fg=TEXT, font=self.ui_font(9, bold=True)).pack(side="left", padx=(2, 8))
 			path_var = tk.StringVar(value=self.game_paths.get(version, ""))
 			entry = tk.Entry(row, textvariable=path_var, bg="#171512", fg=TEXT,
-							 insertbackground=TEXT, relief="sunken", bd=1,
-							 font=self.ui_font(9))
+							 insertbackground=TEXT, relief="flat", bd=1,
+							 highlightthickness=1, highlightbackground="#51432f",
+							 highlightcolor="#806b42", font=self.ui_font(9))
 			entry.pack(side="left", fill="x", expand=True, padx=4, ipady=4)
-			state_label = tk.Label(row, text="", width=14, anchor="w", bg="#302922",
+			state_label = tk.Label(row, text="", width=14, anchor="w", bg="#181614",
 								   fg=MUTED, font=self.ui_font(7, bold=True))
 			state_label.pack(side="left", padx=(6, 0))
 			StoneButton(row, text="BROWSE", command=lambda variable=path_var: self.browse_folder(
 				window, variable), font=self.ui_font(8, bold=True), padx=8, pady=4,
-				bg="#302922", theme_provider=lambda: self.theme
+				bg="#181614", theme_provider=lambda: self.theme
 				).pack(side="left", padx=(6, 2))
+			self.style_popup_row(row)
 			rows[version] = (path_var, state_label)
 
 		state = {"cancel": threading.Event(), "queue": queue.Queue(),
@@ -3023,7 +3270,7 @@ class LauncherUI:
 		window.protocol("WM_DELETE_WINDOW", lambda: finish(False))
 		for path_var, _label in rows.values():
 			path_var.trace_add("write", refresh_states)
-		self.add_gradient(body, "panel")
+		self.style_popup(window, body)
 		self.apply_theme(self.version.get(), subtree=window)
 		start_scan()
 
@@ -3048,6 +3295,68 @@ class LauncherUI:
 			menu.add_command(label=version, command=tk._setit(self.version, version))
 		self.refresh_version_menu()
 
+	def edit_launch_args(self, parent, version, variable):
+		"""A small panel over Options for one game's launch arguments."""
+		window = Overlay(self.root, 600, 340, reuse_scrim=parent.scrim)
+		parent.place_forget()   # one panel at a time over the shared backdrop
+
+		def restore(event):
+			if event.widget is not window:
+				return
+			try:
+				width, height = parent.panel_size
+				parent.place(relx=.5, rely=.5, anchor="center", width=width, height=height)
+				parent.lift()
+				parent.grab_set()   # hand the modal grab back to Options
+			except tk.TclError:
+				pass
+
+		def stone(parent_frame, text, command):
+			return StoneButton(parent_frame, text=text, command=command,
+							   font=self.ui_font(8, bold=True), padx=8, pady=4,
+							   bg="#211c18", theme_provider=lambda: self.theme)
+
+		body = window.make_body()
+		text_var = tk.StringVar(value=variable.get())
+
+		def apply():
+			variable.set(" ".join(text_var.get().splitlines()).strip())
+			window.destroy()
+
+		actions = tk.Frame(body, bg="#211c18")
+		actions.pack(fill="x", side="bottom", pady=(10, 0))
+		stone(actions, "OK", apply).pack(side="right")
+		stone(actions, "CANCEL", window.destroy).pack(side="right", padx=(0, 8))
+		stone(actions, "CLEAR", lambda: text_var.set("")).pack(side="left")
+
+		tk.Label(body, text="LAUNCH ARGUMENTS", bg="#211c18", fg=GOLD,
+				 font=self.ui_font(15, bold=True)).pack(anchor="w")
+		tk.Label(body, text=f"{version}  \u00b7  used every time you press Play",
+				 bg="#211c18", fg="#c7baa0", font=self.ui_font(8)
+				 ).pack(anchor="w", pady=(3, 0))
+		tk.Frame(body, bg="#78613c", height=1).pack(fill="x", pady=(10, 0))
+		entry = tk.Entry(body, textvariable=text_var, bg="#171512", fg=TEXT,
+						 insertbackground=TEXT, relief="flat", bd=1, highlightthickness=1,
+						 highlightbackground="#51432f", highlightcolor="#806b42",
+						 font=self.ui_font(10))
+		entry.pack(fill="x", ipady=6, pady=(14, 8))
+		entry.bind("<Return>", lambda _event: apply())
+		entry.bind("<Escape>", lambda _event: window.destroy())
+		hint = ("Separate arguments with spaces and put quotes around a value that contains "
+				"spaces, for example -console. They are passed straight to the game, so only "
+				"use arguments you trust. Leave this empty to launch normally.")
+		if version in LOADER_VERSIONS:
+			hint += (" This game starts through its own loader, so the arguments go to the "
+					 "loader, which may not pass them on to the client.")
+		tk.Label(body, text=hint, bg="#211c18", fg=MUTED, font=self.ui_font(8),
+				 wraplength=520, justify="left").pack(anchor="w")
+
+		window.bind("<Destroy>", restore, add="+")
+		self.style_popup(window, body)
+		self.apply_theme(self.version.get(), subtree=window)
+		entry.focus_set()
+		entry.icursor("end")
+
 	def browse_folder(self, parent, variable):
 		current = variable.get().strip()
 		initial = current if Path(current).is_dir() else str(Path.home())
@@ -3056,9 +3365,15 @@ class LauncherUI:
 		if selected:
 			variable.set(selected)
 
-	def save_options(self, window, entries, options_status):
+	def save_options(self, window, entries, options_status, arg_vars=None):
 		self.game_paths.update({version: variable.get().strip()
 								for version, variable in entries.items()})
+		for version, variable in (arg_vars or {}).items():
+			text = variable.get().strip()
+			if text:
+				self.launch_args[version] = text
+			else:
+				self.launch_args.pop(version, None)
 		# An extra is shown while it has a folder; clearing the folder hides it again.
 		for name in EXTRA_VERSIONS:
 			if name in entries:
@@ -3077,7 +3392,7 @@ class LauncherUI:
 		if self.version.get() not in self.game_versions:
 			self.version.set(GAME_VERSIONS[0])
 		self.update_install_status()
-		self.set_status("Game folders saved")
+		self.set_status("Game settings saved")
 		window.destroy()
 
 	def draw_background(self, event):
@@ -3134,7 +3449,7 @@ class LauncherUI:
 						  width=w-36, justify="center")
 
 	def fitted_slide(self, index, size):
-		key = (index, size)
+		key = (self.slideshow_key, index, size)
 		frame = self._slide_cache.get(key)
 		if frame is None:
 			frame = ImageOps.fit(self.slideshow_images[index], size,
@@ -3251,6 +3566,9 @@ class LauncherUI:
 
 	def play_game(self):
 		version = self.version.get()
+		if self.updates.is_updating(version):
+			self.set_status(f"{version} is updating")
+			return
 		install_path = self.game_paths.get(version, "")
 		if not install_path:
 			self.set_status(f"Choose the {version} folder in Options")
@@ -3267,14 +3585,17 @@ class LauncherUI:
 			return
 		try:
 			# macOS clients are .app bundles, which are opened rather than executed directly.
-			command = (["open", str(executable)] if executable.suffix.casefold() == ".app"
-					   else [str(executable)])
+			args = split_launch_args(self.launch_args.get(version, ""))
+			if executable.suffix.casefold() == ".app":
+				command = ["open", str(executable)] + (["--args", *args] if args else [])
+			else:
+				command = [str(executable), *args]
 			subprocess.Popen(command, cwd=str(executable.parent))
 		except OSError as error:
 			self.set_status(f"Could not start {version}")
 			messagebox.showerror("Could not launch game", str(error), parent=self.root)
 			return
-		self.set_status(f"Launching {version}…")
+		self.set_status(f"Launching {version}" + (f" with {len(args)} argument(s)" if args else "") + "…")
 		if version in LOADER_VERSIONS:
 			self.watch_for_client(version, executable)
 
