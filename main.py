@@ -2818,7 +2818,7 @@ class LauncherUI:
 		self.background.delete("credit")
 		x, y = width * .954, height * .985
 		font = self.ui_font(8, bold=True)
-		text = "Created by Frank Rosello, version 1.0"
+		text = "Created by Frank Rosello, version 1.0.1"
 		for offset_x in range(4):
 			for offset_y in range(4):
 				if offset_x or offset_y:
