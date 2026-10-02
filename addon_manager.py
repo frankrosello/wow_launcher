@@ -30,13 +30,40 @@ OVERLAY_BG = "#100f12"
 CURSE_API = "https://curseforge-proxy.frankierose212005.workers.dev"
 CURSE_STATE_FILE = "AddOns_curseforge.json"    # saved next to the AddOns folder
 CURSE_MATCH_FILE = "AddOns_curseforge_matches_v2.json"   # folder name -> project id
-# Which CurseForge game-version major numbers belong to each launcher game.
-# Games not listed here accept any file.
+# Forever shares major 1 with Era, so compare the full version and flavor metadata.
+FOREVER_VERSION_TYPE_ID = 88568
+FOREVER_BETA_VERSION = "1.60.1"
+
+
+class FlavorRule:
+	def __init__(self, major_rule, forever=False, exclude_forever=False):
+		self.major_rule = major_rule
+		self.forever = forever
+		self.exclude_forever = exclude_forever
+
+	def matches_version(self, version):
+		version = str(version).strip()
+		is_forever = bool(re.fullmatch(r"1\.60(?:\.\d+)+", version)) or "forever" in version.casefold()
+		if self.forever:
+			return is_forever
+		if self.exclude_forever and is_forever:
+			return False
+		return bool(re.fullmatch(r"\d+(\.\d+)+", version)) and self.major_rule(int(version.split(".")[0]))
+
+	def matches_file(self, file):
+		if any(self.matches_version(version) for version in file.get("gameVersions", [])):
+			return True
+		return self.forever and any(str(item.get("gameVersionTypeId")) == str(FOREVER_VERSION_TYPE_ID)
+			for item in file.get("sortableGameVersions", []))
+
+
 FLAVOR_RULES = {
-	"Retail": lambda major: major >= 10,
-	"Classic Era": lambda major: major == 1,
-	"TBC Anniversary": lambda major: major == 2,
-	"Mists of Pandaria Classic": lambda major: major == 5,
+	"WoW Forever Beta": FlavorRule(lambda major: major == 1, forever=True),
+	"Retail": FlavorRule(lambda major: major >= 10),
+	"Classic Era": FlavorRule(lambda major: major == 1, exclude_forever=True),
+	"TBC Anniversary": FlavorRule(lambda major: major == 2),
+	"Crusader Storm": FlavorRule(lambda major: major == 2),
+	"Mists of Pandaria Classic": FlavorRule(lambda major: major == 5),
 }
 # Soft shadow around the floating panel: (x offset, y offset, blur radius, opacity)
 OVERLAY_SHADOW_LAYERS = ((0, 6, 9, 0.70), (0, 2, 3, 0.60))
@@ -268,9 +295,7 @@ def pick_file(files, accepts):
 	"""Newest file for this game (releases preferred over betas/alphas), or None."""
 	candidates = []
 	for item in files:
-		majors = [int(version.split(".")[0]) for version in item.get("gameVersions", [])
-				  if re.fullmatch(r"\d+(\.\d+)+", version)]
-		if accepts is not None and not any(accepts(major) for major in majors):
+		if accepts is not None and not accepts.matches_file(item):
 			continue
 		candidates.append(item)
 	if not candidates:
@@ -298,6 +323,7 @@ class AddonManager:
 
 	def __init__(self, app, addons_dir, version, button_class):
 		self.app = app
+		self.version = version
 		self.addons_dir = Path(addons_dir)
 		self.disabled_dir = self.addons_dir.parent / "AddOns_Disabled"
 		self.state_path = self.addons_dir.parent / CURSE_STATE_FILE
@@ -333,7 +359,8 @@ class AddonManager:
 		def button(parent, text, command, side="left", padx=(0, 6)):
 			widget = self.button_class(
 				parent, text=text, command=command, font=app.ui_font(8, bold=True),
-				padx=8, pady=4, bg="#211c18", theme_provider=lambda: app.theme)
+				padx=8, pady=4, bg=theme["panel"], theme_provider=lambda: app.theme,
+				style="subtle", version_colored=True)
 			widget.pack(side=side, padx=padx)
 			return widget
 
@@ -378,9 +405,13 @@ class AddonManager:
 		button(actions, "BROWSE ADDONS", self.open_browse)
 		button(actions, "INSTALL ZIP", self.install_from_file)
 		button(actions, "FROM URL", self.install_from_url)
-		button(actions, "REMOVE", self.remove_selected, "right", (6, 0))
-		button(actions, "DISABLE", lambda: self.set_enabled(False), "right", (6, 0))
-		button(actions, "ENABLE", lambda: self.set_enabled(True), "right", (6, 0))
+		selection_actions = tk.Frame(body, bg=theme["panel"])
+		selection_actions.pack(fill="x", side="bottom", pady=(8, 0))
+		tk.Label(selection_actions, text="SELECTED ADDONS", bg=theme["panel"],
+			fg=theme["muted"], font=app.ui_font(8, bold=True)).pack(side="left")
+		button(selection_actions, "REMOVE", self.remove_selected, "right", (6, 0))
+		button(selection_actions, "DISABLE", lambda: self.set_enabled(False), "right", (6, 0))
+		button(selection_actions, "ENABLE", lambda: self.set_enabled(True), "right", (6, 0))
 
 		status_row = tk.Frame(body, bg="#211c18")
 		status_row.pack(fill="x", side="bottom", pady=(8, 0))
@@ -391,16 +422,22 @@ class AddonManager:
 			status_row, bg="#211c18", fg="#a89d88", font=app.ui_font(8), anchor="w",
 			text="Select addons to enable, disable or remove them. Right-click for more.")
 		self.status.pack(side="left", fill="x", expand=True)
+		self.status.config(wraplength=700, justify="left")
+		self.progress = ttk.Progressbar(body, mode="indeterminate", style="Addon.Horizontal.TProgressbar")
+		self.progress.configure(maximum=100)
 
 		# A recessed rounded strip around the list, like the playtime box on the main screen.
 		table = tk.Frame(body, bg="#181614", padx=3, pady=3)
 		table.pack(fill="both", expand=True)
 		style = ttk.Style(window)
 		style.theme_use("clam")
+		style.configure("Addon.Horizontal.TProgressbar", background=theme["accent"],
+			troughcolor=theme["surface"], borderwidth=0, thickness=3,
+			lightcolor=theme["accent"], darkcolor=theme["accent"])
 		flat = theme["surface"]
 		style.configure("Addon.Treeview", background=flat, fieldbackground=flat,
 						foreground=theme["text"], borderwidth=0, relief="flat",
-						rowheight=26, font=app.ui_font(9))
+						rowheight=30, font=app.ui_font(9))
 		style.layout("Addon.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])  # no frame
 		style.map("Addon.Treeview",
 				  background=[("selected", theme["control_active"])],
@@ -436,9 +473,13 @@ class AddonManager:
 		self.update_headings()
 		scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview,
 								  style="Addon.Vertical.TScrollbar")
-		self.tree.configure(yscrollcommand=scrollbar.set)
-		scrollbar.pack(side="right", fill="y", padx=(3, 1), pady=2)
-		self.tree.pack(side="left", fill="both", expand=True)
+		horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
+		self.tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+		table.rowconfigure(0, weight=1)
+		table.columnconfigure(0, weight=1)
+		self.tree.grid(row=0, column=0, sticky="nsew")
+		scrollbar.grid(row=0, column=1, sticky="ns", padx=(3, 1), pady=2)
+		horizontal.grid(row=1, column=0, sticky="ew")
 		self.tree.tag_configure("off", foreground=theme["disabled"])
 		self.tree.tag_configure("update", foreground=theme["warning"])
 		self.empty_label = tk.Label(table, text="", bg=theme["surface"], fg=theme["muted"],
@@ -469,6 +510,17 @@ class AddonManager:
 		app.apply_theme(app.version.get(), subtree=window)
 		self.update_button.set_label("UPDATE ALL")
 		entry.focus_set()
+
+	def show_download_progress(self):
+		self.progress.stop()
+		self.progress.configure(mode="indeterminate", value=0)
+		self.progress.pack(side="bottom", fill="x", pady=(6, 0), before=self.status.master)
+		self.progress.start(15)
+
+	def hide_download_progress(self):
+		self.progress.stop()
+		self.progress.pack_forget()
+		self.progress["value"] = 0
 
 	def on_destroy(self, event):
 		if event.widget is self.window:
@@ -927,6 +979,7 @@ class AddonManager:
 		self.window.after(150, self.poll_tasks)
 
 	def next_update(self):
+		self.show_download_progress()
 		mod, file = self.pending.popleft()
 		name = file.get("displayName") or file.get("fileName") or mod
 		self.set_status(f"{'Installing' if self.fresh else 'Updating'} {name}\u2026 "
@@ -939,12 +992,14 @@ class AddonManager:
 	def supports(self, mod):
 		"""True if the CurseForge project has a file for the selected launcher game."""
 		if self.accepts is None:
-			return True
+			return False  # No known mapping: do not advertise unrelated files as compatible.
 		if pick_file(mod.get("latestFiles", []), self.accepts):
 			return True
 		for index in mod.get("latestFilesIndexes", []):
 			version = index.get("gameVersion", "")
-			if re.fullmatch(r"\d+(\.\d+)+", version) and self.accepts(int(version.split(".")[0])):
+			if self.accepts.matches_version(version):
+				return True
+			if self.accepts.forever and str(index.get("gameVersionTypeId")) == str(FOREVER_VERSION_TYPE_ID):
 				return True
 		return False
 
@@ -964,14 +1019,15 @@ class AddonManager:
 		def button(parent, text, command, side="left", padx=(0, 6)):
 			widget = self.button_class(
 				parent, text=text, command=command, font=app.ui_font(8, bold=True),
-				padx=8, pady=4, bg="#211c18", theme_provider=lambda: app.theme)
+				padx=8, pady=4, bg=theme["panel"], theme_provider=lambda: app.theme,
+				style="subtle", version_colored=True)
 			widget.pack(side=side, padx=padx)
 			return widget
 
 		body = window.make_body()
 		tk.Label(body, text="BROWSE ADDONS", bg="#211c18", fg="#e3c36e",
 				 font=app.ui_font(15, bold=True)).pack(anchor="w")
-		tk.Label(body, text=f"CurseForge  \u00b7  {app.version.get()}  \u00b7  "
+		tk.Label(body, text=f"CurseForge  \u00b7  {self.version}  \u00b7  "
 				 "most popular first  \u00b7  double-click to install",
 				 bg="#211c18", fg="#c7baa0", font=app.ui_font(8)
 				 ).pack(anchor="w", pady=(3, 0))
@@ -998,6 +1054,8 @@ class AddonManager:
 		self.browse_status = tk.Label(body, text="", bg="#211c18", fg="#a89d88",
 									  font=app.ui_font(8), anchor="w")
 		self.browse_status.pack(fill="x", side="bottom", pady=(8, 0))
+		self.browse_status.config(wraplength=850, justify="left")
+
 
 		table = tk.Frame(body, bg="#181614", padx=3, pady=3)
 		table.pack(fill="both", expand=True)
@@ -1012,9 +1070,13 @@ class AddonManager:
 			self.browse_tree.column(key, width=width, anchor="w", stretch=(key == "summary"))
 		scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.browse_tree.yview,
 								  style="Addon.Vertical.TScrollbar")
-		self.browse_tree.configure(yscrollcommand=scrollbar.set)
-		scrollbar.pack(side="right", fill="y", padx=(3, 1), pady=2)
-		self.browse_tree.pack(side="left", fill="both", expand=True)
+		horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.browse_tree.xview)
+		self.browse_tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+		table.rowconfigure(0, weight=1)
+		table.columnconfigure(0, weight=1)
+		self.browse_tree.grid(row=0, column=0, sticky="nsew")
+		scrollbar.grid(row=0, column=1, sticky="ns", padx=(3, 1), pady=2)
+		horizontal.grid(row=1, column=0, sticky="ew")
 		self.browse_tree.tag_configure("off", foreground=theme["disabled"])
 		self.browse_empty = tk.Label(table, text="", bg=theme["surface"], fg=theme["muted"],
 									 font=app.ui_font(10, italic=True), justify="center")
@@ -1070,9 +1132,14 @@ class AddonManager:
 						 daemon=True).start()
 
 	def browse_worker(self, term, token):
+		if self.accepts is None:
+			self.browse_tasks.put((token, [], None))
+			return
 		try:
 			params = {"gameId": 1, "classId": 1, "sortField": 2, "sortOrder": "desc",
 					  "pageSize": 40}
+			if self.accepts.forever:
+				params["gameVersion"] = FOREVER_BETA_VERSION
 			if term:
 				params["searchFilter"] = term
 			data = self.curse_request("/v1/mods/search?" + urlencode(params), None)
@@ -1096,26 +1163,32 @@ class AddonManager:
 	def show_results(self, mods, error):
 		if error:
 			self.browse_note(f"Search failed: {error}", "warning")
+			if not self.browse_tree.get_children():
+				self.browse_empty.config(text="Could not load addons.\nCheck your connection and try SEARCH again.")
+				self.browse_empty.place(relx=.5, rely=.4, anchor="center")
 			return
+		mods = [mod for mod in (mods or []) if self.supports(mod)]
 		have = {row["curse_id"] for row in self.rows if row["curse_id"]}
 		self.browse_mods = {str(mod["id"]): mod for mod in mods}
 		self.browse_tree.delete(*self.browse_tree.get_children())
-		# Projects for this game first; the rest are dimmed at the bottom.
-		for mod in sorted(mods, key=lambda item: not self.supports(item)):
+		# Preserve popularity order, showing only projects with compatible file metadata.
+		for mod in mods:
 			mod_id = str(mod["id"])
-			ok = self.supports(mod)
-			status = "Installed" if mod_id in have else ("" if ok else "Other game")
+			status = "Installed" if mod_id in have else "Available"
 			authors = ", ".join(a.get("name", "") for a in mod.get("authors", [])[:2])
 			self.browse_tree.insert(
-				"", "end", iid=mod_id, tags=() if ok else ("off",),
+				"", "end", iid=mod_id,
 				values=(mod.get("name", ""), authors, short_number(mod.get("downloadCount")),
 						(mod.get("dateModified") or "")[:10], status,
 						mod.get("summary", "")))
 		if mods:
 			self.browse_empty.place_forget()
-			self.browse_note(f"{len(mods)} result(s). Select addons and press INSTALL SELECTED.")
+			self.browse_note(f"{len(mods)} compatible result(s) for {self.version}. Select addons to install.")
 		else:
-			self.browse_empty.config(text="No addons found.\nTry a different search.")
+			message = (f"No compatible addons found for {self.version}.\nTry a different search."
+				if self.accepts is not None else
+				f"CurseForge compatibility is not defined for {self.version}.\nUse INSTALL ZIP or FROM URL for this client.")
+			self.browse_empty.config(text=message)
 			self.browse_empty.place(relx=.5, rely=.4, anchor="center")
 			self.browse_empty.lift()
 			self.browse_note("No results.")
@@ -1272,6 +1345,7 @@ class AddonManager:
 			return
 		self.busy = True
 		self.set_status("Downloading\u2026")
+		self.show_download_progress()
 		threading.Thread(target=self.download, args=(url, None), daemon=True).start()
 		self.window.after(150, self.poll_tasks)
 
@@ -1282,6 +1356,11 @@ class AddonManager:
 			total = 0
 			with os.fdopen(handle, "wb") as output, urlopen(
 					Request(url, headers=DOWNLOAD_HEADERS), timeout=30) as response:
+				try:
+					expected = int(response.headers.get("Content-Length", "0"))
+				except (TypeError, ValueError):
+					expected = 0
+				last_report = 0.0
 				while True:
 					chunk = response.read(65536)
 					if not chunk:
@@ -1290,6 +1369,10 @@ class AddonManager:
 					if total > MAX_DOWNLOAD_BYTES:
 						raise OSError("file is larger than 200 MB")
 					output.write(chunk)
+					now = time.monotonic()
+					if expected > 0 and now - last_report >= 0.1:
+						self.tasks.put(("progress", min(100, total * 100 / expected), None, context))
+						last_report = now
 			self.tasks.put(("download", path, None, context))
 		except Exception as error:
 			if path:
@@ -1306,6 +1389,11 @@ class AddonManager:
 			kind, value, error, context = self.tasks.get_nowait()
 		except queue.Empty:
 			self.window.after(150, self.poll_tasks)
+			return
+		if kind == "progress":
+			self.progress.stop()
+			self.progress.configure(mode="determinate", value=value)
+			self.window.after(20, self.poll_tasks)
 			return
 		if kind == "check":
 			self.busy = False
@@ -1336,6 +1424,10 @@ class AddonManager:
 			self.updated = 0
 			self.failed = [f"{name} (no compatible file)" for name in context or []]
 			self.fresh = True
+			if not self.pending:
+				self.busy = False
+				self.set_status("No compatible addon files found.", "warning")
+				return
 			self.next_update()
 			self.window.after(150, self.poll_tasks)
 			return
@@ -1346,6 +1438,7 @@ class AddonManager:
 				self.failed.append(context["name"])
 			else:
 				self.busy = False
+				self.hide_download_progress()
 				self.set_status(f"Download failed: {error}", "error")
 				return
 		else:
@@ -1375,6 +1468,7 @@ class AddonManager:
 			self.window.after(150, self.poll_tasks)
 			return
 		self.busy = False
+		self.hide_download_progress()
 		if context:
 			self.refresh()
 			verb = "Installed" if self.fresh else "Updated"

@@ -1,6 +1,8 @@
 """A classic-styled launcher for configured World of Warcraft installations."""
 from collections import deque
 import io
+import math
+from datetime import date, datetime, timedelta
 import json
 from html.parser import HTMLParser
 import os
@@ -774,8 +776,9 @@ class StoneButton(tk.Canvas):
 	"""A clickable launcher control styled like a beveled stone game button."""
 
 	def __init__(self, parent, text, command, font, padx=16, pady=7,
-				 background_provider=None, theme_provider=None, style="stone", **kwargs):
+				 background_provider=None, theme_provider=None, style="stone", version_colored=False, **kwargs):
 		self.style = style
+		self.version_colored = version_colored
 		self.label = text
 		self.command = command
 		self.button_font = font
@@ -813,6 +816,14 @@ class StoneButton(tk.Canvas):
 			return
 		self.delete("all")
 		button_theme = self.theme_provider()
+		if self.version_colored:
+			# Popup buttons always use the version palette, even if popup styling resets style.
+			self.style = "subtle"
+			button_theme = dict(button_theme)
+			for button_role, version_role in (("button_face", "control"),
+				("button_hover", "control_active"), ("button_pressed", "window"),
+				("button_highlight", "accent"), ("button_shadow", "accent_dark")):
+				button_theme[button_role] = button_theme[version_role]
 		background = None
 		if self.background_provider is not None:
 			background = self.background_provider(self, width, height)
@@ -1216,7 +1227,9 @@ class LauncherUI:
 		self.status.place(relx=.046, rely=.985, anchor="sw")
 		self.root.protocol("WM_DELETE_WINDOW", self.close_launcher)
 		self.playtime_poll_id = self.root.after(1000, self.poll_game_processes)
+		self.update_news_age()
 		self.news_poll_id = self.root.after(250, self.poll_news_queue)
+
 		self._background_poll_id = self.root.after(30, self.poll_background_queue)
 		self.update_install_status()
 		self.apply_theme(GAME_VERSIONS[0])
@@ -1415,18 +1428,12 @@ class LauncherUI:
 				child.destroy()
 
 	def build_header(self):
-		self.options_button = StoneButton(self.root, text="OPTIONS", command=self.open_options,
-					font=self.ui_font(8, bold=True), padx=10, pady=4,
-					bg=BG, background_provider=self.backdrop_patch,
-					theme_provider=lambda: self.theme, style="subtle")
-		self.options_button.place(**OPTIONS_PLACE)
 		self.update_button = StoneButton(
 			self.root, text="UPDATE AVAILABLE", command=lambda: self.updates.check_selected(),
 			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
 			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme,
 			style="subtle")
-		self.update_button.place(relx=.96, rely=.045, anchor="ne",
-								x=-(self.options_button.winfo_reqwidth() + 6))
+		self.update_button.place(relx=.96, rely=.045, anchor="ne")
 		self.armory_button = StoneButton(
 			self.root, text="ARMORY", command=self.open_armory,
 			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
@@ -1496,6 +1503,18 @@ class LauncherUI:
 		self.news_status_label = tk.Label(news_header, text="CONNECTING…",
 									  bg="#211c18", fg=MUTED,
 									  font=self.ui_font(7))
+		self.news_reload_button = tk.Label(news_header, text="↻",
+			font=self.ui_font(11), bg="#211c18", fg=MUTED,
+			bd=0, highlightthickness=0, padx=3, pady=0, cursor="hand2", takefocus=True)
+		for event in ("<Button-1>", "<Return>", "<space>"):
+			self.news_reload_button.bind(event, lambda _event: self.load_game_news(force=True))
+		for event in ("<Enter>", "<FocusIn>"):
+			self.news_reload_button.bind(event,
+				lambda _event: self.news_reload_button.config(fg=self.theme["text"]))
+		for event in ("<Leave>", "<FocusOut>"):
+			self.news_reload_button.bind(event,
+				lambda _event: self.news_reload_button.config(fg=self.theme["muted"]))
+		self.news_reload_button.pack(side="right", padx=(5, 0))
 		self.news_status_label.pack(side="right")
 		self.news_items_frame = tk.Frame(news, bg="#211c18")
 		self.news_items_frame.pack(fill="both", expand=True)
@@ -1513,8 +1532,19 @@ class LauncherUI:
 		playtime.place(relx=.018, rely=.05, relwidth=.37, relheight=.9)
 		playtime_header = tk.Frame(playtime, bg="#181614")
 		playtime_header.pack(fill="x")
-		tk.Label(playtime_header, text="PLAYTIME", bg="#181614", fg=GOLD,
-				 font=self.ui_font(8, bold=True)).pack(side="left")
+		# A label avoids macOS drawing a white native button over the dark theme.
+		self.playtime_button = tk.Label(playtime_header, text="PLAYTIME  ›",
+			bg="#181614", fg=GOLD, font=self.ui_font(8, bold=True),
+			bd=0, highlightthickness=0, padx=0, pady=0, cursor="hand2", takefocus=True)
+		self.playtime_button.pack(side="left")
+		for event in ("<Button-1>", "<Return>", "<space>"):
+			self.playtime_button.bind(event, lambda _event: self.open_playtime_viewer())
+		for event in ("<Enter>", "<FocusIn>"):
+			self.playtime_button.bind(event,
+				lambda _event: self.playtime_button.config(fg=self.theme["bright"]))
+		for event in ("<Leave>", "<FocusOut>"):
+			self.playtime_button.bind(event,
+				lambda _event: self.playtime_button.config(fg=self.theme["accent"]))
 		self.playtime_status_label = tk.Label(playtime_header, text="\u25cf CHECKING",
 										  bg="#181614", fg=MUTED,
 										  font=self.ui_font(7, bold=True))
@@ -1546,11 +1576,14 @@ class LauncherUI:
 		for label, command in (
 				("OPEN FOLDER", self.open_game_folder),
 				("ADD-ONS", self.open_addon_manager),
-				("CONFIG", self.open_game_config)):
-			StoneButton(actions, text=label, command=command,
+				("OPTIONS", self.open_options)):
+			button = StoneButton(actions, text=label, command=command,
 						font=self.ui_font(8, bold=True), padx=7, pady=5,
 						bg="#181614", theme_provider=lambda: self.theme
-						).pack(side="left", padx=3, expand=True)
+						)
+			button.pack(side="left", padx=3, expand=True)
+			if label == "OPTIONS":
+				self.options_button = button
 
 		self.play = StoneButton(footer, text="Play", command=self.play_game,
 							font=self.ui_font(16, bold=True), padx=22, pady=8,
@@ -1561,6 +1594,8 @@ class LauncherUI:
 
 	def load_settings(self):
 		self.playtime_seconds = {version: 0.0 for version in ALL_VERSIONS}
+		self.playtime_history = {}  # local ISO date -> version -> seconds
+		self.playtime_history_started = date.today().isoformat()
 		self.enabled_extras = set()
 		self.learned_clients = {}
 		self.tracked_clients = {}  # pid -> (game, create_time)
@@ -1575,6 +1610,25 @@ class LauncherUI:
 				for version, value in saved_playtime.items():
 					if isinstance(value, (int, float)) and not isinstance(value, bool):
 						self.playtime_seconds[version] = max(0.0, float(value))
+			history = data.get("playtime_history", {})
+			if isinstance(history, dict):
+				for day, versions in history.items():
+					try:
+						if date.fromisoformat(day).isoformat() != day or not isinstance(versions, dict):
+							continue
+					except (TypeError, ValueError):
+						continue
+					clean = {name: float(value) for name, value in versions.items()
+						if isinstance(value, (int, float)) and not isinstance(value, bool)
+						and math.isfinite(value) and value >= 0}
+					if clean:
+						self.playtime_history[day] = clean
+			try:
+				started = date.fromisoformat(data.get("playtime_history_started", ""))
+				self.playtime_history_started = min(started, date.today()).isoformat()
+			except (TypeError, ValueError):
+				if self.playtime_history:
+					self.playtime_history_started = min(self.playtime_history)
 			known_paths = {
 				version: str(folders.get(
 					version,
@@ -1839,6 +1893,28 @@ class LauncherUI:
 
 		step(1)
 
+	def update_news_age(self):
+		if self.last_news is None:
+			return
+		version, articles, errors, matched = self.last_news
+		timestamps = [self._news_page_cache[url][0] for url in self.news_sources_for(version)
+			if url in self._news_page_cache]
+		if not timestamps:
+			return
+		seconds = max(0, int(time.monotonic() - min(timestamps)))
+		if seconds < 60:
+			age = "NOW"
+		elif seconds < 3600:
+			age = f"{seconds // 60}M AGO"
+		elif seconds < 86400:
+			age = f"{seconds // 3600}H AGO"
+		else:
+			age = f"{seconds // 86400}D AGO"
+		prefix = "PARTIAL" if errors else ("OFFICIAL" if matched else "LATEST")
+		self.news_status_label.config(text=f"{prefix} · UPDATED {age}",
+			fg=self.theme["warning"] if errors else
+			(self.theme["success"] if matched else self.theme["muted"]))
+
 	def news_sources_for(self, version):
 		sources = [WOW_NEWS_URL]
 		if version not in ("WoW Forever Beta", "Retail"):
@@ -1847,11 +1923,11 @@ class LauncherUI:
 
 	NEWS_CACHE_SECONDS = 600
 
-	def news_source_articles(self, source_url, allow_network):
+	def news_source_articles(self, source_url, allow_network, force=False):
 		"""(articles, failed) for one news page, cached for a few minutes. Returns None
 		when a download would be needed but is not allowed."""
 		cached = self._news_page_cache.get(source_url)
-		if cached is not None and time.monotonic() - cached[0] < self.NEWS_CACHE_SECONDS:
+		if not force and cached is not None and time.monotonic() - cached[0] < self.NEWS_CACHE_SECONDS:
 			return [dict(article) for article in cached[1]], False
 		if not allow_network:
 			return None
@@ -1876,13 +1952,13 @@ class LauncherUI:
 			self._news_page_cache[source_url] = (time.monotonic(), found)
 		return [dict(article) for article in found], not found
 
-	def build_news(self, version, allow_network=True):
+	def build_news(self, version, allow_network=True, force=False):
 		"""(selected articles, error count, matched) or None if it needs the network."""
 		sources = self.news_sources_for(version)
 		if allow_network:
 			with ThreadPoolExecutor(max_workers=len(sources)) as pool:
 				results = list(pool.map(
-					lambda url: self.news_source_articles(url, True), sources))
+					lambda url: self.news_source_articles(url, True, force=force), sources))
 		else:
 			results = [self.news_source_articles(url, False) for url in sources]
 			if any(result is None for result in results):
@@ -1919,7 +1995,7 @@ class LauncherUI:
 				selected.append(article)
 		return selected, feed_errors, matched
 
-	def load_game_news(self):
+	def load_game_news(self, force=False):
 		version = self.version.get()
 		self.news_generation += 1
 		generation = self.news_generation
@@ -1927,13 +2003,13 @@ class LauncherUI:
 		self.show_news_message(f"Loading {version} news from Blizzard…")
 		thread = threading.Thread(
 			target=self.fetch_game_news,
-			args=(version, generation), daemon=True)
+			args=(version, generation, force), daemon=True)
 		thread.start()
 
-	def fetch_game_news(self, version, generation):
+	def fetch_game_news(self, version, generation, force=False):
 		selected, errors, matched = [], 1, False
 		try:
-			selected, errors, matched = self.build_news(version)
+			selected, errors, matched = self.build_news(version, force=force)
 		except Exception:
 			pass
 		finally:
@@ -1950,6 +2026,7 @@ class LauncherUI:
 			if generation != self.news_generation or version != self.version.get():
 				continue
 			self.render_game_news(version, articles, errors, matched)
+		self.update_news_age()
 		self.news_poll_id = self.root.after(250, self.poll_news_queue)
 
 	def show_news_message(self, message):
@@ -2144,9 +2221,7 @@ class LauncherUI:
 			return
 
 		self.last_news = (version, articles, errors, matched)
-		self.news_status_label.config(
-			text="OFFICIAL · UPDATED NOW" if matched else "LATEST WOW NEWS",
-			fg=self.theme["success"] if matched else self.theme["muted"])
+		self.update_news_age()
 		actual_height = self.news_items_frame.winfo_height()
 		available = max(1, actual_height - 12)
 		self.news_layout_height = actual_height
@@ -2154,8 +2229,6 @@ class LauncherUI:
 			plan = self.plan_news_layout(articles, available)
 		count, lines = plan
 		self.news_cards = self.build_news_cards(articles[:count], lines)
-		if errors and not matched:
-			self.news_status_label.config(text="PARTIAL FEED", fg=self.theme["warning"])
 		if animate:
 			self.animate_news_cards(self.news_cards)
 		else:
@@ -2336,6 +2409,192 @@ class LauncherUI:
 			text=self.format_total_time(self.playtime_seconds.get(version, 0)),
 			fg=self.theme["text"])
 
+	def record_playtime(self, version, seconds, end_timestamp=None):
+		"""Use monotonic elapsed seconds; split history at local midnight."""
+		if not math.isfinite(seconds) or seconds <= 0:
+			return
+		end = time.time() if end_timestamp is None else end_timestamp
+		cursor = end - seconds
+		self.playtime_seconds[version] = self.playtime_seconds.get(version, 0.0) + seconds
+		while cursor < end:
+			day = datetime.fromtimestamp(cursor).date()
+			midnight = datetime.combine(day + timedelta(days=1), datetime.min.time()).timestamp()
+			stop = min(end, midnight)
+			entry = self.playtime_history.setdefault(day.isoformat(), {})
+			entry[version] = entry.get(version, 0.0) + (stop - cursor)
+			self.playtime_history_started = min(self.playtime_history_started, day.isoformat())
+			cursor = stop
+
+	def playtime_series(self, version, days, end_day):
+		start = end_day - timedelta(days=days - 1)
+		series = []
+		for offset in range(days):
+			day = start + timedelta(days=offset)
+			values = self.playtime_history.get(day.isoformat(), {})
+			seconds = sum(values.values()) if version == "All versions" else values.get(version, 0.0)
+			series.append((day, seconds if day.isoformat() >= self.playtime_history_started else None))
+		return series
+
+	def open_playtime_viewer(self):
+		"""A responsive native graph; hover details stay inside the panel."""
+		theme = dict(self.theme)
+		panel = theme["panel"]
+		window = Overlay(self.root, 860, 570)
+		body = window.make_body()
+		body.config(bg=panel)
+		def button(parent, text, command):
+			return StoneButton(parent, text=text, command=command, font=self.ui_font(8, bold=True),
+				bg=panel, theme_provider=lambda: theme, style="subtle", padx=8, pady=4)
+		top = tk.Frame(body, bg=panel)
+		top.pack(fill="x", pady=(0, 12))
+		tk.Label(top, text="PLAYTIME", bg=panel, fg=theme["accent"],
+			font=self.ui_font(15, bold=True)).pack(side="left")
+		button(top, "CLOSE", window.destroy).pack(side="right")
+		controls = tk.Frame(body, bg=panel)
+		controls.pack(fill="x", pady=(0, 12))
+		selected = tk.StringVar(value=self.version.get())
+		versions = list(dict.fromkeys(["All versions", *self.game_versions,
+			*self.playtime_seconds, *(name for values in self.playtime_history.values() for name in values)]))
+		menu = tk.OptionMenu(controls, selected, *versions, command=lambda _: draw())
+		menu_font = self.ui_font(8)
+		# Reserve the longest title, so changing versions cannot squeeze other controls.
+		menu_width = math.ceil(max(menu_font.measure(name) for name in versions) /
+			max(1, menu_font.measure("0"))) + 2
+		menu.config(bg=theme["control"], fg=theme["text"], relief="flat", bd=0,
+			highlightthickness=0, font=menu_font, width=menu_width, anchor="w",
+			activebackground=theme["control_active"])
+		menu["menu"].config(bg=theme["control"], fg=theme["text"], font=self.ui_font(8))
+		menu.pack(side="left", padx=(0, 12))
+		state = {"days": 30, "end": date.today(), "timer": None, "series": []}
+		navigation = tk.Frame(body, bg=panel)
+		navigation.pack(fill="x", pady=(0, 12))
+		for days in (7, 30, 90, 365):
+			button(navigation, f"{days} DAYS", lambda value=days: choose_range(value)).pack(side="left", padx=2)
+		nav_buttons = []
+		for caption, direction in (("TODAY", 0), ("NEXT ›", 1), ("‹ PREVIOUS", -1)):
+			control = button(navigation, caption, lambda value=direction: move(value))
+			nav_buttons.append(control)
+			control.pack(side="right", padx=2)
+		nav_width = max(control.winfo_reqwidth() for control in nav_buttons)
+		for control in nav_buttons:
+			control.configure(width=nav_width)
+		range_label = tk.Label(body, bg=panel, fg=theme["muted"], font=self.ui_font(9), anchor="w")
+		range_label.pack(fill="x", pady=(0, 8))
+		summary = tk.Frame(body, bg=panel)
+		summary.pack(fill="x", pady=(0, 12))
+		metrics = []
+		for caption in ("PERIOD TOTAL", "AVERAGE / TRACKED DAY", "DAYS PLAYED", "LIFETIME TOTAL"):
+			card = tk.Frame(summary, bg=theme["surface"], padx=10, pady=8)
+			card.pack(side="left", fill="both", expand=True, padx=(0, 6))
+			tk.Label(card, text=caption, bg=theme["surface"], fg=theme["muted"],
+				font=self.ui_font(7, bold=True)).pack(anchor="w")
+			value = tk.Label(card, bg=theme["surface"], fg=theme["text"], font=self.ui_font(12, bold=True))
+			value.pack(anchor="w")
+			metrics.append(value)
+			self.add_rounded_surface(card, "surface", radius=7)
+		canvas = tk.Canvas(body, bg=theme["surface"], bd=0, highlightthickness=0, height=260)
+		canvas.pack(fill="both", expand=True)
+		hover = tk.Label(body, text="Move over the graph for daily playtime.", bg=panel,
+			fg=theme["text"], font=self.ui_font(9), anchor="w")
+		hover.pack(fill="x", pady=(8, 2))
+		tk.Label(body, text=f"Daily history starts {self.playtime_history_started}. Earlier totals have no dates. "
+			"Tracking runs while the launcher is open.", bg=panel, fg=theme["muted"],
+			font=self.ui_font(8), anchor="w", wraplength=790).pack(fill="x")
+
+		def choose_range(days):
+			state["days"] = days
+			draw()
+
+		def move(direction):
+			state["end"] = date.today() if direction == 0 else min(date.today(),
+				state["end"] + timedelta(days=direction * state["days"]))
+			draw()
+
+		def draw(event=None):
+			if not canvas.winfo_exists():
+				return
+			series = self.playtime_series(selected.get(), state["days"], state["end"])
+			state["series"] = series
+			known = [seconds for _, seconds in series if seconds is not None]
+			total = sum(known)
+			lifetime = sum(self.playtime_seconds.values()) if selected.get() == "All versions" else self.playtime_seconds.get(selected.get(), 0)
+			for label, value in zip(metrics, (self.format_total_time(total),
+				self.format_total_time(total / len(known)) if known else "Unavailable",
+				str(sum(seconds > 0 for seconds in known)), self.format_total_time(lifetime))):
+				label.config(text=value)
+			range_label.config(text=f"{series[0][0]:%b %d, %Y} – {series[-1][0]:%b %d, %Y}  ·  {selected.get()}")
+			canvas.delete("all")
+			width, height = max(200, canvas.winfo_width()), max(140, canvas.winfo_height())
+			left, right, top, bottom = 58, width - 18, 20, height - 35
+			peak = max(known, default=0)
+			ceiling = max(60, peak * 1.15)
+			state["bounds"] = (left, right, top, bottom, ceiling)
+			for step in range(5):
+				y = bottom - (bottom - top) * step / 4
+				seconds = ceiling * step / 4
+				label = f"{seconds / 3600:.1f}h" if ceiling >= 3600 else f"{seconds / 60:.1f}m"
+				canvas.create_line(left, y, right, y, fill=theme["border"])
+				canvas.create_text(left - 8, y, text=label, anchor="e", fill=theme["muted"], font=self.ui_font(8))
+			step_width = (right - left) / len(series)
+			points = []
+			for index, (_, seconds) in enumerate(series):
+				if seconds is None:
+					continue
+				x = left + (index + .5) * step_width
+				y = bottom - seconds / ceiling * (bottom - top)
+				if state["days"] <= 30:
+					if seconds > 0:
+						canvas.create_rectangle(x - step_width * .34, y, x + step_width * .34, bottom,
+							fill=theme["accent"], outline="")
+				else:
+					points.extend((x, y))
+			if len(points) >= 4:
+				canvas.create_line(*points, fill=theme["accent"], width=2)
+			elif points:
+				x, y = points
+				canvas.create_oval(x-3, y-3, x+3, y+3, fill=theme["accent"], outline="")
+			for index in sorted({0, len(series)//4, len(series)//2, 3*len(series)//4, len(series)-1}):
+				canvas.create_text(left + (index + .5)*step_width, bottom + 18,
+					text=series[index][0].strftime("%b %d"), fill=theme["muted"], font=self.ui_font(8))
+			if not peak:
+				canvas.create_text((left+right)/2, (top+bottom)/2,
+					text="No recorded playtime in this period.", fill=theme["muted"], font=self.ui_font(11))
+			hover.config(text="Move over the graph for daily playtime.")
+
+		def inspect(event):
+			if "bounds" not in state:
+				return
+			left, right, top, bottom, ceiling = state["bounds"]
+			canvas.delete("cursor")
+			if not left <= event.x <= right or not top <= event.y <= bottom:
+				return
+			index = min(len(state["series"])-1, int((event.x-left)/(right-left)*len(state["series"])))
+			day, seconds = state["series"][index]
+			value = self.format_session_time(seconds) if seconds is not None else "No dated history"
+			hover.config(text=f"{day:%A, %b %d, %Y}  ·  {value}")
+			x = left + (index+.5)*(right-left)/len(state["series"])
+			canvas.create_line(x, top, x, bottom, fill=theme["muted"], dash=(3,3), tags="cursor")
+
+		def leave(event):
+			canvas.delete("cursor")
+			hover.config(text="Move over the graph for daily playtime.")
+
+		def tick():
+			if body.winfo_exists():
+				draw()
+				state["timer"] = self.root.after(15000, tick)
+
+		def cleanup(event):
+			if event.widget is body and state["timer"] is not None:
+				self.root.after_cancel(state["timer"])
+				state["timer"] = None
+
+		canvas.bind("<Configure>", draw)
+		canvas.bind("<Motion>", inspect)
+		canvas.bind("<Leave>", leave)
+		body.bind("<Destroy>", cleanup, add="+")
+		tick()
+
 	def request_process_scan(self):
 		"""Look for running game processes on a worker thread (psutil is slow on Windows)."""
 		if self.scan_running:
@@ -2356,8 +2615,7 @@ class LauncherUI:
 		delta = max(0.0, now - self.last_playtime_poll)
 		self.last_playtime_poll = now
 		if self.running_version is not None:
-			self.playtime_seconds[self.running_version] = (
-				self.playtime_seconds.get(self.running_version, 0.0) + delta)
+			self.record_playtime(self.running_version, delta)
 		while True:
 			try:
 				version, key = self.learn_requests.get_nowait()
@@ -2376,6 +2634,8 @@ class LauncherUI:
 			if kind == "error":
 				self.set_status(f"Playtime check failed: {value}")
 			elif value != self.running_version:
+				if self.running_version is not None:
+					self.persist_settings()
 				self.running_version = value
 				self.session_started_at = now if value is not None else None
 		if not self.scan_running and now - self.last_scan_request >= 2.0:
@@ -2393,6 +2653,8 @@ class LauncherUI:
 			self.settings_path.write_text(json.dumps({
 				"game_paths": self.game_paths,
 				"playtime_seconds": self.playtime_seconds,
+				"playtime_history": self.playtime_history,
+				"playtime_history_started": self.playtime_history_started,
 				"setup_complete": self.setup_complete,
 				"launch_args": self.launch_args,
 				"armory": self.armory,
@@ -2407,6 +2669,8 @@ class LauncherUI:
 
 	def close_launcher(self):
 		self.updates.shutdown()
+		if self.running_version is not None:
+			self.record_playtime(self.running_version, max(0.0, time.monotonic() - self.last_playtime_poll))
 		self.persist_settings()
 		if hasattr(self, "_background_executor"):
 			self._background_executor.shutdown(wait=False, cancel_futures=True)
@@ -2969,7 +3233,7 @@ class LauncherUI:
 		def stone(parent, text, command, size=8, padx=8, pady=4):
 			return StoneButton(parent, text=text, command=command,
 							   font=self.ui_font(size, bold=True), padx=padx, pady=pady,
-							   bg="#211c18", theme_provider=lambda: self.theme)
+							   bg="#211c18", theme_provider=lambda: self.theme, style="subtle", version_colored=True)
 
 		body = window.make_body()
 		tk.Label(body, text="GAME INSTALLATIONS", bg="#211c18", fg=GOLD,
@@ -2993,6 +3257,8 @@ class LauncherUI:
 		auto_button = stone(footer, "AUTO SEARCH", lambda: toggle_scan())
 		auto_button.pack(side="left", padx=(0, 8))
 		stone(footer, "EXTRA", lambda: add_extra()).pack(side="left")
+		stone(footer, "CONFIG", lambda: self.open_game_config(parent=window, paths=entries)
+			).pack(side="left", padx=(8, 0))
 		stone(footer, "SAVE", lambda: self.save_options(window, entries, options_status, arg_vars),
 			  size=9, padx=12).pack(side="right")
 		stone(footer, "CANCEL", window.destroy).pack(side="right", padx=(0, 8))
@@ -3444,7 +3710,7 @@ class LauncherUI:
 		def stone(parent_frame, text, command):
 			return StoneButton(parent_frame, text=text, command=command,
 							   font=self.ui_font(8, bold=True), padx=8, pady=4,
-							   bg="#211c18", theme_provider=lambda: self.theme)
+							   bg="#211c18", theme_provider=lambda: self.theme, style="subtle", version_colored=True)
 
 		body = window.make_body()
 		text_var = tk.StringVar(value=variable.get())
@@ -3689,10 +3955,90 @@ class LauncherUI:
 			AddonManager(self, directory / "Interface" / "AddOns",
 						 self.version.get(), StoneButton)
 
-	def open_game_config(self):
-		directory = self.selected_game_directory()
-		if directory is not None:
-			self.open_directory(directory / "WTF", "configuration")
+	def open_game_config(self, parent=None, paths=None):
+		"""Edit each installation's WTF/Config.wtf from Options."""
+		parent = parent or self.root
+		paths = self.game_paths if paths is None else paths
+		window = Overlay(parent, 820, 570)
+		body = window.make_body()
+		panel = self.theme["panel"]
+		body.config(bg=panel)
+		selected = tk.StringVar(value=self.version.get())
+		state = {"path": None, "original": None, "newline": "\n", "bom": False}
+		top = tk.Frame(body, bg=panel)
+		top.pack(fill="x", pady=(0, 8))
+		tk.Label(top, text="GAME CONFIG", bg=panel, fg=self.theme["accent"],
+			font=self.ui_font(15, bold=True)).pack(side="left")
+		menu = tk.OptionMenu(top, selected, *paths, command=lambda _: load())
+		menu.config(bg=self.theme["control"], fg=self.theme["text"],
+			font=self.ui_font(9), bd=0, highlightthickness=0)
+		menu.pack(side="right")
+		footer = tk.Frame(body, bg=panel)
+		footer.pack(side="bottom", fill="x", pady=(10, 0))
+		status = tk.Label(body, bg=panel, fg=self.theme["muted"],
+			font=self.ui_font(8), anchor="w", wraplength=740)
+		status.pack(side="bottom", fill="x", pady=(8, 0))
+		area = tk.Frame(body, bg=panel)
+		area.pack(fill="both", expand=True)
+		editor = tk.Text(area, wrap="none", undo=True, bg=self.theme["control"],
+			fg=self.theme["text"], insertbackground=self.theme["text"],
+			font=("Courier", 10), bd=0, padx=8, pady=8)
+		vertical = tk.Scrollbar(area, orient="vertical", command=editor.yview)
+		horizontal = tk.Scrollbar(area, orient="horizontal", command=editor.xview)
+		editor.config(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+		area.rowconfigure(0, weight=1)
+		area.columnconfigure(0, weight=1)
+		editor.grid(row=0, column=0, sticky="nsew")
+		vertical.grid(row=0, column=1, sticky="ns")
+		horizontal.grid(row=1, column=0, sticky="ew")
+
+		def load():
+			version = selected.get()
+			value = paths.get(version, "")
+			folder = value.get().strip() if hasattr(value, "get") else str(value).strip()
+			state.update(path=None, original=None)
+			editor.config(state="normal")
+			editor.delete("1.0", "end")
+			try:
+				if not folder:
+					raise ValueError("Choose an installation folder in Options first.")
+				executable = self.find_executable(version, folder)
+				base = Path(folder).expanduser()
+				candidates = [base / sub for sub in INSTALL_SUBDIRECTORIES.get(version, ("",))]
+				directory = executable.parent if executable is not None else next(
+					(candidate for candidate in candidates if (candidate / "WTF" / "Config.wtf").is_file()), base)
+				path = directory / "WTF" / "Config.wtf"
+				raw = path.read_bytes()
+				text = raw.decode("utf-8-sig")
+				state.update(path=path, original=raw, newline="\r\n" if b"\r\n" in raw else "\n",
+					bom=raw.startswith(b"\xef\xbb\xbf"))
+				editor.insert("1.0", text.replace("\r\n", "\n"))
+				status.config(text=str(path), fg=self.theme["muted"])
+			except (OSError, ValueError) as error:
+				status.config(text=f"Cannot load Config.wtf: {error}", fg=self.theme["warning"])
+				editor.config(state="disabled")
+			editor.edit_reset()
+
+		def save():
+			path = state["path"]
+			if path is None:
+				return
+			try:
+				if path.read_bytes() != state["original"]:
+					raise ValueError("The file changed outside the editor. Reopen it before saving.")
+				text = editor.get("1.0", "end-1c").replace("\n", state["newline"])
+				raw = text.encode("utf-8-sig" if state["bom"] else "utf-8")
+				path.with_name("Config.wtf.bak").write_bytes(state["original"])
+				path.write_bytes(raw)
+				state["original"] = raw
+				status.config(text="Config.wtf saved. Backup: Config.wtf.bak", fg=self.theme["success"])
+			except (OSError, ValueError) as error:
+				status.config(text=f"Could not save: {error}", fg=self.theme["warning"])
+
+		for caption, command in (("CLOSE", window.destroy), ("SAVE", save)):
+			StoneButton(footer, text=caption, command=command, font=self.ui_font(9, bold=True),
+				bg=panel, theme_provider=lambda: self.theme, style="subtle", version_colored=True, padx=8, pady=4).pack(side="right", padx=(6, 0))
+		load()
 
 	def open_armory(self):
 		"""Look up a character by name and realm and show its summary."""
