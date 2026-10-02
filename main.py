@@ -1,5 +1,6 @@
 """A classic-styled launcher for configured World of Warcraft installations."""
 from collections import deque
+import io
 import json
 from html.parser import HTMLParser
 import os
@@ -24,6 +25,7 @@ import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from addon_manager import AddonManager, Overlay
+from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug
 from update_manager import UpdateController
 
 
@@ -1425,6 +1427,12 @@ class LauncherUI:
 			style="subtle")
 		self.update_button.place(relx=.96, rely=.045, anchor="ne",
 								x=-(self.options_button.winfo_reqwidth() + 6))
+		self.armory_button = StoneButton(
+			self.root, text="ARMORY", command=self.open_armory,
+			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
+			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme,
+			style="subtle")
+		self.armory_button.place(relx=.045, rely=.045, anchor="nw")
 
 	def backdrop_patch(self, widget, width, height):
 		if self.displayed_background is None:
@@ -1558,6 +1566,7 @@ class LauncherUI:
 		self.tracked_clients = {}  # pid -> (game, create_time)
 		self.setup_complete = False
 		self.launch_args = {}   # game -> argument text passed to the client
+		self.armory = {}   # last lookup and saved character summaries; no API credentials
 		try:
 			data = json.loads(self.settings_path.read_text(encoding="utf-8"))
 			folders = data.get("game_paths", {})
@@ -1591,6 +1600,18 @@ class LauncherUI:
 				self.launch_args = {str(name): value.strip()
 									for name, value in saved_args.items()
 									if isinstance(value, str) and value.strip()}
+			saved_armory = data.get("armory", {})
+			if isinstance(saved_armory, dict):
+				self.armory = {key: saved_armory[key].strip() for key in
+							   ("region", "realm", "name", "version")
+							   if isinstance(saved_armory.get(key), str)}
+				characters = saved_armory.get("characters", [])
+				if isinstance(characters, list):
+					self.armory["characters"] = [
+						{key: item[key] for key in ("region", "realm", "name", "version", "snapshot", "updated")
+						 if key in item}
+						for item in characters if isinstance(item, dict)
+						and all(isinstance(item.get(key), str) for key in ("region", "realm", "name", "version"))]
 			if "setup_complete" in data:
 				self.setup_complete = bool(data["setup_complete"])
 			else:
@@ -2374,6 +2395,7 @@ class LauncherUI:
 				"playtime_seconds": self.playtime_seconds,
 				"setup_complete": self.setup_complete,
 				"launch_args": self.launch_args,
+				"armory": self.armory,
 				"extras_enabled": sorted(self.enabled_extras),
 				"client_exes": {name: sorted(paths)
 								for name, paths in self.learned_clients.items()},
@@ -2417,7 +2439,7 @@ class LauncherUI:
 			widgets.extend(widget.winfo_children())
 			for option in ("bg", "fg", "activebackground", "activeforeground",
 						   "highlightbackground", "highlightcolor", "insertbackground",
-						   "selectcolor"):
+						   "selectcolor", "selectbackground", "selectforeground"):
 				try:
 					current = str(widget.cget(option)).casefold()
 				except tk.TclError:
@@ -2828,6 +2850,9 @@ class LauncherUI:
 		update_button = getattr(self, "update_button", None)
 		if update_button is not None:
 			update_button.redraw()
+		armory_button = getattr(self, "armory_button", None)
+		if armory_button is not None:
+			armory_button.redraw()
 
 	def draw_credit(self):
 		"""White credit text with a drop shadow, drawn straight onto the background art."""
@@ -3668,6 +3693,453 @@ class LauncherUI:
 		directory = self.selected_game_directory()
 		if directory is not None:
 			self.open_directory(directory / "WTF", "configuration")
+
+	def open_armory(self):
+		"""Look up a character by name and realm and show its summary."""
+		panel = self.theme["panel"]
+		window = Overlay(self.root, 860, 700)
+		body = window.make_body()
+		saved = self.armory
+		state = {"busy": False, "url": "", "photo": None, "queue": queue.Queue(),
+				 "result": None, "generation": 0, "version": self.version.get(), "poll": None, "tab": "Overview"}
+		characters = self.armory.setdefault("characters", [])
+
+		def stone(parent, text, command, size=8, padx=8, pady=4):
+			return StoneButton(parent, text=text, command=command,
+							   font=self.ui_font(size, bold=True), padx=padx, pady=pady,
+							   bg=panel, theme_provider=lambda: self.theme, style="subtle")
+
+		def field(parent, caption, value, width, show=""):
+			column = tk.Frame(parent, bg=panel)
+			tk.Label(column, text=caption, bg=panel, fg=self.theme["muted"], anchor="w",
+					 font=self.ui_font(7, bold=True)).pack(anchor="w")
+			variable = tk.StringVar(value=value)
+			entry = tk.Entry(column, textvariable=variable, width=width, show=show,
+							 bg=self.theme["control"], fg=self.theme["text"], insertbackground=self.theme["text"], relief="flat", bd=0,
+							 highlightthickness=0, highlightbackground=self.theme["border"],
+							 highlightcolor=self.theme["accent"], font=self.ui_font(9))
+			entry.pack(fill="x", ipady=4)
+			return column, variable, entry
+
+		top = tk.Frame(body, bg=panel)
+		top.pack(fill="x", pady=(0, 12))
+		tk.Label(top, text="CHARACTER ARMORY", bg=panel, fg=self.theme["accent"],
+				 font=self.ui_font(15, bold=True)).pack(side="left")
+		version_var = self.version
+		version_menu = tk.OptionMenu(top, version_var,
+			*dict.fromkeys((*GAME_VERSIONS, *self.game_versions)),
+			command=lambda _value: sync_version())
+		version_menu.config(bg=self.theme["control"], fg=self.theme["text"],
+			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
+			relief="flat", bd=0, highlightthickness=0, font=self.ui_font(9), padx=10, pady=4)
+		version_menu.pack(side="right")
+
+		form = tk.Frame(body, bg=panel)
+		form.pack(fill="x")
+		name_box, name_var, name_entry = field(form, "CHARACTER", saved.get("name", ""), 18)
+		realm_box, realm_var, realm_entry = field(form, "REALM", saved.get("realm", ""), 22)
+		region_box, region_var, region_entry = field(form, "REGION", saved.get("region", "us"), 5)
+		name_box.pack(side="left", padx=(0, 8))
+		realm_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
+		region_box.pack(side="left")
+
+		action_row = tk.Frame(body, bg=panel)
+		action_row.pack(fill="x", pady=(10, 0))
+		lookup_status = tk.Label(action_row, text="", bg=panel, fg=self.theme["muted"], anchor="w",
+								 justify="left", wraplength=480, font=self.ui_font(8))
+		lookup_button = stone(action_row, "LOOK UP", lambda: start_lookup(), size=9, padx=12)
+		lookup_button.pack(side="left", padx=(0, 10))
+		lookup_status.pack(side="left", fill="x", expand=True)
+
+		# Bottom first so it is never pushed off the panel.
+		footer = tk.Frame(body, bg=panel)
+		footer.pack(fill="x", side="bottom", pady=(10, 0))
+		stone(footer, "CLOSE", window.destroy).pack(side="right")
+		stone(footer, "COPY PROFILE", lambda: copy_profile()).pack(side="left")
+		stone(footer, "REFRESH", lambda: start_lookup()).pack(side="left", padx=8)
+		stone(footer, "OPEN ARMORY PAGE", lambda: open_page()).pack(side="right", padx=(0, 8))
+
+		# One compact row; the picker expands only when opened.
+		library_row = tk.Frame(body, bg=panel)
+		library_row.pack(fill="x", pady=(8, 8))
+		tk.Label(library_row, text="SAVED", bg=panel, fg=self.theme["muted"],
+				 font=self.ui_font(7, bold=True)).pack(side="left", padx=(0, 8))
+		saved_var = tk.StringVar(value="No saved characters")
+		character_picker = tk.OptionMenu(library_row, saved_var, "No saved characters")
+		character_picker.config(bg=self.theme["control"], fg=self.theme["text"],
+			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
+			relief="flat", bd=0, highlightthickness=0, anchor="w", font=self.ui_font(8))
+		character_picker.pack(side="left", fill="x", expand=True, padx=(0, 8))
+		stone(library_row, "SAVE", lambda: save_character(), pady=2).pack(side="left")
+		stone(library_row, "REMOVE", lambda: remove_character(), pady=2).pack(side="left", padx=(4, 0))
+		visible_characters = []
+		saved_choices = {}
+
+		tab_row = tk.Frame(body, bg=panel)
+		tab_row.pack(fill="x", pady=(0, 4))
+		tab_buttons = {}
+		for title in ("Overview", "Equipment", "Stats", "Professions", "Progress", "Guild", "Achievements"):
+			button = stone(tab_row, title.upper(), lambda value=title: switch_tab(value), size=7, padx=5, pady=2)
+			button.pack(side="left", padx=(0, 4))
+			tab_buttons[title] = button
+
+		detail_area = tk.Frame(body, bg=panel)
+		detail_area.pack(fill="both", expand=True, pady=(12, 8))
+		results = tk.Frame(detail_area, bg=panel)
+		results.pack(fill="both", expand=True)
+		filter_var = tk.StringVar(value="")
+
+		def show_result(result, avatar=None, cached=False):
+			self.clear_children(results)
+			state["result"] = result
+			state["url"] = result.get("profile_url", "")
+			photo = None
+			if avatar:
+				try:
+					image = Image.open(io.BytesIO(avatar)).convert("RGBA")
+					image = ImageOps.fit(image, (52, 52), method=Image.Resampling.LANCZOS)
+					image.putalpha(make_rounded_mask(52, 52, 7))
+					photo = ImageTk.PhotoImage(image, master=self.root)
+				except (OSError, ValueError):
+					photo = None
+			state["photo"] = photo   # keep a reference or Tk drops the image
+			header = tk.Frame(results, bg=self.theme["surface"], padx=10, pady=8)
+			header.pack(fill="x")
+			if photo is not None:
+				tk.Label(header, image=photo, bg=self.theme["surface"], bd=0).pack(side="left", padx=(0, 12))
+			titles = tk.Frame(header, bg=self.theme["surface"])
+			titles.pack(side="left", fill="x", expand=True)
+			tk.Label(titles, text=result["name"], bg=self.theme["surface"], fg=self.theme["accent"], anchor="w",
+					 font=self.ui_font(15, bold=True)).pack(anchor="w")
+			level = f"Level {result['level']} " if result.get("level") else ""
+			summary = " ".join(part for part in (
+				result.get("race"), result.get("spec"), result.get("class")) if part)
+			tk.Label(titles, text=(level + summary).strip(), bg=self.theme["surface"], fg=self.theme["text"],
+					 anchor="w", font=self.ui_font(10)).pack(anchor="w")
+			self.style_popup_row(header)
+			metrics = tk.Frame(results, bg=self.theme["panel"])
+			metrics.pack(fill="x", pady=(4, 4))
+			for column, (label, value) in enumerate((
+				("ITEM LEVEL", result.get("item_level")),
+				("ACHIEVEMENTS", result.get("achievement_points")),
+				("FACTION", result.get("faction")),
+				("GUILD", result.get("guild")))):
+				metrics.columnconfigure(column, weight=1, uniform="metrics")
+				card = tk.Frame(metrics, bg=self.theme["surface"], padx=8, pady=4)
+				card.grid(row=0, column=column, sticky="nsew", padx=(0, 6))
+				tk.Label(card, text=label, bg=self.theme["surface"], fg=self.theme["muted"],
+					font=self.ui_font(7, bold=True), anchor="w").pack(fill="x")
+				tk.Label(card, text=str(value) if value not in (None, "") else "Unavailable",
+					bg=self.theme["surface"], fg=self.theme["text"], anchor="w",
+					wraplength=160, font=self.ui_font(10, bold=True)).pack(fill="x", pady=(3, 0))
+				self.style_popup_row(card)
+			tk.Label(results, text=f"{'Saved snapshot' if cached else 'Updated just now'} • {result['source']} • {result['realm']} / {result['region'].upper()}",
+				bg=self.theme["panel"], fg=self.theme["muted"], anchor="w",
+				font=self.ui_font(7)).pack(fill="x", side="bottom", pady=(3, 0))
+			search_row = tk.Frame(results, bg=self.theme["panel"])
+			search_row.pack(fill="x", side="bottom", pady=(4, 0))
+			view_note = tk.Label(search_row, text="", bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(7))
+			view_note.pack(side="left")
+			tk.Entry(search_row, textvariable=filter_var, bg=self.theme["control"], fg=self.theme["text"],
+				insertbackground=self.theme["text"], relief="flat", bd=0, highlightthickness=0,
+				font=self.ui_font(8), width=20).pack(side="right", ipady=3)
+			tk.Label(search_row, text="FIND", bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(7)).pack(side="right", padx=5)
+			content = tk.Frame(results, bg=self.theme["panel"])
+			content.pack(fill="both", expand=True)
+			state.update(content=content, view_note=view_note)
+			filter_var.set("")
+			content.bind("<Configure>", lambda _event: schedule_details())
+			render_details()
+			lookup_status.config(text="Saved profile. Refresh to check for changes." if cached else "Character loaded. Save it for quick access.", fg=self.theme["muted"])
+			self.apply_theme(self.version.get(), subtree=window)
+
+		def switch_tab(title):
+			state["tab"] = title
+			filter_var.set("")
+			if state["result"]:
+				render_details()
+
+		def schedule_details():
+			if state["result"] and body.winfo_exists():
+				# Debounce actual size changes; child creation must not start a render loop.
+				content = state.get("content")
+				if content and (content.winfo_width(), content.winfo_height()) != state.get("size"):
+					if state.get("resize"):
+						self.root.after_cancel(state["resize"])
+					state["resize"] = self.root.after(40, render_details)
+
+		def render_details():
+			state["resize"] = None
+			hide_tooltip()
+			content = state.get("content")
+			if not content or not content.winfo_exists() or not state["result"]:
+				return
+			self.clear_children(content)
+			result, title = state["result"], state["tab"]
+			for label, button in tab_buttons.items():
+				button.set_label(label.upper() + (" •" if label == title else ""))
+			if title == "Overview":
+				rows = [("Game version", result.get("version")), ("Realm", result.get("realm")),
+					("Region", result.get("region", "").upper()), ("Race", result.get("race")),
+					("Class", result.get("class")), ("Specialization", result.get("spec")),
+					("Level", result.get("level")), ("Last login", result.get("last_login")),
+					*result.get("extras", [])]
+			else:
+				rows = result.get("details", {}).get(title.lower(), [])
+			query_text = filter_var.get().strip().casefold()
+			if query_text:
+				rows = [(caption, value) for caption, value in rows if query_text in f"{caption} {value}".casefold()]
+			width, height = content.winfo_width(), content.winfo_height()
+			state["size"] = (width, height)
+			font = self.ui_font(8)
+			line_height = font.metrics("linespace")
+			columns = 3 if width >= 720 else 2 if width >= 500 else 1
+			capacity = max(columns, columns * max(1, height // (line_height * 2 + 10)))
+			total = len(rows)
+			# Very large lists use an honest summary, never another hidden page.
+			if title in ("Guild", "Achievements", "Progress", "Professions") and total > capacity:
+				if title == "Progress" and not query_text:
+					rows = rows[-capacity:]
+				else:
+					rows = rows[:capacity]
+				state["view_note"].config(text=f"Showing {len(rows)} of {total} entries • use Find to narrow results")
+			else:
+				state["view_note"].config(text="Hover over a value for full details")
+			if not rows:
+				message = "No matches. Try another search." if query_text else result.get("detail_messages", {}).get(title.lower(),
+					"These details are unavailable for this character or game version.")
+				tk.Label(content, text=message, bg=self.theme["panel"], fg=self.theme["muted"],
+					font=font, justify="left", anchor="w", wraplength=max(180, width - 24)).pack(fill="x", pady=8)
+				return
+			row_count = (len(rows) + columns - 1) // columns
+			# Place cells within the existing viewport, so labels cannot grow it.
+			cell_width = max(70, width // columns - 24)
+			def fit_text(text):
+				if font.measure(text) <= cell_width:
+					return text
+				while text and font.measure(text + "…") > cell_width:
+					text = text[:-1]
+				return text + "…"
+			for index, (caption, value) in enumerate(rows):
+				text = str(value) if value not in (None, "") else "Unavailable"
+				card = tk.Frame(content, bg=self.theme["surface"], padx=6, pady=2)
+				card.place(relx=(index % columns) / columns, rely=(index // columns) / row_count,
+					relwidth=1 / columns, relheight=1 / row_count)
+				tk.Label(card, text=fit_text(caption), bg=self.theme["surface"], fg=self.theme["accent"],
+					anchor="w", font=self.ui_font(7, bold=True)).pack(fill="x")
+				# Equipment names are prominent; enchants and gems remain in the hover detail.
+				preview = text.replace("\n", " • ")
+				label = tk.Label(card, text=fit_text(preview), bg=self.theme["surface"], fg=self.theme["text"],
+					anchor="w", font=font)
+				label.pack(fill="x")
+				for target in (card, label):
+					target.bind("<Enter>", lambda _event, heading=caption, detail=text: show_tooltip(heading, detail))
+					target.bind("<Leave>", lambda _event: hide_tooltip())
+
+		def hide_tooltip():
+			tooltip = state.pop("tooltip", None)
+			if tooltip is not None:
+				tooltip.destroy()
+
+		def show_tooltip(heading, detail):
+			hide_tooltip()
+			tooltip = tk.Toplevel(self.root)
+			tooltip.overrideredirect(True)
+			tooltip.config(bg=self.theme["surface"])
+			tk.Label(tooltip, text=f"{heading}\n{detail}", bg=self.theme["surface"], fg=self.theme["text"],
+				font=self.ui_font(9), justify="left", wraplength=460, padx=10, pady=8).pack()
+			tooltip.update_idletasks()
+			x = min(self.root.winfo_pointerx() + 12, self.root.winfo_screenwidth() - tooltip.winfo_reqwidth() - 8)
+			y = min(self.root.winfo_pointery() + 12, self.root.winfo_screenheight() - tooltip.winfo_reqheight() - 8)
+			tooltip.geometry(f"+{max(0, x)}+{max(0, y)}")
+			state["tooltip"] = tooltip
+
+		def filter_details(*_args):
+			if state["result"]:
+				render_details()
+		filter_var.trace_add("write", filter_details)
+
+		def identity(item):
+			return (item.get("version"), item.get("region", "").casefold(),
+					realm_slug(item.get("realm", "")), item.get("name", "").casefold())
+
+		def refresh_list():
+			visible_characters[:] = [item for item in characters if item["version"] == self.version.get()]
+			saved_choices.clear()
+			menu = character_picker["menu"]
+			menu.delete(0, "end")
+			for item in visible_characters:
+				label = f"{item['name']} — {item['realm']} ({item['region'].upper()})"
+				saved_choices[label] = item
+				menu.add_command(label=label, command=lambda value=label: select_character(value))
+			if not visible_characters:
+				saved_var.set("No saved characters for this version")
+				menu.add_command(label="No saved characters", state="disabled")
+			elif saved_var.get() not in saved_choices:
+				saved_var.set(f"Choose a character ({len(visible_characters)} saved)")
+			menu.config(bg=self.theme["control"], fg=self.theme["text"],
+				activebackground=self.theme["control_active"], activeforeground=self.theme["bright"])
+
+		def save_character():
+			result = state["result"]
+			if not result or result.get("version") != self.version.get():
+				lookup_status.config(text="Look up a character first.", fg=self.theme["warning"])
+				return
+			item = {key: result[key] for key in ("region", "realm", "name", "version")}
+			item.update(snapshot=result, updated=time.strftime("%Y-%m-%d %H:%M"))
+			for index, previous in enumerate(characters):
+				if identity(previous) == identity(item):
+					characters[index] = item
+					break
+			else:
+				characters.append(item)
+			self.persist_settings()
+			refresh_list()
+			saved_var.set(f"{item['name']} — {item['realm']} ({item['region'].upper()})")
+			lookup_status.config(text="Character saved.", fg=self.theme["success"])
+
+		def remove_character():
+			item = saved_choices.get(saved_var.get())
+			if item:
+				characters.remove(item)
+				self.persist_settings()
+				refresh_list()
+				lookup_status.config(text="Removed from saved characters.", fg=self.theme["muted"])
+
+		def select_character(label):
+			item = saved_choices.get(label)
+			if not item:
+				return
+			saved_var.set(label)
+			state["generation"] += 1
+			state["busy"] = False
+			name_var.set(item["name"])
+			realm_var.set(item["realm"])
+			region_var.set(item["region"])
+			state["result"], state["url"] = None, ""
+			self.clear_children(results)
+			if isinstance(item.get("snapshot"), dict):
+				show_result(item["snapshot"], cached=True)
+				lookup_status.config(text=f"Saved {item.get('updated', 'previously')}. Refresh for current data.")
+			else:
+				start_lookup()
+
+		def copy_profile():
+			result = state["result"]
+			if not result:
+				lookup_status.config(text="Look up or select a saved character first.", fg=self.theme["warning"])
+				return
+			text = "\n".join(f"{label}: {result[key]}" for label, key in (
+				("Name", "name"), ("Game", "version"), ("Realm", "realm"), ("Region", "region"),
+				("Level", "level"), ("Class", "class"), ("Specialization", "spec"),
+				("Guild", "guild"), ("Item level", "item_level"), ("Armory", "profile_url"))
+				if result.get(key) is not None)
+			self.root.clipboard_clear()
+			self.root.clipboard_append(text)
+			lookup_status.config(text="Profile copied.", fg=self.theme["success"])
+
+		def worker(generation, region, realm, name, version):
+			try:
+				result = lookup_character(region, realm, name, version=version)
+				state["queue"].put((generation, "ok", result, fetch_avatar(result.get("avatar_url"))))
+			except ArmoryError as error:
+				state["queue"].put((generation, "error", str(error), error.url))
+			except Exception as error:
+				state["queue"].put((generation, "error", f"Lookup failed: {error}", None))
+
+		def sync_version():
+			state["version"] = self.version.get()
+			state["generation"] += 1
+			state["busy"], state["result"], state["url"] = False, None, ""
+			state["photo"] = None
+			self.apply_theme(self.version.get(), subtree=window)
+			version_menu["menu"].config(bg=self.theme["control"], fg=self.theme["text"],
+				activebackground=self.theme["control_active"], activeforeground=self.theme["bright"])
+			self.clear_children(results)
+			refresh_list()
+			available = self.version.get() in ARMORY_VERSIONS
+			lookup_button.set_disabled(not available)
+			tk.Label(results, text="Find a character" if available else "Armory unavailable",
+				bg=self.theme["panel"], fg=self.theme["accent"], font=self.ui_font(15, bold=True)
+			).pack(anchor="w", pady=(25, 6), padx=12)
+			tk.Label(results, text="Enter a name and realm above, or choose a saved character.\nEquipment, combat stats, professions and progress appear in the tabs."
+				if available else f"Character data is not available for {self.version.get()}.\nUse the version menu above to browse another game.",
+				bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(9),
+				justify="left", anchor="w", wraplength=700).pack(fill="x", padx=12)
+			lookup_status.config(text="Enter a character or select a saved profile." if available else
+				f"Character lookups are not available for {self.version.get()}.",
+				fg=self.theme["muted"] if available else self.theme["warning"])
+			self.apply_theme(self.version.get(), subtree=window)
+
+		def poll():
+			if not body.winfo_exists():
+				return
+			if state["version"] != self.version.get():
+				sync_version()
+			while True:
+				try:
+					generation, kind, payload, extra = state["queue"].get_nowait()
+				except queue.Empty:
+					break
+				if generation != state["generation"]:
+					continue
+				state["busy"] = False
+				if kind == "ok":
+					show_result(payload, extra)
+					for item in characters:
+						if identity(item) == identity(payload):
+							item.update(snapshot=payload, updated=time.strftime("%Y-%m-%d %H:%M"))
+							self.persist_settings()
+							break
+					self.set_status(f"Armory: loaded {payload['name']}")
+				else:
+					if extra:
+						state["url"] = extra
+					lookup_status.config(text=payload, fg=self.theme["error"])
+			state["poll"] = self.root.after(150, poll)
+
+		def start_lookup(_event=None):
+			if state["version"] != self.version.get():
+				sync_version()
+			if state["busy"]:
+				return
+			version = self.version.get()
+			if version not in ARMORY_VERSIONS:
+				lookup_status.config(text=f"Character lookups are not available for {version}.", fg=self.theme["warning"])
+				return
+			name, realm = name_var.get().strip(), realm_var.get().strip()
+			region = region_var.get().strip().casefold() or "us"
+			if not name or not realm or len(name) > 24 or len(realm) > 40 or region not in REGIONS:
+				lookup_status.config(text="Enter a valid character, realm and region (us, eu, kr, tw).", fg=self.theme["warning"])
+				return
+			self.armory.update(name=name, realm=realm, region=region, version=version)
+			self.persist_settings()
+			state["generation"] += 1
+			state["busy"] = True
+			state["url"], state["result"] = "", None
+			self.clear_children(results)
+			lookup_status.config(text="Looking up character…", fg=self.theme["muted"])
+			threading.Thread(target=worker, daemon=True,
+				args=(state["generation"], region, realm, name, version)).start()
+
+		def open_page():
+			if state["url"]:
+				webbrowser.open(state["url"])
+			else:
+				lookup_status.config(text="Look up a character first.", fg=self.theme["warning"])
+
+		for entry in (name_entry, realm_entry, region_entry):
+			entry.bind("<Return>", start_lookup)
+		def cleanup(event):
+			if event.widget is body:
+				hide_tooltip()
+				for timer in (state.get("poll"), state.get("resize")):
+					if timer:
+						self.root.after_cancel(timer)
+		body.bind("<Destroy>", cleanup, add="+")
+		sync_version()
+		state["poll"] = self.root.after(150, poll)
+		name_entry.focus_set()
 
 	def play_game(self):
 		version = self.version.get()
