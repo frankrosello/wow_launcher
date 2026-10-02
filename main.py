@@ -3625,4 +3625,20 @@ if __name__ == "__main__":
 	set_windows_app_id()
 	app = tk.Tk()
 	LauncherUI(app)
-	app.mainloop()
+	app.mainloop()f __name__ == "__main__":
+    set_windows_app_id()
+
+    app = tk.Tk()
+
+    # Fix Tkinter scaling on macOS
+    if sys.platform == "darwin":
+        try:
+            dpi = app.winfo_fpixels("1i")
+            scaling = dpi / 72.0
+            scaling = max(1.0, min(scaling, 2.0))
+            app.tk.call("tk", "scaling", scaling)
+        except Exception:
+            app.tk.call("tk", "scaling", 2.0)
+
+    LauncherUI(app)
+    app.mainloop()
