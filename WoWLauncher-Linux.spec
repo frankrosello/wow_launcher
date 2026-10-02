@@ -4,9 +4,26 @@ from pathlib import Path
 
 project_dir = Path(SPECPATH)
 
-datas = [
-    (str(project_dir / "assets"), "assets"),
-]
+datas = []
+
+for folder in [
+    "backgrounds",
+    "fonts",
+    "logos",
+    "screenshots",
+]:
+    path = project_dir / folder
+    if path.exists():
+        datas.append((str(path), folder))
+
+for filename in [
+    "wow_logo.png",
+    "wowicon.png",
+    "image.png",
+]:
+    path = project_dir / filename
+    if path.exists():
+        datas.append((str(path), "."))
 
 hiddenimports = [
     "psutil",
@@ -31,9 +48,7 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(
-    a.pure,
-)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
