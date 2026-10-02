@@ -15,7 +15,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -25,7 +25,7 @@ import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from addon_manager import AddonManager, Overlay
-from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug
+from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug, lookup_achievement_category, supported_character_sections, fetch_media_icon
 from update_manager import UpdateController
 
 
@@ -3697,11 +3697,15 @@ class LauncherUI:
 	def open_armory(self):
 		"""Look up a character by name and realm and show its summary."""
 		panel = self.theme["panel"]
-		window = Overlay(self.root, 860, 700)
+		window = Overlay(self.root, 860, 360)
 		body = window.make_body()
+		search_page = tk.Frame(body, bg=self.theme["panel"])
+		search_page.pack(fill="both", expand=True)
+		character_page = tk.Frame(body, bg=self.theme["panel"])
 		saved = self.armory
 		state = {"busy": False, "url": "", "photo": None, "queue": queue.Queue(),
-				 "result": None, "generation": 0, "version": self.version.get(), "poll": None, "tab": "Overview"}
+				 "result": None, "generation": 0, "version": self.version.get(), "poll": None, "tab": "Overview", "categories": {}, "category_pending": set(), "icon_bytes": {}, "icon_pending": set(),
+				 "icon_watchers": {}, "icon_photos": {}}
 		characters = self.armory.setdefault("characters", [])
 
 		def stone(parent, text, command, size=8, padx=8, pady=4):
@@ -3721,7 +3725,7 @@ class LauncherUI:
 			entry.pack(fill="x", ipady=4)
 			return column, variable, entry
 
-		top = tk.Frame(body, bg=panel)
+		top = tk.Frame(search_page, bg=panel)
 		top.pack(fill="x", pady=(0, 12))
 		tk.Label(top, text="CHARACTER ARMORY", bg=panel, fg=self.theme["accent"],
 				 font=self.ui_font(15, bold=True)).pack(side="left")
@@ -3734,7 +3738,7 @@ class LauncherUI:
 			relief="flat", bd=0, highlightthickness=0, font=self.ui_font(9), padx=10, pady=4)
 		version_menu.pack(side="right")
 
-		form = tk.Frame(body, bg=panel)
+		form = tk.Frame(search_page, bg=panel)
 		form.pack(fill="x")
 		name_box, name_var, name_entry = field(form, "CHARACTER", saved.get("name", ""), 18)
 		realm_box, realm_var, realm_entry = field(form, "REALM", saved.get("realm", ""), 22)
@@ -3743,7 +3747,7 @@ class LauncherUI:
 		realm_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
 		region_box.pack(side="left")
 
-		action_row = tk.Frame(body, bg=panel)
+		action_row = tk.Frame(search_page, bg=panel)
 		action_row.pack(fill="x", pady=(10, 0))
 		lookup_status = tk.Label(action_row, text="", bg=panel, fg=self.theme["muted"], anchor="w",
 								 justify="left", wraplength=480, font=self.ui_font(8))
@@ -3752,15 +3756,16 @@ class LauncherUI:
 		lookup_status.pack(side="left", fill="x", expand=True)
 
 		# Bottom first so it is never pushed off the panel.
-		footer = tk.Frame(body, bg=panel)
+		footer = tk.Frame(search_page, bg=panel)
 		footer.pack(fill="x", side="bottom", pady=(10, 0))
 		stone(footer, "CLOSE", window.destroy).pack(side="right")
-		stone(footer, "COPY PROFILE", lambda: copy_profile()).pack(side="left")
-		stone(footer, "REFRESH", lambda: start_lookup()).pack(side="left", padx=8)
-		stone(footer, "OPEN ARMORY PAGE", lambda: open_page()).pack(side="right", padx=(0, 8))
+		stone(footer, "VIEW CHARACTER", lambda: view_character()).pack(side="left")
+		search_summary = tk.Label(search_page, text="Search for a character or choose a saved profile.",
+			bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(10), anchor="w")
+		search_summary.pack(fill="x", side="bottom", pady=(8, 4))
 
 		# One compact row; the picker expands only when opened.
-		library_row = tk.Frame(body, bg=panel)
+		library_row = tk.Frame(search_page, bg=panel)
 		library_row.pack(fill="x", pady=(8, 8))
 		tk.Label(library_row, text="SAVED", bg=panel, fg=self.theme["muted"],
 				 font=self.ui_font(7, bold=True)).pack(side="left", padx=(0, 8))
@@ -3775,7 +3780,34 @@ class LauncherUI:
 		visible_characters = []
 		saved_choices = {}
 
-		tab_row = tk.Frame(body, bg=panel)
+		viewer_toolbar = tk.Frame(character_page, bg=self.theme["panel"])
+		viewer_toolbar.pack(fill="x", pady=(0, 8))
+		stone(viewer_toolbar, "BACK", lambda: show_search()).pack(side="left")
+		stone(viewer_toolbar, "REFRESH", lambda: start_lookup()).pack(side="left", padx=4)
+		stone(viewer_toolbar, "COPY PROFILE", lambda: copy_profile()).pack(side="left")
+		stone(viewer_toolbar, "OPEN ARMORY PAGE", lambda: open_page()).pack(side="right")
+		stone(viewer_toolbar, "CLOSE", window.destroy).pack(side="right", padx=4)
+		viewer_status = tk.Label(character_page, text="", bg=self.theme["panel"], fg=self.theme["muted"],
+			font=self.ui_font(8), anchor="w")
+		viewer_status.pack(fill="x", side="bottom", pady=(3, 0))
+
+		def show_search():
+			hide_tooltip()
+			character_page.pack_forget()
+			window.resize(360)
+			search_page.pack(fill="both", expand=True)
+			name_entry.focus_set()
+
+		def view_character():
+			if not state["result"]:
+				lookup_status.config(text="Look up or select a character first.", fg=self.theme["warning"])
+				return
+			search_page.pack_forget()
+			window.resize(700)
+			character_page.pack(fill="both", expand=True)
+			render_details()
+
+		tab_row = tk.Frame(character_page, bg=panel)
 		tab_row.pack(fill="x", pady=(0, 4))
 		tab_buttons = {}
 		for title in ("Overview", "Equipment", "Stats", "Professions", "Progress", "Guild", "Achievements"):
@@ -3783,15 +3815,85 @@ class LauncherUI:
 			button.pack(side="left", padx=(0, 4))
 			tab_buttons[title] = button
 
-		detail_area = tk.Frame(body, bg=panel)
+		detail_area = tk.Frame(character_page, bg=panel)
 		detail_area.pack(fill="both", expand=True, pady=(12, 8))
 		results = tk.Frame(detail_area, bg=panel)
 		results.pack(fill="both", expand=True)
 		filter_var = tk.StringVar(value="")
 
+		def request_icon(kind, identifier, target, size=32, tree_item=None):
+			result = state["result"]
+			if not result or not isinstance(identifier, int) or identifier <= 0:
+				return
+			key = (result["region"], result["version"], kind, identifier)
+			watcher = (state["generation"], target, tree_item, size)
+			if key in state["icon_bytes"]:
+				apply_icon(key, state["icon_bytes"][key], watcher)
+				return
+			state["icon_watchers"].setdefault(key, []).append(watcher)
+			if key in state["icon_pending"]:
+				return
+			state["icon_pending"].add(key)
+			if "icon_executor" not in state:
+				state["icon_executor"] = ThreadPoolExecutor(max_workers=4, thread_name_prefix="armory-icons")
+			cache_dir = self.settings_path.parent / "armory-icons"
+			def download():
+				try:
+					data = fetch_media_icon(*key, cache_dir=cache_dir)
+				except Exception:
+					data = None
+				state["queue"].put((0, "icon", (key, data), None))
+			state["icon_executor"].submit(download)
+
+		def apply_icon(key, data, watcher):
+			generation, target, tree_item, size = watcher
+			if not data or generation != state["generation"] or not target.winfo_exists():
+				return
+			photo_key = (key, size)
+			photo = state["icon_photos"].get(photo_key)
+			if photo is None:
+				try:
+					image = Image.open(io.BytesIO(data)).convert("RGBA")
+					image = ImageOps.fit(image, (size, size), method=Image.Resampling.LANCZOS)
+					photo = ImageTk.PhotoImage(image, master=self.root)
+				except (OSError, ValueError, Image.DecompressionBombError):
+					return
+				state["icon_photos"][photo_key] = photo
+			if tree_item is not None:
+				if target.exists(tree_item):
+					target.item(tree_item, image=photo)
+			else:
+				target.config(image=photo, text="")
+				target.image = photo
+
+		def refresh_achievement_icons():
+			tree = state.get("achievement_tree")
+			if state["tab"] != "Achievements" or not tree or not tree.winfo_exists() or not tree.winfo_viewable():
+				return
+			visible = {tree.identify_row(y) for y in range(12, tree.winfo_height(), 13)}
+			for item in visible:
+				identifier = state.get("achievement_icon_nodes", {}).get(item)
+				if identifier is not None and item not in state["achievement_icon_requested"]:
+					state["achievement_icon_requested"].add(item)
+					request_icon("achievement", identifier, tree, size=18, tree_item=item)
+
+		def refresh_section_tabs():
+			support = supported_character_sections(self.version.get(), state["result"])
+			visible = []
+			for title, button in tab_buttons.items():
+				button.pack_forget()
+				if support.get(title, True):
+					button.pack(side="left", padx=(0, 4))
+					visible.append(title)
+			if state["tab"] not in visible:
+				state["tab"] = "Overview"
+			return support
+
 		def show_result(result, avatar=None, cached=False):
 			self.clear_children(results)
 			state["result"] = result
+			support = refresh_section_tabs()
+			state["categories"], state["category_pending"] = {}, set()
 			state["url"] = result.get("profile_url", "")
 			photo = None
 			if avatar:
@@ -3821,7 +3923,7 @@ class LauncherUI:
 			metrics.pack(fill="x", pady=(4, 4))
 			for column, (label, value) in enumerate((
 				("ITEM LEVEL", result.get("item_level")),
-				("ACHIEVEMENTS", result.get("achievement_points")),
+				*([("ACHIEVEMENTS", result.get("achievement_points"))] if support["Achievements"] else []),
 				("FACTION", result.get("faction")),
 				("GUILD", result.get("guild")))):
 				metrics.columnconfigure(column, weight=1, uniform="metrics")
@@ -3852,9 +3954,13 @@ class LauncherUI:
 			render_details()
 			lookup_status.config(text="Saved profile. Refresh to check for changes." if cached else "Character loaded. Save it for quick access.", fg=self.theme["muted"])
 			self.apply_theme(self.version.get(), subtree=window)
+			search_summary.config(text=f"{result['name']} • {result['realm']} • {result['version']}\nSave this character or select View Character.")
+			viewer_status.config(text="Saved profile" if cached else "Character loaded")
+			view_character()
 
 		def switch_tab(title):
-			state["tab"] = title
+			support = refresh_section_tabs()
+			state["tab"] = title if support.get(title, True) else "Overview"
 			filter_var.set("")
 			if state["result"]:
 				render_details()
@@ -3875,7 +3981,13 @@ class LauncherUI:
 			if not content or not content.winfo_exists() or not state["result"]:
 				return
 			self.clear_children(content)
+			refresh_section_tabs()
 			result, title = state["result"], state["tab"]
+			if title == "Achievements":
+				for label, button in tab_buttons.items():
+					button.set_label(label.upper() + (" •" if label == title else ""))
+				render_achievements(content, result)
+				return
 			for label, button in tab_buttons.items():
 				button.set_label(label.upper() + (" •" if label == title else ""))
 			if title == "Overview":
@@ -3914,10 +4026,10 @@ class LauncherUI:
 			row_count = (len(rows) + columns - 1) // columns
 			# Place cells within the existing viewport, so labels cannot grow it.
 			cell_width = max(70, width // columns - 24)
-			def fit_text(text):
-				if font.measure(text) <= cell_width:
+			def fit_text(text, available=cell_width):
+				if font.measure(text) <= available:
 					return text
-				while text and font.measure(text + "…") > cell_width:
+				while text and font.measure(text + "…") > available:
 					text = text[:-1]
 				return text + "…"
 			for index, (caption, value) in enumerate(rows):
@@ -3925,34 +4037,178 @@ class LauncherUI:
 				card = tk.Frame(content, bg=self.theme["surface"], padx=6, pady=2)
 				card.place(relx=(index % columns) / columns, rely=(index // columns) / row_count,
 					relwidth=1 / columns, relheight=1 / row_count)
-				tk.Label(card, text=fit_text(caption), bg=self.theme["surface"], fg=self.theme["accent"],
+				ref = (result.get("icon_refs", {}).get(title.lower(), {})).get(caption)
+				text_parent, text_width = card, cell_width
+				if isinstance(ref, dict):
+					icon = tk.Label(card, text="□", bg=self.theme["surface"], fg=self.theme["muted"],
+						font=self.ui_font(18), bd=0, padx=3)
+					icon.pack(side="left", padx=(0, 6))
+					text_parent = tk.Frame(card, bg=self.theme["surface"])
+					text_parent.pack(side="left", fill="both", expand=True)
+					text_width = max(40, cell_width - 42)
+					request_icon(ref.get("kind"), ref.get("id"), icon)
+				tk.Label(text_parent, text=fit_text(caption, text_width), bg=self.theme["surface"], fg=self.theme["accent"],
 					anchor="w", font=self.ui_font(7, bold=True)).pack(fill="x")
 				# Equipment names are prominent; enchants and gems remain in the hover detail.
 				preview = text.replace("\n", " • ")
-				label = tk.Label(card, text=fit_text(preview), bg=self.theme["surface"], fg=self.theme["text"],
+				label = tk.Label(text_parent, text=fit_text(preview, text_width), bg=self.theme["surface"], fg=self.theme["text"],
 					anchor="w", font=font)
 				label.pack(fill="x")
-				for target in (card, label):
-					target.bind("<Enter>", lambda _event, heading=caption, detail=text: show_tooltip(heading, detail))
-					target.bind("<Leave>", lambda _event: hide_tooltip())
+				# Bind the value once; parent/child Enter events must not create competing popups.
+				label.bind("<Enter>", lambda _event, source=label, heading=caption, detail=text:
+					queue_tooltip(source, heading, detail))
+				label.bind("<Leave>", lambda _event: hide_tooltip())
+				label.bind("<ButtonPress-1>", lambda _event: hide_tooltip())
+				label.bind("<Destroy>", lambda event: cancel_source_tooltip(event.widget))
+
+		def render_achievements(content, result):
+			state["view_note"].config(text="Expand a category to see its achievements; collapse it to free space")
+			style_name = f"Armory{str(id(window))}.Treeview"
+			style = ttk.Style(self.root)
+			style.configure(style_name, background=self.theme["surface"], fieldbackground=self.theme["surface"],
+				foreground=self.theme["text"], borderwidth=0, font=self.ui_font(9), rowheight=26)
+			style.configure(style_name + ".Heading", background=self.theme["control"], foreground=self.theme["text"], font=self.ui_font(8, bold=True))
+			style.map(style_name, background=[("selected", self.theme["control_active"])],
+				foreground=[("selected", self.theme["bright"])])
+			tree = ttk.Treeview(content, style=style_name, columns=("completed",), show="tree headings", selectmode="browse")
+			tree.heading("#0", text="Category / achievement")
+			tree.heading("completed", text="Completed")
+			tree.column("#0", width=490, minwidth=220)
+			tree.column("completed", width=160, minwidth=140, stretch=False)
+			scrollbar = ttk.Scrollbar(content, orient="vertical", command=tree.yview)
+			scrollbar.pack(side="right", fill="y")
+			tree.config(yscrollcommand=scrollbar.set)
+			tree.pack(fill="both", expand=True)
+			state["achievement_tree"] = tree
+			state["achievement_icon_nodes"], state["achievement_icon_requested"] = {}, set()
+			completed = result.get("achievement_records", [])
+			query_text = filter_var.get().strip().casefold()
+			if query_text:
+				for item in completed:
+					if query_text in f"{item['name']} {item['completed']}".casefold():
+						row = tree.insert("", "end", text=item["name"], values=(item["completed"],))
+						state["achievement_icon_nodes"][row] = item["id"]
+				return
+			history_note = f"{len(completed)} completed achievements" if "achievement_records" in result else "Refresh to load achievement history"
+			tree.insert("", "end", text=f"{result.get('achievement_points', 'Unavailable')} points • {history_note}")
+			roots = result.get("achievement_categories", [])
+			for category in roots:
+				add_category(tree, "", category)
+			tree.insert("", "end", iid="all-history", text="All completed achievements", open=False)
+			tree.insert("all-history", "end", text="Expand to view saved achievement history")
+			tree.bind("<<TreeviewOpen>>", lambda _event: expand_category(tree))
+
+		def add_category(tree, parent, category):
+			key = f"category:{category['id']}"
+			if tree.exists(key):
+				return
+			tree.insert(parent, "end", iid=key, text=category["name"], open=False)
+			tree.insert(key, "end", iid=key + ":placeholder", text="Expand to load category")
+
+		def expand_category(tree):
+			key = tree.focus()
+			if key == "all-history":
+				for child in tree.get_children(key):
+					tree.delete(child)
+				for item in state["result"].get("achievement_records", []):
+					row = tree.insert(key, "end", text=item["name"], values=(item["completed"],))
+					state["achievement_icon_nodes"][row] = item["id"]
+				return
+			if not key.startswith("category:") or key.endswith(":placeholder"):
+				return
+			category_id = int(key.split(":")[1])
+			if category_id in state["categories"]:
+				fill_category(tree, key, state["categories"][category_id])
+				return
+			if category_id in state["category_pending"]:
+				return
+			state["category_pending"].add(category_id)
+			generation = state["generation"]
+			region, version = state["result"]["region"], state["result"]["version"]
+			def load():
+				try:
+					payload = lookup_achievement_category(region, version, category_id)
+				except ArmoryError as error:
+					payload = {"error": str(error)}
+				except Exception:
+					payload = {"error": "Category could not be loaded."}
+				state["queue"].put((generation, "category", (category_id, payload), None))
+			threading.Thread(target=load, daemon=True).start()
+
+		def fill_category(tree, key, data):
+			if not tree.winfo_exists() or not tree.exists(key):
+				return
+			for child in tree.get_children(key):
+				tree.delete(child)
+			if data.get("error"):
+				tree.insert(key, "end", text=data["error"])
+				return
+			for child in data.get("subcategories", []):
+				add_category(tree, key, child)
+			ids = {item["id"] for item in data.get("achievements", [])}
+			rows = [item for item in state["result"].get("achievement_records", []) if item["id"] in ids]
+			for item in rows:
+				row = tree.insert(key, "end", text=item["name"], values=(item["completed"],))
+				state["achievement_icon_nodes"][row] = item["id"]
+			if not rows and not data.get("subcategories"):
+				tree.insert(key, "end", text="No completed achievements in this category")
 
 		def hide_tooltip():
+			state["hover_generation"] = state.get("hover_generation", 0) + 1
+			timer = state.pop("tooltip_timer", None)
+			if timer is not None:
+				self.root.after_cancel(timer)
+			state.pop("tooltip_source", None)
 			tooltip = state.pop("tooltip", None)
-			if tooltip is not None:
+			if tooltip is not None and tooltip.winfo_exists():
 				tooltip.destroy()
 
-		def show_tooltip(heading, detail):
+		def cancel_source_tooltip(source):
+			if state.get("tooltip_source") is source:
+				hide_tooltip()
+
+		def still_hovering(source):
+			try:
+				if not source.winfo_exists() or not source.winfo_viewable() or self.root.focus_displayof() is None:
+					return False
+				x, y = self.root.winfo_pointerxy()
+				return self.root.winfo_containing(x, y) is source
+			except tk.TclError:
+				return False
+
+		def queue_tooltip(source, heading, detail):
 			hide_tooltip()
-			tooltip = tk.Toplevel(self.root)
-			tooltip.overrideredirect(True)
-			tooltip.config(bg=self.theme["surface"])
-			tk.Label(tooltip, text=f"{heading}\n{detail}", bg=self.theme["surface"], fg=self.theme["text"],
-				font=self.ui_font(9), justify="left", wraplength=460, padx=10, pady=8).pack()
-			tooltip.update_idletasks()
-			x = min(self.root.winfo_pointerx() + 12, self.root.winfo_screenwidth() - tooltip.winfo_reqwidth() - 8)
-			y = min(self.root.winfo_pointery() + 12, self.root.winfo_screenheight() - tooltip.winfo_reqheight() - 8)
-			tooltip.geometry(f"+{max(0, x)}+{max(0, y)}")
+			state["tooltip_source"] = source
+			generation = state["hover_generation"]
+			def reveal():
+				state.pop("tooltip_timer", None)
+				if generation != state.get("hover_generation") or not still_hovering(source):
+					return
+				show_tooltip(source, heading, detail)
+			state["tooltip_timer"] = self.root.after(350, reveal)
+
+		def show_tooltip(source, heading, detail):
+			# Keep the hover inside the existing Tk panel. No native popup window
+			# and no desktop-coordinate geometry, including on multiple Mac displays.
+			tooltip = tk.Frame(body, bg=self.theme["surface"], bd=0, highlightthickness=1,
+				highlightbackground=self.theme["border"], takefocus=False)
 			state["tooltip"] = tooltip
+			tk.Label(tooltip, text=f"{heading}\n{detail}", bg=self.theme["surface"], fg=self.theme["text"],
+				font=self.ui_font(9), justify="left", wraplength=max(80, min(420, body.winfo_width() - 36)),
+				padx=10, pady=8, takefocus=False).pack()
+			tooltip.update_idletasks()
+			if not still_hovering(source):
+				hide_tooltip()
+				return
+			width, height = tooltip.winfo_reqwidth(), tooltip.winfo_reqheight()
+			x = source.winfo_rootx() - body.winfo_rootx()
+			y = source.winfo_rooty() - body.winfo_rooty() + source.winfo_height() + 6
+			if y + height > body.winfo_height() - 8:
+				y = source.winfo_rooty() - body.winfo_rooty() - height - 6
+			x = max(8, min(x, body.winfo_width() - width - 8))
+			y = max(8, min(y, body.winfo_height() - height - 8))
+			tooltip.place(x=x, y=y)
+			tooltip.lift()
 
 		def filter_details(*_args):
 			if state["result"]:
@@ -4052,6 +4308,9 @@ class LauncherUI:
 			state["generation"] += 1
 			state["busy"], state["result"], state["url"] = False, None, ""
 			state["photo"] = None
+			refresh_section_tabs()
+			show_search()
+			search_summary.config(text="Search for a character or choose a saved profile.")
 			self.apply_theme(self.version.get(), subtree=window)
 			version_menu["menu"].config(bg=self.theme["control"], fg=self.theme["text"],
 				activebackground=self.theme["control_active"], activeforeground=self.theme["bright"])
@@ -4074,6 +4333,9 @@ class LauncherUI:
 		def poll():
 			if not body.winfo_exists():
 				return
+			source = state.get("tooltip_source")
+			if source is not None and not still_hovering(source):
+				hide_tooltip()
 			if state["version"] != self.version.get():
 				sync_version()
 			while True:
@@ -4081,7 +4343,22 @@ class LauncherUI:
 					generation, kind, payload, extra = state["queue"].get_nowait()
 				except queue.Empty:
 					break
+				if kind == "icon":
+					key, data = payload
+					state["icon_pending"].discard(key)
+					state["icon_bytes"][key] = data
+					for watcher in state["icon_watchers"].pop(key, []):
+						apply_icon(key, data, watcher)
+					continue
 				if generation != state["generation"]:
+					continue
+				if kind == "category":
+					category_id, data = payload
+					state["category_pending"].discard(category_id)
+					state["categories"][category_id] = data
+					tree = state.get("achievement_tree")
+					if tree and tree.winfo_exists():
+						fill_category(tree, f"category:{category_id}", data)
 					continue
 				state["busy"] = False
 				if kind == "ok":
@@ -4096,6 +4373,8 @@ class LauncherUI:
 					if extra:
 						state["url"] = extra
 					lookup_status.config(text=payload, fg=self.theme["error"])
+					viewer_status.config(text=payload, fg=self.theme["error"])
+			refresh_achievement_icons()
 			state["poll"] = self.root.after(150, poll)
 
 		def start_lookup(_event=None):
@@ -4119,6 +4398,7 @@ class LauncherUI:
 			state["url"], state["result"] = "", None
 			self.clear_children(results)
 			lookup_status.config(text="Looking up character…", fg=self.theme["muted"])
+			viewer_status.config(text="Refreshing character…", fg=self.theme["muted"])
 			threading.Thread(target=worker, daemon=True,
 				args=(state["generation"], region, realm, name, version)).start()
 
@@ -4133,6 +4413,8 @@ class LauncherUI:
 		def cleanup(event):
 			if event.widget is body:
 				hide_tooltip()
+				if state.get("icon_executor"):
+					state["icon_executor"].shutdown(wait=False, cancel_futures=True)
 				for timer in (state.get("poll"), state.get("resize")):
 					if timer:
 						self.root.after_cancel(timer)

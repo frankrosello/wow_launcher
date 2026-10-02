@@ -4,6 +4,8 @@ Blizzard credentials belong only in Worker secrets. Retail can fall back to
 Raider.IO when the shared service is unavailable.
 """
 import json
+import hashlib
+from pathlib import Path
 import re
 import time
 import unicodedata
@@ -23,6 +25,31 @@ ARMORY_LOCALES = {"us": "en-us", "eu": "en-gb", "kr": "ko-kr", "tw": "zh-tw"}
 # Versions accepted by the Worker's /character endpoint.
 ARMORY_VERSIONS = ("Retail", "Classic Era", "Mists of Pandaria Classic", "TBC Anniversary")
 EXPERIMENTAL_VERSIONS = ("TBC Anniversary",)
+
+
+def supported_character_sections(version, result=None):
+	"""Version defaults, refined by the actual optional endpoint responses."""
+	sections = {
+		"Achievements": version in ("Retail", "Mists of Pandaria Classic"),
+		"Professions": version == "Retail",
+	}
+	if isinstance(result, dict):
+		reported = result.get("section_support")
+		if not isinstance(reported, dict):
+			reported = {}
+		if isinstance(reported, dict):
+			for title in sections:
+				if isinstance(reported.get(title), bool):
+					sections[title] = reported[title]
+		# Also handle character snapshots saved before explicit capabilities existed.
+		if "Professions" not in reported and (result.get("details") or {}).get("professions"):
+			sections["Professions"] = True
+	# These clients have no player achievement system.
+	if version in ("Classic Era", "TBC Anniversary") or version not in ARMORY_VERSIONS:
+		sections["Achievements"] = False
+	if version not in ARMORY_VERSIONS:
+		sections["Professions"] = False
+	return sections
 
 
 class ArmoryError(Exception):
@@ -135,7 +162,7 @@ def _character_details(data):
 	"""Normalize optional Worker details; tolerate missing Classic endpoints."""
 	details = {key: [] for key in ("equipment", "stats", "professions", "progress", "guild", "achievements")}
 	messages = {}
-	if data.get("schema") not in (2, 3):
+	if data.get("schema") not in (2, 3, 4):
 		for key in details:
 			messages[key] = "Additional details require the updated Armory service. Your basic profile is still available."
 	equipment = data.get("equipment") or {}
@@ -260,7 +287,7 @@ def _character_details(data):
 		if profile.get("achievement_points") is not None:
 			details["achievements"].append(("Achievement points", profile["achievement_points"]))
 		messages["achievements"] = "Achievement history is unavailable for this character or game version."
-	if data.get("schema") != 3:
+	if data.get("schema") not in (3, 4):
 		for key in ("guild", "achievements"):
 			details[key].append(("Additional details", "Update the Armory Worker and refresh this character to load guild and achievement history."))
 	return details, messages
@@ -290,6 +317,43 @@ def _proxy_lookup(region, realm, name, version):
 		raise ArmoryError("The armory service sent a response that could not be read.")
 	result = _blizzard_result(profile, data.get("media"), region, realm, name, version)
 	result["details"], result["detail_messages"] = _character_details(data)
+	result["section_support"] = supported_character_sections(version)
+	for title, endpoint in (("Achievements", "achievements"), ("Professions", "professions")):
+		if isinstance(data.get(endpoint), dict):
+			result["section_support"][title] = True
+		elif (data.get("unavailable") or {}).get(endpoint) in (400, 404, 405, 501):
+			result["section_support"][title] = False
+	result["section_support"] = supported_character_sections(version, result)
+	categories = data.get("achievement_categories") or {}
+	roots = categories.get("root_categories", categories.get("categories", []))
+	result["achievement_categories"] = [
+		{"id": item["id"], "name": item["name"]} for item in roots
+		if isinstance(item, dict) and isinstance(item.get("id"), int) and isinstance(item.get("name"), str)]
+	result["icon_refs"] = {"equipment": {}, "overview": {}}
+	for item in (data.get("equipment") or {}).get("equipped_items", []):
+		if isinstance(item, dict):
+			identifier = (item.get("item") or {}).get("id")
+			slot = _name(item.get("slot")) or "Equipment"
+			if isinstance(identifier, int) and identifier > 0:
+				result["icon_refs"]["equipment"][slot] = {"kind": "item", "id": identifier}
+	for label, key, kind in (("Class", "character_class", "playable-class"),
+		("Specialization", "active_spec", "playable-specialization")):
+		identifier = (profile.get(key) or {}).get("id")
+		if isinstance(identifier, int) and identifier > 0:
+			result["icon_refs"]["overview"][label] = {"kind": kind, "id": identifier}
+	result["achievement_records"] = []
+	for item in (data.get("achievements") or {}).get("achievements", []):
+		if not isinstance(item, dict) or item.get("completed_timestamp") is None:
+			continue
+		achievement = item.get("achievement") or {}
+		identifier = achievement.get("id", item.get("id"))
+		if not isinstance(identifier, int):
+			continue
+		result["achievement_records"].append({"id": identifier,
+			"name": achievement.get("name") or f"Achievement {identifier}",
+			"completed": _format_timestamp(item["completed_timestamp"]) or "Date unavailable",
+			"timestamp": item["completed_timestamp"]})
+	result["achievement_records"].sort(key=lambda item: item["timestamp"], reverse=True)
 	return result
 
 
@@ -354,6 +418,54 @@ def lookup_character(region, realm, name, version="Retail"):
 	if version != "Retail":
 		raise ArmoryError("The character service is unavailable.", url=classic_armory_url(region))
 	return _raiderio_lookup(region, realm, name)
+
+
+def lookup_achievement_category(region, version, category_id):
+	"""Load official category membership without making the user supply API keys."""
+	if region not in REGIONS or version not in ARMORY_VERSIONS or not isinstance(category_id, int) or category_id <= 0:
+		raise ArmoryError("Invalid achievement category.")
+	query = urlencode({"region": region, "version": version, "id": category_id})
+	data = _get_json(f"{PROXY_URL.rstrip('/')}/achievement-category?{query}")
+	if not isinstance(data, dict):
+		raise ArmoryError("The category response could not be read.")
+	return data
+
+
+def fetch_media_icon(region, version, kind, identifier, cache_dir=None):
+	"""Fetch the official icon; cache successful downloads on disk for seven days."""
+	if region not in REGIONS or version not in ARMORY_VERSIONS or kind not in (
+		"item", "achievement", "playable-class", "playable-specialization"):
+		return None
+	if not isinstance(identifier, int) or identifier <= 0:
+		return None
+	cache_path = None
+	if cache_dir is not None:
+		digest = hashlib.sha256(f"{region}/{version}/{kind}/{identifier}".encode()).hexdigest()
+		cache_path = Path(cache_dir) / (digest + ".img")
+		try:
+			if time.time() - cache_path.stat().st_mtime < 7 * 86400:
+				with cache_path.open("rb") as stream:
+					data = stream.read(MAX_AVATAR_BYTES + 1)
+				if data and len(data) <= MAX_AVATAR_BYTES:
+					return data
+		except OSError:
+			pass
+	try:
+		query = urlencode({"region": region, "version": version, "kind": kind, "id": identifier})
+		media = _get_json(f"{PROXY_URL.rstrip('/')}/media?{query}")
+		assets = media.get("assets", []) if isinstance(media, dict) else []
+		url = next((item.get("value") for item in assets
+			if isinstance(item, dict) and item.get("key") == "icon"), None)
+		data = fetch_avatar(url)
+		if data and cache_path is not None:
+			try:
+				cache_path.parent.mkdir(parents=True, exist_ok=True)
+				cache_path.write_bytes(data)
+			except OSError:
+				pass
+		return data
+	except (ArmoryError, ValueError, TypeError):
+		return None
 
 
 def fetch_avatar(url):
