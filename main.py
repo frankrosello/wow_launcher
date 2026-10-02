@@ -3621,8 +3621,8 @@ def set_windows_app_id():
 		pass
 
 
-if __name__ == "__main__":
-	set_windows_app_id()
-	app = tk.Tk()
-	LauncherUI(app)
+if __name__ == "__main__": 
+	set_windows_app_id() 
+	app = tk.Tk() 
+	LauncherUI(app) 
 	app.mainloop()
