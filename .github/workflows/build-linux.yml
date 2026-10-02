@@ -57,8 +57,8 @@ jobs:
 
       - name: Verify build output
         run: |
-          test -f dist/WoWLauncher/WoWLauncher || { echo "Build output missing. dist contents:"; find dist -maxdepth 2; exit 1; }
-          chmod +x dist/WoWLauncher/WoWLauncher
+          test -f dist/WoWLauncher || { echo "Build output missing. dist contents:"; find dist -maxdepth 2; exit 1; }
+          chmod +x dist/WoWLauncher
 
       - name: Create Linux archive
         run: |
