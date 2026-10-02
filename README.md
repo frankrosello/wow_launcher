@@ -38,107 +38,90 @@ A classic-styled, unofficial launcher for your World of Warcraft installations. 
 
 ---
 
-## Building the launcher (PyInstaller)
+## Running from source
 
-The launcher is built into a standalone Windows `.exe` with [PyInstaller](https://pyinstaller.org/), so players don't need Python installed.
+### Requirements
+- Python 3.9 or newer, with Tkinter
+- The launcher source files: `main.py`, `addon_manager.py`, and `update_manager.py`
 
-### What you need to build
-- Python 3.9 or newer, with Tkinter (included with most Python installers)
-- `pip install pillow psutil pyinstaller`
-- The three code files in one folder: `main.py`, `addon_manager.py`, and `update_manager.py`
+Install the Python dependencies:
 
-### Build
-Open a terminal in the project folder and run (Windows Command Prompt):
-
-```bat
-pyinstaller --noconfirm --windowed --name "WoW Launcher" --icon wowicon.ico ^
-  --add-data "logos;logos" --add-data "backgrounds;backgrounds" ^
-  --add-data "screenshots;screenshots" --add-data "fonts;fonts" ^
-  --add-data "wowicon.png;." --add-data "wowicon.ico;." ^
-  --add-data "wow_logo.png;." --add-data "image.png;." ^
-  main.py
+```bash
+pip install pillow psutil
 ```
 
-Your build appears in `dist\WoW Launcher\`. Run `WoW Launcher.exe` from there.
+Run the launcher directly from the project folder:
 
-Notes:
-- `--windowed` hides the console window. `--icon` sets the icon of the `.exe` itself.
-- Each `--add-data "source;destination"` bundles an artwork file or folder. Leave out any that you don't have, because PyInstaller stops with an error if a listed path is missing.
-- In PowerShell, use a backtick (`` ` ``) instead of `^` at the end of each line, or put the whole command on one line.
-- On macOS or Linux, separate source and destination with `:` instead of `;`. A macOS app icon must be an `.icns` file.
-- The default build is a folder (`--onedir`), which starts quickly and keeps the artwork easy to swap. Add `--onefile` for a single `.exe`, but it starts more slowly and the bundled artwork can't be changed afterwards.
-- The launcher saves `launcher_settings.json` next to the `.exe`, so keep the folder somewhere you can write to.
-- Some antivirus programs flag PyInstaller programs as suspicious by mistake. If that happens, build it yourself from source rather than trusting a random download.
+```bash
+python main.py
+```
 
-> **Before you publish a build:** the `.exe` bundles whatever artwork you added. If that includes Blizzard logos, backgrounds, or screenshots, don't upload the build as a public release. See the [Disclaimer](#disclaimer).
-
-On first launch the setup wizard helps you point the launcher at your game folders. You can change them later under **Options**.
-
-### Artwork folders (optional)
-
-The launcher looks for its artwork next to `main.py`, or inside the build if it was bundled with `--add-data`. If a file is missing, it falls back to a plain themed look.
-
-| Folder / file | Used for |
-|---|---|
-| `logos/` | Per-game logos |
-| `backgrounds/` | Per-game background art |
-| `screenshots/` | Four rotating images per game, named `classicscreenshot1.png` to `classicscreenshot4.png`, and likewise `retailscreenshot…`, `tbcscreenshot…`, `mopscreenshot…`, `foreverscreenshot…` |
-| `fonts/` | Optional `*friz*.ttf` font files. On Windows the launcher also looks in your game's own `Fonts` folders. |
-| `wowicon.png` / `wowicon.ico` | Window and taskbar icon |
-
-Use your own images or ones you have the right to use. See the disclaimer below.
+The launcher can be run from source without building an `.exe`. This is useful for development and testing.
 
 ---
 
-## Technology
+## Building with PyInstaller
 
-**Language:** Python 3 (the whole launcher). The CurseForge proxy it talks to is a small separate JavaScript service on Cloudflare Workers.
+PyInstaller is used to package the launcher into a standalone Windows application so users do not need Python installed.
 
-**Third-party libraries**
-| Library | Used for |
-|---|---|
-| [Pillow](https://pypi.org/project/Pillow/) (9.1+) | Artwork loading, resizing, gradients, rounded corners, shadows, and the blurred backdrop behind panels |
-| [psutil](https://pypi.org/project/psutil/) | Detecting running game processes for playtime tracking |
-| [PyInstaller](https://pyinstaller.org/) | Packaging the launcher as a standalone app (build time only) |
+### Install PyInstaller
 
-**Python standard library**
-- `tkinter` (including `ttk`, `font`, `filedialog`, `messagebox`, and `simpledialog`) for the whole interface
-- `urllib` for web requests, `zipfile` and `shutil` for addon installs
-- `threading`, `queue`, and `concurrent.futures` for background work such as news, update checks, and downloads
-- `json`, `pathlib`, `re`, `html.parser`, `shlex`, `subprocess`, `plistlib`, and `ctypes` (Windows font and taskbar-icon handling)
+```bash
+pip install pyinstaller
+```
 
----
+### Using the included spec file
 
-## How it works and what it connects to
+The repository includes `WoWLauncher.spec`, which contains the launcher entry point, bundled artwork folders/files, application name, and Windows icon configuration.
 
-The launcher starts your existing game executable. It does not patch, modify, or inspect game binaries, and it does not touch your login or the Battle.net Agent. The addon manager only reads and writes inside your `Interface\AddOns` folder (and `AddOns_Disabled` next to it).
+From the project folder, run:
 
-Network requests go to:
-- the official World of Warcraft news pages (news feed)
-- Blizzard's public version service (update notifications)
-- a small CurseForge proxy that holds the API key, so you never need your own (addon search and downloads)
-- any URL or GitHub link you enter yourself in the addon manager
+```bash
+python -m PyInstaller WoWLauncher.spec --noconfirm --clean
+```
 
-Settings and playtime are stored locally in `launcher_settings.json` next to the launcher.
+The completed application will be placed in:
 
----
+```text
+dist\WoWLauncher\
+```
 
-## Possible future additions
+Run:
 
-These are ideas, not promises:
+```text
+dist\WoWLauncher\WoWLauncher.exe
+```
 
-- **Backup and restore** of `WTF` and `Interface\AddOns`, including an automatic snapshot before addon updates or a game patch
-- **Safer addon updates:** install to a temporary folder and swap it in, so a failed copy can never leave an addon missing
-- **Addon compatibility flags:** compare each addon's Interface number with the installed client build and warn when a patch is likely to break it
-- **Open Battle.net button** on the update notice
-- **Periodic update re-checks** while the launcher stays open
-- **Addon profiles** (for example raid, PvP, minimal) that switch sets of enabled addons
-- **More addon sources** beyond CurseForge, such as GitHub releases or WoWInterface
-- **Cache cleaner** and an **error-log viewer** for post-patch troubleshooting
-- **More launch options:** window mode, process priority, and "close launcher on play"
-- **Windows `.exe` build** via PyInstaller for people who don't want to install Python
+### What the spec file includes
 
----
+The PyInstaller configuration bundles:
+
+- `main.py` as the application entry point
+- `wowicon.ico` and `wowicon.png`
+- `wow_logo.png`
+- `image.png`
+- `logos/`
+- `backgrounds/`
+- `screenshots/`
+- `fonts/`
+
+It also builds the application as a windowed executable, so a console window is not shown.
+
+### Rebuilding after changes
+
+If you change the launcher source code or bundled artwork, rebuild the application:
+
+```bash
+pyinstaller --noconfirm WoWLauncher.spec
+```
+
+For a clean rebuild, remove the previous `build/` and `dist/` folders first.
+
+### Important
+
+The generated `.exe` contains whatever artwork is bundled through the spec file. If those files include Blizzard logos, backgrounds, screenshots, fonts, or other Blizzard-owned assets, do not distribute the resulting build publicly unless you have the necessary rights to do so. See the [Disclaimer](#disclaimer).
+
+PyInstaller builds may also be flagged by some antivirus programs as false positives. Building the application yourself from the source is recommended rather than downloading an untrusted executable.
 
 ## Disclaimer
 
@@ -158,4 +141,31 @@ If you are a rights holder and want something removed from this repository, plea
 
 ## License
 
-_Add the license for the launcher's source code here (for example MIT). This license applies to the code only and never to any Blizzard assets._
+This project is licensed under the MIT License for the original source code written by Frank Rosello.
+
+Copyright (c) 2026 Frank Rosello
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+**Important:** The MIT License applies only to the original source code of this
+launcher. It does **not** grant permission to use, copy, modify, or redistribute
+any Blizzard Entertainment assets, including World of Warcraft or Blizzard
+logos, artwork, screenshots, fonts, or other copyrighted materials. Those
+materials remain subject to their respective rights and licenses as described
+in the [Disclaimer](#disclaimer).
