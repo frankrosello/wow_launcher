@@ -6,6 +6,7 @@ import math
 from datetime import date, datetime, timedelta
 import json
 from html.parser import HTMLParser
+from html import unescape
 import os
 from pathlib import Path
 import plistlib
@@ -320,6 +321,27 @@ GAME_NEWS_TERMS = {
 	"Crusader Storm": (
 		"crusader storm", "burning crusade", "anniversary", "outland", "hotfix"),
 }
+
+
+
+def news_article_games(article):
+	"""Use explicit edition names; general news stays in All Games."""
+	patterns = {
+		"WoW Forever Beta": r"\b(?:wow[ :]*forever|world of warcraft[ :]*forever)\b",
+		"Retail": r"\b(?:retail|midnight|the war within|dragonflight)\b",
+		"Classic Era": r"\b(?:classic era|hardcore|season of discovery|wow classic|world of warcraft classic)\b",
+		"Mists of Pandaria Classic": r"\b(?:mists of pandaria|pandaria classic|mop classic)\b",
+		"TBC Anniversary": r"\b(?:burning crusade|tbc|bcc|outland|classic anniversary|anniversary edition)\b",
+	}
+	def editions(text):
+		text = text.casefold().replace("–", " ").replace("—", " ")
+		games = [game for game, pattern in patterns.items() if re.search(pattern, text)]
+		# "WoW Classic" in an expansion's name isn't also Classic Era.
+		if "Classic Era" in games and any(game in games for game in ("Mists of Pandaria Classic", "TBC Anniversary")):
+			if not re.search(r"\b(?:classic era|hardcore|season of discovery)\b", text):
+				games.remove("Classic Era")
+		return games
+	return editions(article.get("title", "")) or editions(article.get("summary", ""))
 
 
 def resource_path(*parts):
@@ -2137,17 +2159,30 @@ class LauncherUI:
 			except Exception:
 				pass
 			found.extend(parser.items)
+		# Older archive pages publish cards in the embedded JSON model.
+		model_match = re.search(r'<script[^>]*\bid=["\']model["\'][^>]*>\s*model\s*=\s*(\{.*?\})\s*;?\s*</script>', page, re.DOTALL)
+		if model_match:
+			try:
+				model = json.loads(model_match.group(1))
+				for blog in model.get("blogList", {}).get("blogs", []):
+					if isinstance(blog, dict) and blog.get("title") and blog.get("url"):
+						found.append({"id": str(blog.get("id") or ""), "title": unescape(blog["title"]),
+							"summary": unescape(re.sub(r"<[^>]+>", " ", blog.get("description") or "")).strip(), "url": blog["url"]})
+			except (ValueError, TypeError, AttributeError):
+				pass
 		if found:
 			self._news_page_cache[source_url] = (time.monotonic(), found)
 		return [dict(article) for article in found], not found
 
-	def build_news(self, version, allow_network=True, force=False, limit=6):
+	def build_news(self, version, allow_network=True, force=False, limit=6, archive_pages=1):
 		"""(selected articles, error count, matched) or None if it needs the network."""
 		sources = self.news_sources_for(version)
+		if WOW_NEWS_URL in sources and archive_pages > 1:
+			sources = [*sources, *(f"{WOW_NEWS_URL}?page={page}" for page in range(2, archive_pages + 1))]
 		if not sources:
 			return [], 0, False
 		if allow_network:
-			with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+			with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
 				results = list(pool.map(
 					lambda url: self.news_source_articles(url, True, force=force), sources))
 		else:
@@ -2171,14 +2206,10 @@ class LauncherUI:
 		if version == "Crusader Storm":
 			return list(articles.values())[:limit], feed_errors, bool(articles)
 
-		terms = GAME_NEWS_TERMS.get(version, (version.casefold(),))
 		ranked = []
 		for article in articles.values():
-			text = f"{article['title']} {article['summary']}".casefold()
-			for rank, term in enumerate(terms):
-				if term in text:
-					ranked.append((rank, article))
-					break
+			if version in news_article_games(article):
+				ranked.append((0, article))
 		ranked.sort(key=lambda item: item[0])
 		matched = bool(ranked)
 		selected = [article for _rank, article in ranked][:limit]
@@ -2281,7 +2312,7 @@ class LauncherUI:
 			selected = state["filter"]
 			articles = state["articles"]
 			if selected != "ALL GAMES":
-				articles = [item for item in articles if item.get("game") == selected]
+				articles = [item for item in articles if selected in item.get("games", [])]
 			status.config(text=f"{len(articles)} article{'s' if len(articles) != 1 else ''} • {selected}")
 			failure = state.get("failures", {}).get(selected)
 			if failure and not articles:
@@ -2359,20 +2390,32 @@ class LauncherUI:
 		self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
 
 	def fetch_news_hub(self, generation, force=False):
-		all_articles = []
+		# Fetch each source once, then classify each unique article once.
+		versions = self.news_hub_versions()
+		sources = [WOW_NEWS_URL, WOW_CLASSIC_NEWS_URL,
+			*(f"{WOW_NEWS_URL}?page={page}" for page in range(2, 11))]
+		articles = {}
 		failures = {}
-		for version in self.news_hub_versions():
-			try:
-				selected, errors, matched = self.build_news(version, force=force, limit=100)
-				if errors:
-					failures[version] = self.__dict__.get("_news_source_errors", {}).get(
-						self.news_sources_for(version)[0], "The news source could not be reached or parsed.")
-				for article in selected:
-					item = dict(article)
-					item["game"] = version
-					all_articles.append(item)
-			except Exception as exc:
-				failures[version] = str(exc)
+		with ThreadPoolExecutor(max_workers=4) as pool:
+			results = list(pool.map(lambda url: self.news_source_articles(url, True, force=force), sources))
+		for source_url, (found, failed) in zip(sources, results):
+			if failed:
+				message = self.__dict__.get("_news_source_errors", {}).get(source_url, "A news source could not be reached or parsed.")
+				for version in versions:
+					failures.setdefault(version, message)
+			for article in found:
+				item = dict(article)
+				item["url"] = urljoin(source_url, item["url"])
+				match = NEWS_ID_PATTERN.search(item["url"])
+				key = match.group(1) if match else item["url"].split("#", 1)[0]
+				previous = articles.get(key)
+				if previous is None or (not previous.get("summary") and item.get("summary")):
+					articles[key] = item
+		all_articles = []
+		for article in articles.values():
+			article["games"] = [game for game in news_article_games(article) if game in versions]
+			article["game"] = " / ".join(article["games"]) or "World of Warcraft"
+			all_articles.append(article)
 		self.news_hub_queue.put((generation, all_articles, failures))
 
 	def poll_news_hub(self, window, state, status, render, generation):
@@ -2572,11 +2615,6 @@ class LauncherUI:
 			self.open_news_hub()
 
 		button(toolbar, "HOME", go_home)
-		address = tk.StringVar(value=url)
-		address_field = tk.Entry(toolbar, textvariable=address, state="readonly",
-			readonlybackground=theme["control"], fg=theme["text"], relief="flat", bd=0,
-			font=self.ui_font(8))
-		address_field.pack(side="left", fill="x", expand=True, ipady=7)
 		status = tk.Label(body, text="Loading article…", bg=panel, fg=theme["muted"],
 			font=self.ui_font(8), anchor="w", wraplength=950)
 		status.pack(side="bottom", fill="x", pady=(6, 0))
@@ -2599,7 +2637,6 @@ class LauncherUI:
 				state["history"].append(target)
 				state["index"] = len(state["history"]) - 1
 			state["url"] = target
-			address.set(target)
 			update_controls()
 			state["generation"] += 1
 			generation = state["generation"]
@@ -2664,7 +2701,6 @@ class LauncherUI:
 				else:
 					resolved, title, blocks = result
 					state["url"] = resolved
-					address.set(resolved)
 					state["history"][state["index"]] = resolved
 					show_text(title or "World of Warcraft News", blocks)
 					status.config(text="Reader view • Article text and links. Original layout and media: OPEN IN BROWSER.",
