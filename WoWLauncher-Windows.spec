@@ -1,16 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
 from pathlib import Path
 
 project_dir = Path(SPECPATH)
 
-# Assets used by the launcher
-datas = [
-    (str(project_dir / "assets"), "assets"),
-]
+datas = []
 
-# Add hidden imports if needed
+for folder in [
+    "backgrounds",
+    "fonts",
+    "logos",
+    "screenshots",
+]:
+    path = project_dir / folder
+    if path.exists():
+        datas.append((str(path), folder))
+
+for filename in [
+    "wow_logo.png",
+    "wowicon.png",
+    "image.png",
+]:
+    path = project_dir / filename
+    if path.exists():
+        datas.append((str(path), "."))
+
 hiddenimports = [
     "psutil",
     "PIL",
@@ -34,28 +48,28 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(
-    a.pure,
-)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="WoWLauncher",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    icon=str(project_dir / "wowicon.ico"),
+)
 
-    # Change this to your actual icon
-    icon=str(project_dir / "assets" / "wow.ico"),
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="WoWLauncher",
 )
