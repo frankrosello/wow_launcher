@@ -78,9 +78,9 @@ PyInstaller cannot cross-compile. You must build on the same operating system yo
 
 | OS | Spec file | Icon | Output |
 |---|---|---|---|
-| Windows | `WoWLauncher.spec` | `wowicon.ico` | `dist\WoWLauncher\WoWLauncher.exe` |
-| macOS | `WoWLauncher-mac.spec` | `.icns` | `dist/WoWLauncher.app` |
-| Linux | `WoWLauncher-linux.spec` | none (window icon set at runtime from `wowicon.png`) | `dist/WoWLauncher/WoWLauncher` |
+| Windows | `WoWLauncher-Windows.spec` | `wowicon.ico` | `dist\WoWLauncher\WoWLauncher.exe` |
+| macOS | `WoWLauncher-macOS.spec` | `.icns` | `dist/WoWLauncher.app` |
+| Linux | `WoWLauncher-Linux.spec` | none (window icon set at runtime from `wowicon.png`) | `dist/WoWLauncher/WoWLauncher` |
 
 Why they differ:
 
@@ -94,7 +94,7 @@ Why they differ:
 From the project folder, run:
 
 ```bash
-python -m PyInstaller WoWLauncher.spec --noconfirm --clean
+python -m PyInstaller WoWLauncher-Windows.spec --noconfirm --clean
 ```
 
 Then run:
@@ -108,7 +108,7 @@ dist\WoWLauncher\WoWLauncher.exe
 From the project folder, run:
 
 ```bash
-python3 -m PyInstaller WoWLauncher-mac.spec --noconfirm --clean
+python3 -m PyInstaller WoWLauncher-macOS.spec --noconfirm --clean
 ```
 
 Then open:
@@ -122,7 +122,7 @@ dist/WoWLauncher.app
 Tkinter must be installed first (for example, `sudo apt install python3-tk` on Debian/Ubuntu). Then, from the project folder, run:
 
 ```bash
-python3 -m PyInstaller WoWLauncher-linux.spec --noconfirm --clean
+python3 -m PyInstaller WoWLauncher-Linux.spec --noconfirm --clean
 ```
 
 Then run:
