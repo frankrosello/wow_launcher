@@ -112,7 +112,7 @@ It also builds the application as a windowed executable, so a console window is 
 If you change the launcher source code or bundled artwork, rebuild the application:
 
 ```bash
-pyinstaller --noconfirm WoWLauncher.spec
+python -m PyInstaller WoWLauncher.spec --noconfirm --clean
 ```
 
 For a clean rebuild, remove the previous `build/` and `dist/` folders first.
