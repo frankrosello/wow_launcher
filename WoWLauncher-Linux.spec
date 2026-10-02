@@ -3,6 +3,7 @@
 from pathlib import Path
 
 project_dir = Path(SPECPATH)
+icon_path = project_dir / "wowicon.png"
 
 datas = []
 
@@ -62,4 +63,5 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(icon_path),
 )

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 project_dir = Path(SPECPATH)
+icon_path = project_dir / "wowicon.icns"
 
 datas = []
 
@@ -68,6 +69,7 @@ app = BUNDLE(
     a.binaries,
     a.datas,
     name="WoWLauncher.app",
+    icon=str(icon_path),
     bundle_identifier="com.frankrosello.wowlauncher",
     info_plist={
         "CFBundleName": "WoW Launcher",
