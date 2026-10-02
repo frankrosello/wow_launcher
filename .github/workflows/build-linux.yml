@@ -1,0 +1,80 @@
+name: Build WoW Launcher (Linux)
+
+on:
+  workflow_dispatch:
+
+  push:
+    tags:
+      - "v*"
+
+jobs:
+
+  # ==========================================
+  # LINUX
+  # ==========================================
+  build-linux:
+    name: Build Linux
+    # Pinned: building on the oldest supported runner keeps the binary
+    # compatible with older glibc versions. ubuntu-latest can break this.
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pillow psutil
+          fi
+          pip install pyinstaller
+
+      - name: Verify Tkinter and spec file
+        run: |
+          python -c "import tkinter; print('Tkinter OK:', tkinter.TkVersion)"
+          test -f WoWLauncher-Linux.spec || { echo "WoWLauncher-Linux.spec not found. Files:"; ls -la; exit 1; }
+
+      - name: Build Linux application
+        run: |
+          python -m PyInstaller WoWLauncher-Linux.spec --noconfirm --clean
+
+      - name: Verify build output
+        run: |
+          test -f dist/WoWLauncher || { echo "Build output missing. dist contents:"; find dist -maxdepth 2; exit 1; }
+          chmod +x dist/WoWLauncher
+
+      - name: Create Linux archive
+        run: |
+          tar -czf WoWLauncher-Linux.tar.gz -C dist WoWLauncher
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
+        with:
+          name: WoWLauncher-Linux
+          path: WoWLauncher-Linux.tar.gz
+          if-no-files-found: error
+
+      - name: Add build to most recent release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName)
+          echo "Uploading to release: $TAG"
+          gh release upload "$TAG" WoWLauncher-Linux.tar.gz --repo "${{ github.repository }}" --clobber
