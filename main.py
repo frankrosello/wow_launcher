@@ -56,6 +56,10 @@ CLIENT_MAJOR_VERSIONS = {
 # Used for playtime when several games claim the same running exe.
 RUNNING_CLIENT_MAJORS = {**CLIENT_MAJOR_VERSIONS, "Crusader Storm": (2,)}
 IS_MAC = sys.platform == "darwin"
+# Tk point sizes are 4/3 larger on Windows (96 dpi) than on macOS (72 dpi), so on a Mac the
+# same size looks smaller. Sizes are given to Tk in pixels there (negative) to match.
+# 1.333 matches Windows at 100% display scaling, 1.667 at 125%. Tune this to taste.
+MAC_FONT_SCALE = 1.5
 # Windows .exe names first, then the macOS .app bundle names (Mac clients are app bundles).
 EXECUTABLES = {
 	"WoW Forever Beta": ("WowB.exe", "World of Warcraft Classic Beta.app",
@@ -103,8 +107,7 @@ GAME_COPY = {
 	"WoW Forever Beta": {
 		"title": "A WORLD THAT NEVER ENDS",
 		"subtitle": "Step into WoW Forever and rediscover Azeroth as a living, breathing world. "
-			"Explore sprawling zones, delve into dangerous dungeons, and forge friendships "
-			"that last long after the journey ends.",
+			"Explore vast zones, face dangerous dungeons, and forge lasting friendships.",
 		"headline": "A NEW ADVENTURE AWAITS", "tagline": "YOUR LEGEND NEVER ENDS",
 		"slides": (
 			("A NEW ADVENTURE AWAITS", "YOUR LEGEND NEVER ENDS"),
@@ -116,9 +119,8 @@ GAME_COPY = {
 	},
 	"Retail": {
 		"title": "CHOOSE YOUR NEXT ADVENTURE",
-		"subtitle": "Enter the modern World of Warcraft and continue an ever-evolving saga across Azeroth. "
-			"Team up for dungeons, raids, and world events, or venture out alone whenever you're "
-			"ready.",
+		"subtitle": "Enter the modern World of Warcraft and continue an ever-evolving saga. Team up "
+			"for dungeons, raids, and world events, or venture out alone when ready.",
 		"headline": "A NEW CHAPTER BEGINS", "tagline": "YOUR STORY CONTINUES",
 		"slides": (
 			("A NEW CHAPTER BEGINS", "YOUR STORY CONTINUES"),
@@ -130,9 +132,8 @@ GAME_COPY = {
 	},
 	"Classic Era": {
 		"title": "RETURN TO AZEROTH",
-		"subtitle": "Return to original Azeroth and experience World of Warcraft in its timeless form. Earn "
-			"every level, gather allies for classic dungeons, or set out alone to find hidden "
-			"corners.",
+		"subtitle": "Return to original Azeroth and experience World of Warcraft in its timeless "
+			"form. Earn each level, gather allies for dungeons, or find hidden corners.",
 		"headline": "ADVENTURE BEGINS ANEW", "tagline": "RETURN TO THE WORLD THAT STARTED IT ALL",
 		"slides": (
 			("ADVENTURE BEGINS ANEW", "RETURN TO THE WORLD THAT STARTED IT ALL"),
@@ -144,9 +145,8 @@ GAME_COPY = {
 	},
 	"Mists of Pandaria Classic": {
 		"title": "THE MISTS ARE CALLING",
-		"subtitle": "Journey back to Pandaria, a land of tranquil forests, mist-covered peaks, and ancient "
-			"conflicts. Master new challenges and gather allies, as great danger hides behind the "
-			"calm.",
+		"subtitle": "Journey back to Pandaria, a realm of serene forests, mist-covered peaks, and "
+			"ancient conflicts. Master new challenges as danger hides behind the calm.",
 		"headline": "JOURNEY THROUGH THE MISTS", "tagline": "PANDARIA AWAITS",
 		"slides": (
 			("JOURNEY THROUGH THE MISTS", "PANDARIA AWAITS"),
@@ -158,8 +158,8 @@ GAME_COPY = {
 	},
 	"TBC Anniversary": {
 		"title": "THROUGH THE DARK PORTAL",
-		"subtitle": "Cross the Dark Portal and return to the broken world of Outland. Face the Burning Legion "
-			"alongside your allies in dungeons and raids in the Burning Crusade Anniversary edition.",
+		"subtitle": "Cross the Dark Portal and return to the broken world of Outland. Fight the "
+			"Burning Legion beside your allies in dungeons and raids of Burning Crusade.",
 		"headline": "STEP THROUGH THE DARK PORTAL", "tagline": "YOUR OUTLAND ADVENTURE BEGINS",
 		"slides": (
 			("STEP THROUGH THE DARK PORTAL", "YOUR OUTLAND ADVENTURE BEGINS"),
@@ -172,8 +172,7 @@ GAME_COPY = {
 	"Crusader Storm": {
 		"title": "THE BURNING CRUSADE, YOUR WAY",
 		"subtitle": "Return to Outland on a free, BlizzLike Burning Crusade server. Level from 1 to "
-			"70 at your own pace, team up across factions, and chase achievements, from relaxed "
-			"questing to Hardcore challenges.",
+			"70 at your own pace, team up across factions, and chase Hardcore goals.",
 		"headline": "OUTLAND CALLS AGAIN", "tagline": "A BLIZZLIKE BURNING CRUSADE",
 		"slides": (
 			("OUTLAND CALLS AGAIN", "A BLIZZLIKE BURNING CRUSADE"),
@@ -287,6 +286,7 @@ SLIDESHOW_PREFIXES = {
 WOW_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/news"
 WOW_CLASSIC_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/classic"
 NEWS_TEXT_WIDTH = 395
+NEWS_CARD_COUNT = 3   # news cards shown, on every platform (font metrics differ per OS)
 NEWS_ID_PATTERN = re.compile(r"/news/(\d+)")
 GENERIC_NEWS_TITLES = {"learn more", "read more", "view all", "read more stories", "more"}
 VOID_TAGS = frozenset((
@@ -1216,12 +1216,17 @@ class LauncherUI:
 			self.root.after(400, self.open_setup_wizard)
 
 	def set_app_icon(self):
-		"""Set a crisp window/taskbar icon (Win32 API on Windows, PNG elsewhere)."""
+		"""Set a crisp window/taskbar icon (Win32 API on Windows, PNG on Linux and when
+		running from source on macOS; the built macOS app keeps its bundle icon)."""
 		if os.name == "nt":
 			if self.set_windows_icon():
 				# Tk can reapply its default icon when the window first maps; set again.
 				self.root.after(300, self.set_windows_icon)
 				return
+		if IS_MAC and getattr(sys, "frozen", False):
+			# The .app bundle already carries the .icns icon (set in the spec). Calling
+			# iconphoto here would replace the Dock icon with the flat PNG.
+			return
 		icon = self.load_image(resource_path(APP_ICON_FILE), "RGBA")
 		if icon is None:
 			return
@@ -1704,14 +1709,29 @@ class LauncherUI:
 		extras = tuple(name for name in EXTRA_VERSIONS if name in self.enabled_extras)
 		return (*self.dynamic_versions, *GAME_VERSIONS, *extras)
 
+	HERO_SUBTITLE_WIDTH = 444   # a little under the label's wraplength (450)
+	HERO_SUBTITLE_LINES = 3     # every description is laid out on this many lines
+
+	def wrap_subtitle(self, text, width):
+		return self.fit_text(text, self.ui_font(10), width, 99).split("\n")
+
+	def balanced_subtitle(self, text):
+		"""Wrap the description into explicit lines, narrowing the wrap width for shorter
+		texts until they use exactly HERO_SUBTITLE_LINES lines."""
+		target = self.HERO_SUBTITLE_LINES
+		for width in range(self.HERO_SUBTITLE_WIDTH, 150, -2):
+			lines = self.wrap_subtitle(text, width)
+			if len(lines) >= target:
+				return "\n".join(lines)
+		return "\n".join(self.wrap_subtitle(text, self.HERO_SUBTITLE_WIDTH))
+
 	def copy_for_version(self, version):
 		if version in GAME_COPY:
 			return GAME_COPY[version]
 		return {
 			"title": f"ENTER {version.upper()}",
-			"subtitle": f"Explore {version}, an installed World of Warcraft client detected "
-				f"on this computer. Choose it to launch that version directly and continue "
-			f"your own adventure through Azeroth.",
+			"subtitle": f"Explore {version}, an installed World of Warcraft client. Choose it "
+				f"to launch that version directly and continue your adventure through Azeroth.",
 			"headline": f"{version.upper()} AWAITS",
 			"tagline": "A NEW ADVENTURE BEGINS",
 			"play": "Play",
@@ -1731,12 +1751,13 @@ class LauncherUI:
 			return
 		self.game_copy = self.copy_for_version(self.version.get())
 		self.play.set_label(self.game_copy["play"])
+		subtitle = self.balanced_subtitle(self.game_copy["subtitle"])
 		if animate:
-			self.fade_hero_text(self.game_copy["title"], self.game_copy["subtitle"])
+			self.fade_hero_text(self.game_copy["title"], subtitle)
 			self.transition_art_text()
 			return
 		self.hero_title.config(text=self.game_copy["title"])
-		self.hero_subtitle.config(text=self.game_copy["subtitle"])
+		self.hero_subtitle.config(text=subtitle)
 		self.art_text, self.art_text_fade = self.slide_text(), 1.0
 		if self.current_art_frame is not None:
 			self.draw_art_text()
@@ -1960,14 +1981,14 @@ class LauncherUI:
 
 	def plan_news_layout(self, articles, available):
 		"""Pick how many articles and description lines fill the area best."""
-		minimum = min(3, len(articles))
+		minimum = min(NEWS_CARD_COUNT, len(articles))
 		if available <= 1:
 			return minimum, 1
 		summary_font = self.ui_font(8)
 		natural = [self.fit_text(self.news_summary(article), summary_font,
 								 NEWS_TEXT_WIDTH, 10).count("\n") + 1 for article in articles]
 		best, best_score = (minimum, 0), None
-		for count in range(minimum, len(articles) + 1):
+		for count in range(minimum, min(len(articles), NEWS_CARD_COUNT) + 1):
 			for lines in (0, 1, 2):
 				total = sum(self.news_card_height(min(lines, natural[index]))
 							for index in range(count))
@@ -2104,6 +2125,11 @@ class LauncherUI:
 			self.news_status_label.config(text="PARTIAL FEED", fg=self.theme["warning"])
 		if animate:
 			self.animate_news_cards(self.news_cards)
+		else:
+			# Cards are built in the panel colour (invisible); without the fade they must be
+			# set to their final colours here, or a relayout leaves them blank/half-faded.
+			for record in self.news_cards:
+				self.set_news_card_progress(record, 1)
 
 	def find_running_game(self, selected):
 		executable_versions = {}
@@ -2355,7 +2381,7 @@ class LauncherUI:
 			self._font_cache[key] = tkfont.Font(
 				root=self.root,
 				family=self._font_family,
-				size=size,
+				size=-round(size * MAC_FONT_SCALE) if IS_MAC else size,
 				weight="bold" if bold else "normal",
 				slant="italic" if italic else "roman")
 		return self._font_cache[key]
@@ -2406,18 +2432,7 @@ class LauncherUI:
 				surface.schedule()
 
 	def register_friz_fonts(self):
-		if os.name != "nt":
-			return
-		try:
-			import ctypes
-			gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-			add_font = gdi32.AddFontResourceExW
-			add_font.argtypes = (ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p)
-			add_font.restype = ctypes.c_int
-		except (AttributeError, OSError):
-			return
-
-		font_files = set(resource_path("fonts").glob("*friz*.ttf"))
+		font_files = set(self.find_friz_files(resource_path("fonts")))
 		for version, install_path in self.game_paths.items():
 			if not install_path:
 				continue
@@ -2425,17 +2440,87 @@ class LauncherUI:
 			for subdirectory in INSTALL_SUBDIRECTORIES.get(version, ("",)):
 				game_dir = base / subdirectory if subdirectory else base
 				for relative_font_dir in ("Fonts", "Interface/Fonts", "Data/Fonts"):
-					font_dir = game_dir / relative_font_dir
-					try:
-						font_files.update(font_file for font_file in font_dir.iterdir()
-										  if "friz" in font_file.name.casefold()
-									  and font_file.suffix.casefold() == ".ttf")
-					except OSError:
-						continue
-		for font_file in font_files:
+					font_files.update(self.find_friz_files(game_dir / relative_font_dir))
+
+		if os.name == "nt":
+			register = self.register_font_windows()
+		elif sys.platform == "darwin":
+			register = self.register_font_macos
+		else:
+			register = self.register_font_linux()
+		if register is None:
+			return
+		for font_file in sorted(font_files, key=str):
 			if str(font_file) not in self._registered_font_paths:
-				if add_font(str(font_file), 0x10, None):
-					self._registered_font_paths.add(str(font_file))
+				try:
+					if register(str(font_file)):
+						self._registered_font_paths.add(str(font_file))
+				except Exception:
+					continue
+
+	@staticmethod
+	def find_friz_files(folder):
+		"""Friz font files in a folder, matched case-insensitively (FRIZQT__.TTF etc.)."""
+		try:
+			return [item for item in Path(folder).iterdir()
+					if "friz" in item.name.casefold()
+					and item.suffix.casefold() in (".ttf", ".otf")]
+		except OSError:
+			return []
+
+	@staticmethod
+	def register_font_windows():
+		try:
+			import ctypes
+			gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+			add_font = gdi32.AddFontResourceExW
+			add_font.argtypes = (ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p)
+			add_font.restype = ctypes.c_int
+		except (AttributeError, OSError):
+			return None
+		return lambda path: bool(add_font(path, 0x10, None))   # FR_PRIVATE
+
+	@staticmethod
+	def register_font_macos(path):
+		"""Make a font usable by this process only (CoreText process scope)."""
+		import ctypes
+		core_foundation = ctypes.cdll.LoadLibrary(
+			"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+		core_text = ctypes.cdll.LoadLibrary(
+			"/System/Library/Frameworks/CoreText.framework/CoreText")
+		core_foundation.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+		core_foundation.CFURLCreateFromFileSystemRepresentation.argtypes = (
+			ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool)
+		core_foundation.CFRelease.argtypes = (ctypes.c_void_p,)
+		core_text.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+		core_text.CTFontManagerRegisterFontsForURL.argtypes = (
+			ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)
+		raw = os.fsencode(path)
+		url = core_foundation.CFURLCreateFromFileSystemRepresentation(
+			None, raw, len(raw), False)
+		if not url:
+			return False
+		try:
+			# kCTFontManagerScopeProcess = 1. Returns False if already registered; harmless.
+			core_text.CTFontManagerRegisterFontsForURL(url, 1, None)
+		finally:
+			core_foundation.CFRelease(url)
+		return True
+
+	@staticmethod
+	def register_font_linux():
+		try:
+			import ctypes
+			import ctypes.util
+			library = ctypes.util.find_library("fontconfig")
+			if not library:
+				return None
+			fontconfig = ctypes.cdll.LoadLibrary(library)
+			fontconfig.FcConfigAppFontAddFile.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
+			fontconfig.FcConfigAppFontAddFile.restype = ctypes.c_int
+		except OSError:
+			return None
+		return lambda path: bool(fontconfig.FcConfigAppFontAddFile(None, os.fsencode(path)))
 
 	def refresh_friz_font(self):
 		try:
@@ -2443,7 +2528,8 @@ class LauncherUI:
 		except tk.TclError:
 			families = ()
 		self._font_family = next(
-			(name for name in families if "friz quadrata" in name.casefold()),
+			(name for name in families
+			 if "friz quadrata" in name.casefold() or "frizqt" in name.casefold()),
 			"Friz Quadrata")
 		for font in self._font_cache.values():
 			font.configure(family=self._font_family)
