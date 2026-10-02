@@ -1,3 +1,4 @@
+# Armory UI update: profession icons, primary/secondary groups, and searchable guild roster.
 """Keyless character lookups through the launcher's Cloudflare Worker.
 
 Blizzard credentials belong only in Worker secrets. Retail can fall back to
@@ -158,6 +159,70 @@ def _value(value):
 	return value
 
 
+def _profession_groups(data):
+	"""Keep primary and secondary skills separate, including flat Classic ranks."""
+	groups = {"primaries": [], "secondaries": []}
+	professions = data.get("professions") or {}
+	if not isinstance(professions, dict):
+		return groups
+	for group in groups:
+		for profession in professions.get(group, []) or []:
+			if not isinstance(profession, dict):
+				continue
+			name = _name(profession.get("profession")) or profession.get("name") or "Profession"
+			tiers = []
+			for tier in profession.get("tiers") or [profession]:
+				if not isinstance(tier, dict):
+					continue
+				rank = tier.get("skill_points", tier.get("rank"))
+				maximum = tier.get("max_skill_points", tier.get("max_rank"))
+				value = (f"{rank} / {maximum}" if rank is not None and maximum is not None
+					else str(rank) if rank is not None else "Rank unavailable")
+				tiers.append({"name": _name(tier.get("tier")), "value": value})
+			groups[group].append({"name": name, "tiers": tiers})
+	return groups
+
+
+# Guild roster references may include only the playable class ID.
+_GUILD_CLASS_NAMES = {
+	1: "Warrior", 2: "Paladin", 3: "Hunter", 4: "Rogue", 5: "Priest",
+	6: "Death Knight", 7: "Shaman", 8: "Mage", 9: "Warlock",
+	10: "Monk", 11: "Druid", 12: "Demon Hunter", 13: "Evoker",
+}
+
+
+def _guild_class_name(value):
+	if isinstance(value, str):
+		return value
+	name = _name(value)
+	if name:
+		return name
+	class_id = value.get("id") if isinstance(value, dict) else value
+	try:
+		return _GUILD_CLASS_NAMES.get(int(class_id), "")
+	except (TypeError, ValueError):
+		return ""
+
+
+def _guild_members(data, fallback_realm=""):
+	"""Retain numeric sorting fields and each roster member's own realm."""
+	members = []
+	for entry in (data.get("guild_roster") or {}).get("members", []) or []:
+		if not isinstance(entry, dict) or not isinstance(entry.get("character"), dict):
+			continue
+		character = entry["character"]
+		if not character.get("name"):
+			continue
+		realm = character.get("realm") or {}
+		members.append({"name": character["name"],
+			"realm": realm.get("name") or realm.get("slug") or fallback_realm,
+			"level": character.get("level") if isinstance(character.get("level"), int) else None,
+			"rank": entry.get("rank") if isinstance(entry.get("rank"), int) else None,
+			"class": _guild_class_name(character.get("playable_class")),
+			"race": _name(character.get("playable_race"))})
+	return members
+
+
 def _character_details(data):
 	"""Normalize optional Worker details; tolerate missing Classic endpoints."""
 	details = {key: [] for key in ("equipment", "stats", "professions", "progress", "guild", "achievements")}
@@ -206,18 +271,11 @@ def _character_details(data):
 	# Versatility uses scalar damage bonuses in some profile API responses.
 	if stats.get("versatility_damage_done_bonus") is not None:
 		details["stats"].append(("Versatility damage bonus", f"{stats['versatility_damage_done_bonus']}%"))
-	professions = data.get("professions") or {}
-	for group in ("primaries", "secondaries"):
-		for profession in professions.get(group, []):
-			if not isinstance(profession, dict):
-				continue
-			name = _name(profession.get("profession")) or "Profession"
-			tiers = profession.get("tiers") or [profession]
-			for tier in tiers:
-				label = _name(tier.get("tier"))
-				rank, maximum = tier.get("skill_points"), tier.get("max_skill_points")
-				progress = f"{rank} / {maximum}" if rank is not None and maximum is not None else "Rank unavailable"
-				details["professions"].append((name, f"{label} • {progress}" if label else progress))
+	for professions in _profession_groups(data).values():
+		for profession in professions:
+			for tier in profession["tiers"]:
+				value = f"{tier['name']} • {tier['value']}" if tier["name"] else tier["value"]
+				details["professions"].append((profession["name"], value))
 	raids = data.get("raids") or {}
 	for expansion in raids.get("expansions", []):
 		for instance in expansion.get("instances", []):
@@ -261,7 +319,7 @@ def _character_details(data):
 				if character.get("level") is not None:
 					parts.append(f"Level {character['level']}")
 				parts.extend(value for value in (_name(character.get("playable_race")),
-					_name(character.get("playable_class"))) if value)
+					_guild_class_name(character.get("playable_class"))) if value)
 				if member.get("rank") is not None:
 					parts.append("Guild leader" if member["rank"] == 0 else f"Rank {member['rank']}")
 				details["guild"].append((character.get("name") or "Guild member", " • ".join(parts) or "Details unavailable"))
@@ -317,6 +375,8 @@ def _proxy_lookup(region, realm, name, version):
 		raise ArmoryError("The armory service sent a response that could not be read.")
 	result = _blizzard_result(profile, data.get("media"), region, realm, name, version)
 	result["details"], result["detail_messages"] = _character_details(data)
+	result["guild_members"] = _guild_members(data, result["realm"])
+	result["profession_groups"] = _profession_groups(data)
 	result["section_support"] = supported_character_sections(version)
 	for title, endpoint in (("Achievements", "achievements"), ("Professions", "professions")):
 		if isinstance(data.get(endpoint), dict):
@@ -431,10 +491,119 @@ def lookup_achievement_category(region, version, category_id):
 	return data
 
 
+# Blizzard-hosted UI textures. Stable local IDs keep icon caching separate from game IDs.
+UI_ICON_REFS = {'professions': {'alchemy': 1,
+                 'blacksmithing': 2,
+                 'enchanting': 3,
+                 'engineering': 4,
+                 'herbalism': 5,
+                 'inscription': 6,
+                 'jewelcrafting': 7,
+                 'leatherworking': 8,
+                 'mining': 9,
+                 'skinning': 10,
+                 'tailoring': 11,
+                 'cooking': 12,
+                 'fishing': 13,
+                 'first aid': 14,
+                 'archaeology': 15},
+ 'stats': {'health': 16,
+           'resource': 17,
+           'strength': 18,
+           'agility': 19,
+           'intellect': 20,
+           'stamina': 21,
+           'spirit': 22,
+           'armor': 23,
+           'attack power': 24,
+           'spell power': 25,
+           'speed': 26,
+           'melee critical strike': 27,
+           'spell critical strike': 28,
+           'ranged critical strike': 29,
+           'melee haste': 30,
+           'spell haste': 31,
+           'mastery': 32,
+           'versatility': 33,
+           'versatility damage bonus': 34,
+           'dodge': 35,
+           'parry': 36,
+           'block': 37,
+           'leech': 38},
+ 'guild': {'guild': 39}}
+_UI_ICON_TEXTURES = {1: 'trade_alchemy',
+ 2: 'trade_blacksmithing',
+ 3: 'trade_engraving',
+ 4: 'trade_engineering',
+ 5: 'trade_herbalism',
+ 6: 'inv_inscription_tradeskill01',
+ 7: 'inv_misc_gem_01',
+ 8: 'trade_leatherworking',
+ 9: 'trade_mining',
+ 10: 'inv_misc_pelt_wolf_01',
+ 11: 'trade_tailoring',
+ 12: 'inv_misc_food_15',
+ 13: 'trade_fishing',
+ 14: 'spell_holy_sealofsacrifice',
+ 15: 'trade_archaeology',
+ 16: 'inv_potion_54',
+ 17: 'inv_potion_76',
+ 18: 'ability_warrior_innerrage',
+ 19: 'ability_rogue_quickrecovery',
+ 20: 'spell_holy_magicalsentry',
+ 21: 'spell_holy_wordfortitude',
+ 22: 'spell_holy_spiritualguidence',
+ 23: 'inv_chest_plate04',
+ 24: 'inv_sword_27',
+ 25: 'spell_fire_firebolt02',
+ 26: 'ability_rogue_sprint',
+ 27: 'ability_warrior_savageblow',
+ 28: 'spell_fire_flameshock',
+ 29: 'ability_hunter_criticalshot',
+ 30: 'ability_warrior_flurry',
+ 31: 'spell_nature_bloodlust',
+ 32: 'spell_holy_weaponmastery',
+ 33: 'ability_warrior_defensivestance',
+ 34: 'ability_warrior_defensivestance',
+ 35: 'spell_nature_invisibilty',
+ 36: 'ability_parry',
+ 37: 'ability_defend',
+ 38: 'spell_shadow_lifedrain02',
+ 39: 'inv_shield_06'}
+
+
+def _achievement_category_icon_id(region, version, category_id, seen=None, depth=0):
+	"""Use an achievement in the category as its representative Blizzard icon."""
+	seen = set() if seen is None else seen
+	if depth > 4 or len(seen) >= 12 or category_id in seen:
+		return None
+	seen.add(category_id)
+	data = lookup_achievement_category(region, version, category_id)
+	if data.get("error"):
+		return None
+	category = data.get("category") if isinstance(data.get("category"), dict) else data
+	for item in category.get("achievements", []) or []:
+		if isinstance(item, dict):
+			identifier = item.get("id") or (item.get("achievement") or {}).get("id")
+			if isinstance(identifier, int) and identifier > 0:
+				return identifier
+	# Container categories borrow an icon from their first populated subcategory.
+	for child in (category.get("subcategories", category.get("sub_categories", [])) or [])[:4]:
+		if not isinstance(child, dict) or not isinstance(child.get("id"), int):
+			continue
+		try:
+			identifier = _achievement_category_icon_id(region, version, child["id"], seen, depth + 1)
+		except ArmoryError:
+			continue
+		if identifier:
+			return identifier
+	return None
+
+
 def fetch_media_icon(region, version, kind, identifier, cache_dir=None):
 	"""Fetch the official icon; cache successful downloads on disk for seven days."""
 	if region not in REGIONS or version not in ARMORY_VERSIONS or kind not in (
-		"item", "achievement", "playable-class", "playable-specialization"):
+		"item", "achievement", "achievement-category", "ui-icon", "playable-class", "playable-specialization"):
 		return None
 	if not isinstance(identifier, int) or identifier <= 0:
 		return None
@@ -451,11 +620,23 @@ def fetch_media_icon(region, version, kind, identifier, cache_dir=None):
 		except OSError:
 			pass
 	try:
-		query = urlencode({"region": region, "version": version, "kind": kind, "id": identifier})
-		media = _get_json(f"{PROXY_URL.rstrip('/')}/media?{query}")
-		assets = media.get("assets", []) if isinstance(media, dict) else []
-		url = next((item.get("value") for item in assets
-			if isinstance(item, dict) and item.get("key") == "icon"), None)
+		media_kind, media_id = kind, identifier
+		if kind == "achievement-category":
+			media_id = _achievement_category_icon_id(region, version, identifier)
+			if media_id is None:
+				return None
+			media_kind = "achievement"
+		if kind == "ui-icon":
+			texture = _UI_ICON_TEXTURES.get(identifier)
+			if texture is None:
+				return None
+			url = f"https://render.worldofwarcraft.com/icons/56/{texture}.jpg"
+		else:
+			query = urlencode({"region": region, "version": version, "kind": media_kind, "id": media_id})
+			media = _get_json(f"{PROXY_URL.rstrip('/')}/media?{query}")
+			assets = media.get("assets", []) if isinstance(media, dict) else []
+			url = next((item.get("value") for item in assets
+				if isinstance(item, dict) and item.get("key") == "icon"), None)
 		data = fetch_avatar(url)
 		if data and cache_path is not None:
 			try:

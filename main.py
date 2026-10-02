@@ -1,3 +1,4 @@
+# Armory UI update: profession icons, primary/secondary groups, and searchable guild roster.
 """A classic-styled launcher for configured World of Warcraft installations."""
 from collections import deque
 import io
@@ -11,15 +12,17 @@ import plistlib
 import queue
 import re
 import shlex
+import ssl
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 import webbrowser
 
@@ -27,7 +30,7 @@ import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from addon_manager import AddonManager, Overlay
-from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug, lookup_achievement_category, supported_character_sections, fetch_media_icon
+from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug, lookup_achievement_category, supported_character_sections, fetch_media_icon, UI_ICON_REFS
 from update_manager import UpdateController
 
 
@@ -288,6 +291,9 @@ SLIDESHOW_PREFIXES = {
 	"WoW Forever Beta": "forever",
 }
 WOW_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/news"
+CRUSADER_STORM_ARMORY_URL = "https://www.crusader-storm.com/armory/index.php"
+CRUSADER_STORM_DISCORD_URL = "https://discord.com/invite/tsqzZtyrNk"
+CRUSADER_STORM_NEWS_URL = "https://crusader-storm.com/index.php?n=server&sub=patchnotes"
 WOW_CLASSIC_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/classic"
 NEWS_TEXT_WIDTH = 395
 NEWS_CARD_COUNT = 3   # news cards shown, on every platform (font metrics differ per OS)
@@ -323,10 +329,57 @@ def resource_path(*parts):
 
 
 def app_dir():
-	"""Folder next to the .exe (or the script) for files that must persist, like settings."""
+	"""Legacy launcher folder, used to find settings from older releases."""
 	if getattr(sys, "frozen", False):
 		return Path(sys.executable).resolve().parent
 	return Path(__file__).resolve().parent
+
+
+def settings_dir():
+	"""Per-user settings, independent of the launcher installation or bundle."""
+	if sys.platform == "win32":
+		base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+		return base / "WoWLauncher"
+	if sys.platform == "darwin":
+		return Path.home() / "Library" / "Application Support" / "WoWLauncher"
+	configured = os.environ.get("XDG_CONFIG_HOME", "")
+	base = Path(configured) if configured and Path(configured).is_absolute() else Path.home() / ".config"
+	return base / "WoWLauncher"
+
+
+def write_settings_json(path, data):
+	"""Replace settings atomically so an interrupted save keeps the previous file."""
+	path.parent.mkdir(parents=True, exist_ok=True)
+	temporary = None
+	try:
+		with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+			prefix=".launcher_settings-", suffix=".tmp", delete=False) as output:
+			temporary = Path(output.name)
+			json.dump(data, output, indent=2)
+			output.flush()
+			os.fsync(output.fileno())
+		os.replace(temporary, path)
+	finally:
+		if temporary is not None:
+			temporary.unlink(missing_ok=True)
+
+
+def read_settings_json(path):
+	"""Prefer the user settings; migrate a valid legacy file only on first use."""
+	if path.exists():
+		data = json.loads(path.read_text(encoding="utf-8"))
+	else:
+		legacy = app_dir() / "launcher_settings.json"
+		data = json.loads(legacy.read_text(encoding="utf-8"))
+		if not isinstance(data, dict):
+			raise ValueError("Launcher settings must contain a JSON object")
+		try:
+			write_settings_json(path, data)
+		except OSError:
+			pass  # Use the legacy data this session; normal saves report any write error.
+	if not isinstance(data, dict):
+		raise ValueError("Launcher settings must contain a JSON object")
+	return data
 
 
 def in_official_install(path):
@@ -635,6 +688,103 @@ def split_launch_args(text):
 		parts = text.split()
 	return [part[1:-1] if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'" else part
 			for part in parts]
+
+
+
+class NewsArticleParser(HTMLParser):
+	"""Extract readable blocks without relying on a site's CSS or JavaScript."""
+	SKIP = {"script", "style", "nav", "footer", "aside", "noscript", "svg", "button", "form"}
+	BLOCKS = {"p", "h1", "h2", "h3", "h4", "li", "blockquote", "pre", "td", "th"}
+	VOID = {"img", "br", "hr", "meta", "link", "input", "source", "wbr", "area", "base", "embed", "param", "track", "col"}
+
+	def __init__(self, url):
+		super().__init__(convert_charrefs=True)
+		self.url = url
+		self.stack = []
+		self.blocks = []
+		self.current = None
+		self.title_parts = []
+
+	def handle_starttag(self, tag, attrs):
+		attributes = dict(attrs)
+		classes = (attributes.get("class", "") + " " + attributes.get("id", "")).casefold()
+		priority = 3 if any(name in classes for name in
+			("articledetail-body", "article-detail-body", "article-body", "article-content", "news-content", "newsarticle-content")) else (2 if tag == "article" else (1 if tag == "main" else 0))
+		skipped = tag in self.SKIP or any(item[2] for item in self.stack)
+		if tag not in self.VOID:
+			self.stack.append((tag, priority, skipped))
+		if skipped:
+			return
+		if tag in self.BLOCKS:
+			self.finish_block()
+			self.current = {"kind": tag, "parts": [], "links": [],
+				"priority": max((item[1] for item in self.stack), default=0)}
+		elif tag == "br" and self.current is not None:
+			self.current["parts"].append("\n")
+		elif tag == "a" and self.current is not None:
+			target = urljoin(self.url, attributes.get("href", ""))
+			if urlparse(target).scheme in ("http", "https"):
+				self.current["links"].append(target)
+
+	def handle_endtag(self, tag):
+		if tag in self.BLOCKS and self.current is not None and self.current["kind"] == tag:
+			self.finish_block()
+		for index in range(len(self.stack) - 1, -1, -1):
+			if self.stack[index][0] == tag:
+				del self.stack[index:]
+				break
+
+	def handle_data(self, data):
+		if any(item[2] for item in self.stack):
+			return
+		if any(item[0] == "title" for item in self.stack):
+			self.title_parts.append(data)
+		if self.current is not None:
+			self.current["parts"].append(data)
+
+	def finish_block(self):
+		if self.current is None:
+			return
+		block = self.current
+		block["text"] = " ".join("".join(block.pop("parts")).split())
+		if block["text"]:
+			self.blocks.append(block)
+		self.current = None
+
+	def result(self):
+		self.finish_block()
+		for priority in (3, 2, 1, 0):
+			blocks = [block for block in self.blocks if block["priority"] >= priority]
+			if sum(len(block["text"]) for block in blocks) >= 120:
+				return " ".join("".join(self.title_parts).split()), blocks
+		raise ValueError("This page did not provide readable article text. It may require JavaScript or block embedded access.")
+
+
+def news_ssl_context():
+	"""Verify HTTPS with native OS certificate trust when truststore is installed."""
+	try:
+		import truststore
+	except ImportError:
+		return ssl.create_default_context()
+	return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def fetch_news_article(url):
+	request = Request(url, headers=NEWS_HEADERS)
+	with urlopen(request, timeout=15, context=news_ssl_context()) as response:
+		content_type = response.headers.get("Content-Type", "").casefold()
+		if content_type and not any(kind in content_type for kind in ("text/html", "application/xhtml")):
+			raise ValueError("This link is not an HTML article")
+		raw = response.read(4_000_001)
+		if len(raw) > 4_000_000:
+			raise ValueError("This page is too large for the news reader")
+		encoding = response.headers.get_content_charset() or "utf-8"
+		resolved_url = response.geturl()
+	parser = NewsArticleParser(resolved_url)
+	parser.feed(raw.decode(encoding, "replace"))
+	parser.close()
+	title, blocks = parser.result()
+	return resolved_url, title, blocks
 
 
 class OfficialNewsParser(HTMLParser):
@@ -1144,7 +1294,13 @@ class LauncherUI:
 		self._app_icons = []
 		self._win_icons = None
 		self.set_app_icon()
-		self.settings_path = app_dir() / "launcher_settings.json"
+		self.settings_path = settings_dir() / "launcher_settings.json"
+		try:
+			self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+		except OSError as error:
+			messagebox.showerror("Settings folder unavailable",
+				f"Could not create the launcher settings folder:\n{self.settings_path.parent}\n\n{error}",
+				parent=root)
 		self.news_queue = queue.Queue()
 		self.news_generation = 0
 		self.news_anim_generation = 0
@@ -1156,9 +1312,28 @@ class LauncherUI:
 		self.last_news = None
 		self.news_layout_height = 0
 		self.news_resize_id = None
+		self.news_hub = None
+		self.news_hub_queue = queue.Queue()
+		self.news_hub_generation = 0
 		self.selection_generation = 0
 		self.dynamic_versions = {}
 		self.game_paths = self.load_settings()
+		if not self.settings_path.exists():
+			try:
+				write_settings_json(self.settings_path, {
+					"game_paths": self.game_paths,
+					"playtime_seconds": self.playtime_seconds,
+					"playtime_history": self.playtime_history,
+					"playtime_history_started": self.playtime_history_started,
+					"setup_complete": self.setup_complete,
+					"launch_args": self.launch_args,
+					"armory": self.armory,
+					"extras_enabled": sorted(self.enabled_extras),
+					"client_exes": {name: sorted(paths) for name, paths in self.learned_clients.items()},
+				})
+			except OSError as error:
+				messagebox.showerror("Settings could not be saved",
+					f"Could not create launcher settings:\n{self.settings_path}\n\n{error}", parent=root)
 		self.discovered_versions = self.discover_game_versions()
 		self.game_versions = self.compute_game_versions()
 		self.game_copy = GAME_COPY[GAME_VERSIONS[0]]
@@ -1498,8 +1673,9 @@ class LauncherUI:
 		news.pack(fill="both", expand=True, pady=(8, 0))
 		news_header = tk.Frame(news, bg="#211c18")
 		news_header.pack(fill="x", pady=(0, 2))
-		tk.Label(news_header, text="\u25c6  LATEST NEWS", bg="#211c18", fg=GOLD,
-				 font=self.ui_font(8, bold=True)).pack(side="left")
+		self.news_title_label = tk.Label(news_header, text="\u25c6  LATEST NEWS", bg="#211c18", fg=GOLD,
+				 font=self.ui_font(8, bold=True))
+		self.news_title_label.pack(side="left")
 		self.news_status_label = tk.Label(news_header, text="CONNECTING…",
 									  bg="#211c18", fg=MUTED,
 									  font=self.ui_font(7))
@@ -1515,6 +1691,18 @@ class LauncherUI:
 			self.news_reload_button.bind(event,
 				lambda _event: self.news_reload_button.config(fg=self.theme["muted"]))
 		self.news_reload_button.pack(side="right", padx=(5, 0))
+		self.news_more_button = tk.Label(news_header, text="MORE",
+			font=self.ui_font(7, bold=True), bg="#211c18", fg=GOLD,
+			bd=0, highlightthickness=0, padx=5, pady=1, cursor="hand2", takefocus=True)
+		for event in ("<Button-1>", "<Return>", "<space>"):
+			self.news_more_button.bind(event, lambda _event: self.open_news_hub())
+		for event in ("<Enter>", "<FocusIn>"):
+			self.news_more_button.bind(event,
+				lambda _event: self.news_more_button.config(fg=self.theme["bright"]))
+		for event in ("<Leave>", "<FocusOut>"):
+			self.news_more_button.bind(event,
+				lambda _event: self.news_more_button.config(fg=self.theme["accent"]))
+		self.news_more_button.pack(side="right", padx=(5, 0))
 		self.news_status_label.pack(side="right")
 		self.news_items_frame = tk.Frame(news, bg="#211c18")
 		self.news_items_frame.pack(fill="both", expand=True)
@@ -1603,7 +1791,7 @@ class LauncherUI:
 		self.launch_args = {}   # game -> argument text passed to the client
 		self.armory = {}   # last lookup and saved character summaries; no API credentials
 		try:
-			data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+			data = read_settings_json(self.settings_path)
 			folders = data.get("game_paths", {})
 			saved_playtime = data.get("playtime_seconds", {})
 			if isinstance(saved_playtime, dict):
@@ -1672,7 +1860,7 @@ class LauncherUI:
 				# Settings from before first-time setup existed: done if any folder is set.
 				self.setup_complete = any(path for path in known_paths.values())
 			return known_paths
-		except (OSError, json.JSONDecodeError, AttributeError):
+		except (OSError, ValueError, AttributeError):
 			return {version: "" for version in ALL_VERSIONS}
 
 	def discover_game_versions(self):
@@ -1910,12 +2098,14 @@ class LauncherUI:
 			age = f"{seconds // 3600}H AGO"
 		else:
 			age = f"{seconds // 86400}D AGO"
-		prefix = "PARTIAL" if errors else ("OFFICIAL" if matched else "LATEST")
+		prefix = "PARTIAL" if errors else ("CRUSADER STORM" if version == "Crusader Storm" else ("OFFICIAL" if matched else "LATEST"))
 		self.news_status_label.config(text=f"{prefix} · UPDATED {age}",
 			fg=self.theme["warning"] if errors else
 			(self.theme["success"] if matched else self.theme["muted"]))
 
 	def news_sources_for(self, version):
+		if version == "Crusader Storm":
+			return []
 		sources = [WOW_NEWS_URL]
 		if version not in ("WoW Forever Beta", "Retail"):
 			sources.append(WOW_CLASSIC_NEWS_URL)
@@ -1933,14 +2123,13 @@ class LauncherUI:
 			return None
 		try:
 			request = Request(source_url, headers=NEWS_HEADERS)
-			with urlopen(request, timeout=8) as response:
+			with urlopen(request, timeout=8, context=news_ssl_context()) as response:
 				page = response.read(2_000_000).decode("utf-8", "replace")
-		except Exception:
+		except Exception as exc:
+			self.__dict__.setdefault("_news_source_errors", {})[source_url] = str(exc)
 			return [], True
 		found = []
 		for parser_class in (OfficialNewsParser, NewsLinkParser):
-			if len(found) >= 6:
-				break  # the slower fallback parser is only needed when the first finds little
 			parser = parser_class()
 			try:
 				parser.feed(page)
@@ -1952,9 +2141,11 @@ class LauncherUI:
 			self._news_page_cache[source_url] = (time.monotonic(), found)
 		return [dict(article) for article in found], not found
 
-	def build_news(self, version, allow_network=True, force=False):
+	def build_news(self, version, allow_network=True, force=False, limit=6):
 		"""(selected articles, error count, matched) or None if it needs the network."""
 		sources = self.news_sources_for(version)
+		if not sources:
+			return [], 0, False
 		if allow_network:
 			with ThreadPoolExecutor(max_workers=len(sources)) as pool:
 				results = list(pool.map(
@@ -1970,12 +2161,15 @@ class LauncherUI:
 			for article in found:
 				article["url"] = urljoin(source_url, article["url"])
 				id_match = NEWS_ID_PATTERN.search(article["url"])
-				key = id_match.group(1) if id_match else article["url"]
+				key = article.get("id") or (id_match.group(1) if id_match else article["url"])
 				existing = articles.get(key)
 				if existing is None:
 					articles[key] = article
 				elif not existing["summary"] and article["summary"]:
 					existing["summary"] = article["summary"]
+
+		if version == "Crusader Storm":
+			return list(articles.values())[:limit], feed_errors, bool(articles)
 
 		terms = GAME_NEWS_TERMS.get(version, (version.casefold(),))
 		ranked = []
@@ -1987,24 +2181,258 @@ class LauncherUI:
 					break
 		ranked.sort(key=lambda item: item[0])
 		matched = bool(ranked)
-		selected = [article for _rank, article in ranked][:6]
+		selected = [article for _rank, article in ranked][:limit]
 		for article in articles.values():
-			if len(selected) >= 6:
+			if len(selected) >= limit:
 				break
 			if article not in selected:
 				selected.append(article)
 		return selected, feed_errors, matched
 
+	def news_hub_versions(self):
+		"""Return every game represented by the launcher, without duplicates."""
+		return [version for version in dict.fromkeys((*GAME_VERSIONS, *EXTRA_VERSIONS, *self.game_versions))
+			if version != "Crusader Storm"]
+
+	def open_news_hub(self):
+		"""Open the all-games news home page with a game filter."""
+		existing = getattr(self, "news_hub", None)
+		if existing is not None and existing.winfo_exists():
+			existing.lift()
+			return
+
+		theme = dict(self.theme)
+		window = self.news_hub = Overlay(self.root, 980, 650)
+		body = window.make_body()
+		body.config(bg=theme["panel"])
+
+		header = tk.Frame(body, bg=theme["panel"])
+		header.pack(fill="x", pady=(0, 8))
+		tk_label = tk.Label(header, text="NEWS", bg=theme["panel"], fg=theme["accent"],
+			font=self.ui_font(15, bold=True))
+		tk_label.pack(side="left")
+
+		filter_frame = tk.Frame(header, bg=theme["panel"])
+		filter_frame.pack(side="right")
+		tk.Label(filter_frame, text="GAME", bg=theme["panel"], fg=theme["muted"],
+			font=self.ui_font(7, bold=True)).pack(side="left", padx=(0, 6))
+		filter_var = tk.StringVar(value="ALL GAMES")
+		versions = ["ALL GAMES", *self.news_hub_versions()]
+		filter_menu = tk.OptionMenu(filter_frame, filter_var, *versions)
+		filter_menu.config(bg=theme["control"], fg=theme["text"], activebackground=theme["control_active"],
+			activeforeground=theme["bright"], relief="raised", bd=1,
+			font=self.ui_font(8, bold=True), padx=8, pady=2)
+		filter_menu["menu"].config(bg=theme["control"], fg=theme["text"],
+			activebackground=theme["control_active"], activeforeground=theme["bright"])
+		filter_menu.pack(side="left")
+
+		status = tk.Label(body, text="Loading news…", bg=theme["panel"], fg=theme["muted"],
+			font=self.ui_font(8), anchor="w")
+		status.pack(fill="x", pady=(0, 7))
+
+		content = tk.Frame(body, bg=theme["surface"])
+		content.pack(fill="both", expand=True)
+		scroll = tk.Scrollbar(content, orient="vertical")
+		scroll.pack(side="right", fill="y")
+		canvas = tk.Canvas(content, bg=theme["surface"], highlightthickness=0,
+			bd=0, yscrollcommand=scroll.set)
+		canvas.pack(side="left", fill="both", expand=True)
+		scroll.config(command=canvas.yview)
+		list_frame = tk.Frame(canvas, bg=theme["surface"])
+		window_id = canvas.create_window((0, 0), window=list_frame, anchor="nw")
+
+		state = {"articles": [], "filter": "ALL GAMES", "closed": False}
+		state["status"] = status
+		window._news_hub_state = state
+
+		def close():
+			window.destroy()
+
+		def destroyed(event):
+			if event.widget is window:
+				state["closed"] = True
+				self.news_hub = None
+
+		window.bind("<Destroy>", destroyed, add="+")
+
+		def close_button(parent, caption, command):
+			button = StoneButton(parent, text=caption, command=command,
+				font=self.ui_font(8, bold=True), padx=7, pady=3, bg=theme["panel"],
+				theme_provider=lambda: self.theme, style="subtle", version_colored=True)
+			button.pack(side="right", padx=(6, 0))
+			return button
+
+		close_button(header, "CLOSE", close)
+		close_button(header, "RELOAD", lambda: self.load_news_hub(force=True))
+
+		def resize_canvas(_event=None):
+			try:
+				canvas.itemconfigure(window_id, width=canvas.winfo_width())
+				canvas.configure(scrollregion=canvas.bbox("all"))
+			except tk.TclError:
+				pass
+		list_frame.bind("<Configure>", resize_canvas)
+		canvas.bind("<Configure>", resize_canvas)
+
+		def render():
+			if state["closed"] or not window.winfo_exists():
+				return
+			self.clear_children(list_frame)
+			selected = state["filter"]
+			articles = state["articles"]
+			if selected != "ALL GAMES":
+				articles = [item for item in articles if item.get("game") == selected]
+			status.config(text=f"{len(articles)} article{'s' if len(articles) != 1 else ''} • {selected}")
+			failure = state.get("failures", {}).get(selected)
+			if failure and not articles:
+				status.config(text=f"News unavailable • {selected}")
+				tk.Label(list_frame, text="Could not load news: " + failure,
+					bg=theme["surface"], fg=theme["warning"], font=self.ui_font(9),
+					wraplength=780, justify="left").pack(anchor="w", padx=14, pady=16)
+				link = tk.Label(list_frame, text="Open source website", cursor="hand2",
+					bg=theme["surface"], fg=theme["accent"], font=self.ui_font(9))
+				link.pack(anchor="w", padx=14)
+				link.bind("<Button-1>", lambda _event: webbrowser.open(self.news_sources_for(selected)[0]))
+				resize_canvas()
+				return
+			if not articles:
+				tk.Label(list_frame, text="No news available for this game.", bg=theme["surface"],
+					fg=theme["muted"], font=self.ui_font(9, italic=True)).pack(anchor="w", padx=14, pady=16)
+				resize_canvas()
+				return
+			for article in articles:
+				card = tk.Frame(list_frame, bg=theme["panel"], highlightbackground=theme["control"],
+					highlightthickness=1, padx=10, pady=8, cursor="hand2")
+				card.pack(fill="x", padx=10, pady=4)
+				meta = tk.Label(card, text=article.get("game", "World of Warcraft").upper(),
+					bg=theme["panel"], fg=theme["accent"], font=self.ui_font(7, bold=True), anchor="w")
+				meta.pack(fill="x")
+				title = tk.Label(card, text=article["title"], bg=theme["panel"], fg=theme["bright"],
+					font=self.ui_font(10, bold=True), anchor="w", justify="left", wraplength=780)
+				title.pack(fill="x", pady=(2, 2))
+				summary = tk.Label(card, text=self.news_summary(article), bg=theme["panel"], fg=theme["muted"],
+					font=self.ui_font(8), anchor="w", justify="left", wraplength=780)
+				summary.pack(fill="x")
+				widgets = (card, meta, title, summary)
+				def hover(active, widgets=widgets, meta=meta):
+					bg = theme["control"] if active else theme["panel"]
+					for widget in widgets:
+						widget.configure(bg=bg)
+					meta.configure(fg=theme["bright"] if active else theme["accent"])
+				for widget in widgets:
+					widget.bind("<Button-1>", lambda _event, url=article["url"]: self.open_news_browser(url))
+					widget.bind("<Enter>", lambda _event, hover=hover: hover(True))
+					widget.bind("<Leave>", lambda _event, hover=hover: hover(False))
+			resize_canvas()
+
+		def filter_changed(*_args):
+			state["filter"] = filter_var.get()
+			render()
+
+		filter_var.trace_add("write", filter_changed)
+		window.bind("<Escape>", lambda _event: close())
+		state["render"] = render
+		window._news_hub_render = render
+		self.load_news_hub_window(window, state, status, render)
+
+	def load_news_hub_window(self, window, state, status, render):
+		self.news_hub_generation += 1
+		generation = self.news_hub_generation
+		status.config(text="Loading news for all games…", fg=self.theme["muted"])
+		threading.Thread(target=self.fetch_news_hub, args=(generation,), daemon=True).start()
+		self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
+
+	def load_news_hub(self, force=False):
+		window = getattr(self, "news_hub", None)
+		if window is None or not window.winfo_exists():
+			self.open_news_hub()
+			return
+		state = getattr(window, "_news_hub_state", None)
+		if state is None:
+			return
+		self.news_hub_generation += 1
+		generation = self.news_hub_generation
+		status = state["status"]
+		render = state["render"]
+		status.config(text="Refreshing all game news…", fg=self.theme["muted"])
+		threading.Thread(target=self.fetch_news_hub, args=(generation, force), daemon=True).start()
+		self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
+
+	def fetch_news_hub(self, generation, force=False):
+		all_articles = []
+		failures = {}
+		for version in self.news_hub_versions():
+			try:
+				selected, errors, matched = self.build_news(version, force=force, limit=100)
+				if errors:
+					failures[version] = self.__dict__.get("_news_source_errors", {}).get(
+						self.news_sources_for(version)[0], "The news source could not be reached or parsed.")
+				for article in selected:
+					item = dict(article)
+					item["game"] = version
+					all_articles.append(item)
+			except Exception as exc:
+				failures[version] = str(exc)
+		self.news_hub_queue.put((generation, all_articles, failures))
+
+	def poll_news_hub(self, window, state, status, render, generation):
+		if state.get("closed") or not window.winfo_exists():
+			return
+		try:
+			result_generation, articles, failures = self.news_hub_queue.get_nowait()
+		except queue.Empty:
+			self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
+			return
+		if result_generation != generation:
+			self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
+			return
+		state["articles"] = articles
+		state["failures"] = failures
+		status.config(text=f"{len(articles)} articles • ALL GAMES", fg=self.theme["muted"])
+		render()
+
 	def load_game_news(self, force=False):
 		version = self.version.get()
 		self.news_generation += 1
 		generation = self.news_generation
+		if version == "Crusader Storm":
+			self.show_crusader_tools()
+			return
+		self.news_title_label.config(text="◆  LATEST NEWS")
+		self.news_reload_button.pack(side="right", padx=(5, 0), before=self.news_status_label)
+		self.news_more_button.pack(side="right", padx=(5, 0), before=self.news_status_label)
 		self.news_status_label.config(text="UPDATING…", fg=self.theme["muted"])
-		self.show_news_message(f"Loading {version} news from Blizzard…")
+		source = "Crusader Storm" if version == "Crusader Storm" else "Blizzard"
+		self.show_news_message(f"Loading {version} news from {source}…")
 		thread = threading.Thread(
 			target=self.fetch_game_news,
 			args=(version, generation, force), daemon=True)
 		thread.start()
+
+
+	def show_crusader_tools(self):
+		"""Useful shortcuts for a private-server client, with no news requests."""
+		self.last_news = None
+		self.news_anim_generation += 1
+		if self.news_resize_id is not None:
+			self.root.after_cancel(self.news_resize_id)
+			self.news_resize_id = None
+		self.clear_children(self.news_items_frame)
+		self.news_title_label.config(text="◆  SERVER TOOLS")
+		self.news_reload_button.pack_forget()
+		self.news_more_button.pack_forget()
+		self.news_status_label.config(text="CRUSADER STORM", fg=self.theme["muted"])
+		links = [
+			{"title": "Server Website", "summary": "Account, downloads, and server information.",
+				"url": "https://crusader-storm.com/"},
+			{"title": "Patch Notes", "summary": "Read the latest server changes.",
+				"url": CRUSADER_STORM_NEWS_URL},
+			{"title": "Join the Discord", "summary": "Connect with the Crusader Storm community.",
+				"url": CRUSADER_STORM_DISCORD_URL},
+		]
+		self.news_cards = self.build_news_cards(links, 1, open_url=webbrowser.open)
+		self.animate_news_cards(self.news_cards)
+
 
 	def fetch_game_news(self, version, generation, force=False):
 		selected, errors, matched = [], 1, False
@@ -2079,6 +2507,186 @@ class LauncherUI:
 
 	NEWS_FALLBACK_SUMMARY = "Read the full story on the official World of Warcraft site."
 
+	def open_news_browser(self, url):
+		"""Read article text in a native panel, independent of website rendering."""
+		# When an article is opened from the all-games news home, close the
+		# home panel so the article reader becomes the active news view.
+		hub = getattr(self, "news_hub", None)
+		if hub is not None and hub.winfo_exists():
+			try:
+				hub.destroy()
+			except tk.TclError:
+				pass
+
+		existing = getattr(self, "news_browser", None)
+		if existing is not None and existing.winfo_exists():
+			existing.navigate(url)
+			existing.lift()
+			return
+		theme = dict(self.theme)
+		panel = theme["panel"]
+		window = self.news_browser = Overlay(self.root, 1040, 660)
+		body = window.make_body()
+		body.config(bg=panel)
+		header = tk.Frame(body, bg=panel)
+		header.pack(fill="x", pady=(0, 8))
+		tk.Label(header, text="NEWS BROWSER", bg=panel, fg=theme["accent"],
+			font=self.ui_font(14, bold=True)).pack(side="left")
+		state = {"history": [], "index": -1, "url": url, "frame": None,
+			"generation": 0, "results": queue.Queue(), "poll": None, "closed": False}
+
+		def close():
+			window.destroy()
+
+		def destroyed(event):
+			if event.widget is window:
+				state["closed"] = True
+				if state["poll"] is not None:
+					self.root.after_cancel(state["poll"])
+					state["poll"] = None
+
+		window.bind("<Destroy>", destroyed, add="+")
+
+		def button(parent, caption, command, side="left"):
+			control = StoneButton(parent, text=caption, command=command,
+				font=self.ui_font(8, bold=True), padx=6, pady=3, bg=panel,
+				theme_provider=lambda: theme, style="subtle", version_colored=True)
+			control.pack(side=side, padx=(0, 5))
+			return control
+
+		button(header, "CLOSE", close, "right")
+		button(header, "OPEN IN BROWSER", lambda: webbrowser.open(state["url"]), "right")
+		toolbar = tk.Frame(body, bg=panel)
+		toolbar.pack(fill="x", pady=(0, 8))
+		back = button(toolbar, "‹ BACK", lambda: travel(-1))
+		forward = button(toolbar, "FORWARD ›", lambda: travel(1))
+		button(toolbar, "RELOAD", lambda: navigate(state["url"], record=False, force=True))
+
+		def go_home():
+			# Return to the all-games news home without leaving a duplicate
+			# article reader behind.
+			try:
+				window.destroy()
+			except tk.TclError:
+				pass
+			self.open_news_hub()
+
+		button(toolbar, "HOME", go_home)
+		address = tk.StringVar(value=url)
+		address_field = tk.Entry(toolbar, textvariable=address, state="readonly",
+			readonlybackground=theme["control"], fg=theme["text"], relief="flat", bd=0,
+			font=self.ui_font(8))
+		address_field.pack(side="left", fill="x", expand=True, ipady=7)
+		status = tk.Label(body, text="Loading article…", bg=panel, fg=theme["muted"],
+			font=self.ui_font(8), anchor="w", wraplength=950)
+		status.pack(side="bottom", fill="x", pady=(6, 0))
+		content = tk.Frame(body, bg=theme["surface"])
+		content.pack(fill="both", expand=True)
+
+		def update_controls():
+			back.disabled = state["index"] <= 0
+			forward.disabled = state["index"] >= len(state["history"]) - 1
+			back.redraw()
+			forward.redraw()
+
+		def navigate(target, record=True, force=False):
+			target = urljoin(state["url"], target)
+			if urlparse(target).scheme not in ("http", "https"):
+				status.config(text="This link needs an external application.", fg=theme["warning"])
+				return
+			if record and (state["index"] < 0 or target != state["history"][state["index"]]):
+				del state["history"][state["index"] + 1:]
+				state["history"].append(target)
+				state["index"] = len(state["history"]) - 1
+			state["url"] = target
+			address.set(target)
+			update_controls()
+			state["generation"] += 1
+			generation = state["generation"]
+			status.config(text="Loading article…", fg=theme["muted"])
+			show_text("Loading article…", [])
+			threading.Thread(target=download, args=(target, generation), daemon=True).start()
+
+		def travel(direction):
+			index = state["index"] + direction
+			if 0 <= index < len(state["history"]):
+				state["index"] = index
+				navigate(state["history"][index], record=False)
+
+		def download(target, generation):
+			try:
+				result = fetch_news_article(target)
+				state["results"].put((generation, result, None))
+			except Exception as error:
+				state["results"].put((generation, None, str(error)))
+
+		def show_text(title, blocks):
+			reader.config(state="normal")
+			reader.delete("1.0", "end")
+			for tag in reader.tag_names():
+				if tag.startswith("article_link_"):
+					reader.tag_delete(tag)
+			if not any(block["kind"] == "h1" for block in blocks):
+				reader.insert("end", title + "\n\n", "h1")
+			link_number = 0
+			for block in blocks:
+				kind = block["kind"]
+				text = ("• " if kind == "li" else "") + block["text"]
+				reader.insert("end", text + "\n\n", kind if kind in ("h1", "h2", "h3", "h4") else "paragraph")
+				for target in dict.fromkeys(block["links"]):
+					tag = f"article_link_{link_number}"
+					link_number += 1
+					reader.tag_configure(tag, foreground=theme["accent"], underline=True)
+					reader.tag_bind(tag, "<Button-1>", lambda _event, target=target: navigate(target))
+					reader.tag_bind(tag, "<Enter>", lambda _event: reader.config(cursor="hand2"))
+					reader.tag_bind(tag, "<Leave>", lambda _event: reader.config(cursor="xterm"))
+					reader.insert("end", target + "\n", tag)
+				if block["links"]:
+					reader.insert("end", "\n")
+			reader.config(state="disabled")
+			reader.yview_moveto(0)
+
+		def poll():
+			state["poll"] = None
+			if state["closed"] or not window.winfo_exists():
+				return
+			while True:
+				try:
+					generation, result, error = state["results"].get_nowait()
+				except queue.Empty:
+					break
+				if generation != state["generation"]:
+					continue
+				if error:
+					show_text("Could not load article", [{"kind": "p", "text": error,
+						"links": []}, {"kind": "p", "text": "Try RELOAD or OPEN IN BROWSER.", "links": []}])
+					status.config(text="Article unavailable in the reader.", fg=theme["warning"])
+				else:
+					resolved, title, blocks = result
+					state["url"] = resolved
+					address.set(resolved)
+					state["history"][state["index"]] = resolved
+					show_text(title or "World of Warcraft News", blocks)
+					status.config(text="Reader view • Article text and links. Original layout and media: OPEN IN BROWSER.",
+						fg=theme["muted"])
+			state["poll"] = self.root.after(100, poll)
+
+		reader = tk.Text(content, wrap="word", bg=theme["surface"], fg=theme["text"],
+			font=self.ui_font(11), padx=24, pady=20, bd=0, highlightthickness=0,
+			selectbackground=theme["control_active"], selectforeground=theme["bright"],
+			cursor="xterm", spacing1=3, spacing3=8)
+		scroll = ttk.Scrollbar(content, orient="vertical", command=reader.yview)
+		scroll.pack(side="right", fill="y")
+		reader.config(yscrollcommand=scroll.set)
+		reader.pack(fill="both", expand=True)
+		reader.tag_configure("h1", font=self.ui_font(18, bold=True), foreground=theme["accent"], spacing3=12)
+		for heading in ("h2", "h3", "h4"):
+			reader.tag_configure(heading, font=self.ui_font(13, bold=True), foreground=theme["bright"], spacing1=10)
+		window.navigate = navigate
+		window.bind("<Escape>", lambda _event: close())
+		navigate(url)
+		poll()
+
 	def news_summary(self, article):
 		return article["summary"] or self.NEWS_FALLBACK_SUMMARY
 
@@ -2121,7 +2729,8 @@ class LauncherUI:
 		if self.last_news is not None:
 			self.render_game_news(*self.last_news, animate=False)
 
-	def build_news_cards(self, articles, lines):
+	def build_news_cards(self, articles, lines, open_url=None):
+		open_url = open_url or self.open_news_browser
 		theme = self.theme
 		surface, hover_surface = theme["surface"], theme["control"]
 		base = theme["panel"]
@@ -2165,8 +2774,8 @@ class LauncherUI:
 				chevron.configure(fg=theme["accent"] if active else theme["muted"])
 
 			for widget in (card, accent_bar, *text_widgets):
-				widget.bind("<Button-1>", lambda _event, url=article["url"]:
-					webbrowser.open(url))
+				widget.bind("<Button-1>", lambda _event, url=article["url"], navigate=open_url:
+					navigate(url))
 				widget.bind("<Enter>", lambda _event, hover=set_hover: hover(True))
 				widget.bind("<Leave>", lambda _event, hover=set_hover: hover(False))
 
@@ -2215,9 +2824,13 @@ class LauncherUI:
 		self.clear_children(self.news_items_frame)
 		if not articles:
 			self.news_status_label.config(text="OFFLINE", fg=self.theme["warning"])
-			self.show_news_message("News could not be reached. Check your connection or open the official news site.")
-			self.news_items_frame.bind("<Button-1>",
-				lambda _event: webbrowser.open(WOW_NEWS_URL))
+			source_url = self.news_sources_for(version)[0]
+			detail = self.__dict__.get("_news_source_errors", {}).get(source_url, "Check your connection.")
+			self.show_news_message("News could not be loaded. " + detail)
+			link = tk.Label(self.news_items_frame, text="Open source website", cursor="hand2",
+				bg="#211c18", fg=self.theme["accent"], font=self.ui_font(8))
+			link.pack(anchor="w", pady=(4, 0))
+			link.bind("<Button-1>", lambda _event: webbrowser.open(source_url))
 			return
 
 		self.last_news = (version, articles, errors, matched)
@@ -2650,7 +3263,7 @@ class LauncherUI:
 
 	def persist_settings(self):
 		try:
-			self.settings_path.write_text(json.dumps({
+			write_settings_json(self.settings_path, {
 				"game_paths": self.game_paths,
 				"playtime_seconds": self.playtime_seconds,
 				"playtime_history": self.playtime_history,
@@ -2661,7 +3274,7 @@ class LauncherUI:
 				"extras_enabled": sorted(self.enabled_extras),
 				"client_exes": {name: sorted(paths)
 								for name, paths in self.learned_clients.items()},
-			}, indent=2), encoding="utf-8")
+			})
 		except OSError as error:
 			self.set_status(f"Could not save launcher settings: {error}")
 			return False
@@ -3126,7 +3739,7 @@ class LauncherUI:
 		self.background.delete("credit")
 		x, y = width * .954, height * .985
 		font = self.ui_font(8, bold=True)
-		text = "Created by Frank Rosello, version 1.0.1"
+		text = "Created by Frank Rosello, version 1.1"
 		for offset_x in range(4):
 			for offset_y in range(4):
 				if offset_x or offset_y:
@@ -4040,89 +4653,128 @@ class LauncherUI:
 				bg=panel, theme_provider=lambda: self.theme, style="subtle", version_colored=True, padx=8, pady=4).pack(side="right", padx=(6, 0))
 		load()
 
+
 	def open_armory(self):
-		"""Look up a character by name and realm and show its summary."""
+		"""Look up an official character, or open the private server's live armory."""
+		if self.version.get() == "Crusader Storm":
+			webbrowser.open(CRUSADER_STORM_ARMORY_URL)
+			return
+		# Unsupported versions (including Forever) browse Retail until supported.
+		selected_version = self.version.get()
+		version_var = tk.StringVar(master=self.root, value=selected_version if selected_version in ARMORY_VERSIONS else "Retail")
 		panel = self.theme["panel"]
-		window = Overlay(self.root, 860, 360)
+		window = Overlay(self.root, 860, 420)
 		body = window.make_body()
+		body.config(bg=panel)
 		search_page = tk.Frame(body, bg=self.theme["panel"])
 		search_page.pack(fill="both", expand=True)
 		character_page = tk.Frame(body, bg=self.theme["panel"])
 		saved = self.armory
 		state = {"busy": False, "url": "", "photo": None, "queue": queue.Queue(),
-				 "result": None, "generation": 0, "version": self.version.get(), "poll": None, "tab": "Overview", "categories": {}, "category_pending": set(), "icon_bytes": {}, "icon_pending": set(),
+				 "result": None, "generation": 0, "version": version_var.get(), "poll": None, "tab": "Overview", "categories": {}, "category_pending": set(), "icon_bytes": {}, "icon_pending": set(),
 				 "icon_watchers": {}, "icon_photos": {}}
 		characters = self.armory.setdefault("characters", [])
+
+		def apply_armory_theme():
+			self.apply_theme(version_var.get(), subtree=window)
+			# Overlay paints its border into an image, outside widget color options.
+			window.fill = self.theme["panel"]
+			window.edge = blend_hex(window.fill, self.theme["border"], .32)
+			window.build_backdrop()
+			widgets = [window]
+			for widget in widgets:
+				widgets.extend(widget.winfo_children())
+				if isinstance(widget, (tk.OptionMenu, tk.Entry)):
+					widget.configure(highlightthickness=1, highlightbackground=self.theme["border"],
+						highlightcolor=self.theme["accent"], bd=0, relief="flat")
+				if getattr(widget, "_armory_outline", False):
+					widget.configure(bg=self.theme["border"])
 
 		def stone(parent, text, command, size=8, padx=8, pady=4):
 			return StoneButton(parent, text=text, command=command,
 							   font=self.ui_font(size, bold=True), padx=padx, pady=pady,
-							   bg=panel, theme_provider=lambda: self.theme, style="subtle")
+							   bg=parent.cget("bg"), theme_provider=lambda: self.theme, style="subtle")
 
 		def field(parent, caption, value, width, show=""):
-			column = tk.Frame(parent, bg=panel)
-			tk.Label(column, text=caption, bg=panel, fg=self.theme["muted"], anchor="w",
-					 font=self.ui_font(7, bold=True)).pack(anchor="w")
+			column = tk.Frame(parent, bg=parent.cget("bg"))
+			tk.Label(column, text=caption, bg=parent.cget("bg"), fg=self.theme["muted"], anchor="w",
+					 font=self.ui_font(8, bold=True)).pack(anchor="w", pady=(0, 6))
 			variable = tk.StringVar(value=value)
 			entry = tk.Entry(column, textvariable=variable, width=width, show=show,
 							 bg=self.theme["control"], fg=self.theme["text"], insertbackground=self.theme["text"], relief="flat", bd=0,
-							 highlightthickness=0, highlightbackground=self.theme["border"],
+							 highlightthickness=1, highlightbackground=self.theme["control"],
 							 highlightcolor=self.theme["accent"], font=self.ui_font(9))
-			entry.pack(fill="x", ipady=4)
+			entry.pack(fill="x", ipady=5)
 			return column, variable, entry
 
 		top = tk.Frame(search_page, bg=panel)
 		top.pack(fill="x", pady=(0, 12))
 		tk.Label(top, text="CHARACTER ARMORY", bg=panel, fg=self.theme["accent"],
 				 font=self.ui_font(15, bold=True)).pack(side="left")
-		version_var = self.version
 		version_menu = tk.OptionMenu(top, version_var,
-			*dict.fromkeys((*GAME_VERSIONS, *self.game_versions)),
+			*(version for version in dict.fromkeys((*GAME_VERSIONS, *self.game_versions))
+			  if version in ARMORY_VERSIONS),
 			command=lambda _value: sync_version())
 		version_menu.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
 			relief="flat", bd=0, highlightthickness=0, font=self.ui_font(9), padx=10, pady=4)
 		version_menu.pack(side="right")
 
-		form = tk.Frame(search_page, bg=panel)
+		search_card = tk.Frame(search_page, bg=self.theme["surface"], padx=14, pady=12)
+		search_card.pack(fill="x", pady=(0, 12))
+		tk.Label(search_card, text="Find a character", bg=self.theme["surface"], fg=self.theme["text"],
+			font=self.ui_font(11, bold=True), anchor="w").pack(fill="x", pady=(0, 10))
+		form = tk.Frame(search_card, bg=self.theme["surface"])
 		form.pack(fill="x")
-		name_box, name_var, name_entry = field(form, "CHARACTER", saved.get("name", ""), 18)
-		realm_box, realm_var, realm_entry = field(form, "REALM", saved.get("realm", ""), 22)
-		region_box, region_var, region_entry = field(form, "REGION", saved.get("region", "us"), 5)
-		name_box.pack(side="left", padx=(0, 8))
-		realm_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
-		region_box.pack(side="left")
+		form.columnconfigure(0, weight=1, uniform="search_fields")
+		form.columnconfigure(1, weight=1, uniform="search_fields")
+		name_box, name_var, name_entry = field(form, "Character name", saved.get("name", ""), 18)
+		realm_box, realm_var, realm_entry = field(form, "Realm", saved.get("realm", ""), 22)
+		region_box = tk.Frame(form, bg=self.theme["surface"])
+		tk.Label(region_box, text="Region", bg=self.theme["surface"], fg=self.theme["muted"],
+			font=self.ui_font(8, bold=True), anchor="w").pack(anchor="w", pady=(0, 6))
+		region_var = tk.StringVar(value=saved.get("region", "us") if saved.get("region", "us") in REGIONS else "us")
+		region_entry = tk.OptionMenu(region_box, region_var, *REGIONS)
+		region_entry.config(bg=self.theme["control"], fg=self.theme["text"],
+			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
+			font=self.ui_font(9), relief="flat", bd=0, highlightthickness=0, padx=10, pady=5)
+		region_entry["menu"].config(bg=self.theme["control"], fg=self.theme["text"],
+			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"])
+		region_entry.pack(fill="x")
+		name_box.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+		realm_box.grid(row=0, column=1, sticky="ew", padx=(0, 12))
+		region_box.grid(row=0, column=2, sticky="ew")
 
-		action_row = tk.Frame(search_page, bg=panel)
+		action_row = tk.Frame(search_card, bg=self.theme["surface"])
 		action_row.pack(fill="x", pady=(10, 0))
-		lookup_status = tk.Label(action_row, text="", bg=panel, fg=self.theme["muted"], anchor="w",
-								 justify="left", wraplength=480, font=self.ui_font(8))
-		lookup_button = stone(action_row, "LOOK UP", lambda: start_lookup(), size=9, padx=12)
-		lookup_button.pack(side="left", padx=(0, 10))
+		lookup_status = tk.Label(action_row, text="", bg=self.theme["surface"], fg=self.theme["muted"],
+			anchor="w", justify="left", wraplength=500, font=self.ui_font(8))
+		lookup_button = stone(action_row, "VIEW CHARACTER", lambda: view_character(), size=9, padx=12, pady=2)
+		lookup_button.pack(side="right", padx=(12, 0))
 		lookup_status.pack(side="left", fill="x", expand=True)
 
-		# Bottom first so it is never pushed off the panel.
 		footer = tk.Frame(search_page, bg=panel)
-		footer.pack(fill="x", side="bottom", pady=(10, 0))
-		stone(footer, "CLOSE", window.destroy).pack(side="right")
-		stone(footer, "VIEW CHARACTER", lambda: view_character()).pack(side="left")
-		search_summary = tk.Label(search_page, text="Search for a character or choose a saved profile.",
-			bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(10), anchor="w")
-		search_summary.pack(fill="x", side="bottom", pady=(8, 4))
+		footer.pack(fill="x", side="bottom", pady=(6, 0))
+		stone(footer, "CLOSE", window.destroy, pady=2).pack(side="right")
+		search_summary = tk.Label(footer, text="", bg=panel, fg=self.theme["muted"],
+			font=self.ui_font(8), anchor="w")
+		search_summary.pack(side="left", fill="x", expand=True, padx=10)
 
-		# One compact row; the picker expands only when opened.
-		library_row = tk.Frame(search_page, bg=panel)
-		library_row.pack(fill="x", pady=(8, 8))
-		tk.Label(library_row, text="SAVED", bg=panel, fg=self.theme["muted"],
-				 font=self.ui_font(7, bold=True)).pack(side="left", padx=(0, 8))
+		saved_card = tk.Frame(search_page, bg=self.theme["surface"], padx=14, pady=12)
+		saved_card.pack(fill="x")
+		saved_heading = tk.Label(saved_card, text="Saved characters", bg=self.theme["surface"],
+			fg=self.theme["text"], font=self.ui_font(11, bold=True), anchor="w")
+		saved_heading.pack(fill="x", pady=(0, 8))
+		library_row = tk.Frame(saved_card, bg=self.theme["surface"])
+		library_row.pack(fill="x")
 		saved_var = tk.StringVar(value="No saved characters")
 		character_picker = tk.OptionMenu(library_row, saved_var, "No saved characters")
 		character_picker.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
-			relief="flat", bd=0, highlightthickness=0, anchor="w", font=self.ui_font(8))
-		character_picker.pack(side="left", fill="x", expand=True, padx=(0, 8))
-		stone(library_row, "SAVE", lambda: save_character(), pady=2).pack(side="left")
-		stone(library_row, "REMOVE", lambda: remove_character(), pady=2).pack(side="left", padx=(4, 0))
+			relief="flat", bd=0, highlightthickness=0, anchor="w", font=self.ui_font(9), padx=8, pady=5)
+		character_picker.pack(side="left", fill="x", expand=True, padx=(0, 10))
+		remove_button = stone(library_row, "REMOVE", lambda: remove_character(), pady=2)
+		remove_button.pack(side="right")
 		visible_characters = []
 		saved_choices = {}
 
@@ -4130,39 +4782,53 @@ class LauncherUI:
 		viewer_toolbar.pack(fill="x", pady=(0, 8))
 		stone(viewer_toolbar, "BACK", lambda: show_search()).pack(side="left")
 		stone(viewer_toolbar, "REFRESH", lambda: start_lookup()).pack(side="left", padx=4)
-		stone(viewer_toolbar, "COPY PROFILE", lambda: copy_profile()).pack(side="left")
-		stone(viewer_toolbar, "OPEN ARMORY PAGE", lambda: open_page()).pack(side="right")
+		stone(viewer_toolbar, "COPY", lambda: copy_profile()).pack(side="left")
+		stone(viewer_toolbar, "SAVE", lambda: save_character()).pack(side="left", padx=(4, 0))
+		stone(viewer_toolbar, "WEBSITE", lambda: open_page()).pack(side="right")
 		stone(viewer_toolbar, "CLOSE", window.destroy).pack(side="right", padx=4)
 		viewer_status = tk.Label(character_page, text="", bg=self.theme["panel"], fg=self.theme["muted"],
 			font=self.ui_font(8), anchor="w")
-		viewer_status.pack(fill="x", side="bottom", pady=(3, 0))
+		viewer_status.pack(fill="x", side="bottom", pady=0)
 
 		def show_search():
 			hide_tooltip()
 			character_page.pack_forget()
-			window.resize(360)
+			window.resize(420)
 			search_page.pack(fill="both", expand=True)
 			name_entry.focus_set()
 
 		def view_character():
-			if not state["result"]:
-				lookup_status.config(text="Look up or select a character first.", fg=self.theme["warning"])
+			requested = {"version": version_var.get(),
+				"region": region_var.get().strip().casefold() or "us",
+				"realm": realm_var.get().strip(), "name": name_var.get().strip()}
+			if not state["result"] or identity(state["result"]) != identity(requested):
+				# View also searches, just like pressing Enter in the form.
+				start_lookup()
 				return
 			search_page.pack_forget()
 			window.resize(700)
 			character_page.pack(fill="both", expand=True)
 			render_details()
 
+		profile_summary = tk.Frame(character_page, bg=panel)
+		profile_summary.pack(fill="x", pady=(0, 6))
 		tab_row = tk.Frame(character_page, bg=panel)
-		tab_row.pack(fill="x", pady=(0, 4))
+		tab_row.pack(fill="x", pady=(0, 2))
 		tab_buttons = {}
-		for title in ("Overview", "Equipment", "Stats", "Professions", "Progress", "Guild", "Achievements"):
-			button = stone(tab_row, title.upper(), lambda value=title: switch_tab(value), size=7, padx=5, pady=2)
-			button.pack(side="left", padx=(0, 4))
+		for title in ("Overview", "Equipment", "Stats", "Professions", "Guild", "Achievements"):
+			button = tk.Label(tab_row, text=title, bg=panel, fg=self.theme["muted"],
+				font=self.ui_font(9, bold=True), padx=12, pady=7, cursor="hand2", takefocus=True)
+			button.set_label = lambda text, target=button: target.config(text=text)
+			button.bind("<Button-1>", lambda _event, value=title: switch_tab(value))
+			button.bind("<Return>", lambda _event, value=title: switch_tab(value))
+			button.bind("<space>", lambda _event, value=title: switch_tab(value))
+			button.bind("<FocusIn>", lambda _event, target=button: target.config(highlightthickness=1, highlightbackground=self.theme["accent"]))
+			button.bind("<FocusOut>", lambda _event, target=button: target.config(highlightthickness=0))
+			button.pack(side="left", padx=(0, 3))
 			tab_buttons[title] = button
 
 		detail_area = tk.Frame(character_page, bg=panel)
-		detail_area.pack(fill="both", expand=True, pady=(12, 8))
+		detail_area.pack(fill="both", expand=True, pady=(6, 4))
 		results = tk.Frame(detail_area, bg=panel)
 		results.pack(fill="both", expand=True)
 		filter_var = tk.StringVar(value="")
@@ -4218,24 +4884,26 @@ class LauncherUI:
 				return
 			visible = {tree.identify_row(y) for y in range(12, tree.winfo_height(), 13)}
 			for item in visible:
-				identifier = state.get("achievement_icon_nodes", {}).get(item)
-				if identifier is not None and item not in state["achievement_icon_requested"]:
+				ref = state.get("achievement_icon_nodes", {}).get(item)
+				if ref is not None and item not in state["achievement_icon_requested"]:
 					state["achievement_icon_requested"].add(item)
-					request_icon("achievement", identifier, tree, size=18, tree_item=item)
+					kind, identifier = (ref.get("kind"), ref.get("id")) if isinstance(ref, dict) else ("achievement", ref)
+					request_icon(kind, identifier, tree, size=24, tree_item=item)
 
 		def refresh_section_tabs():
-			support = supported_character_sections(self.version.get(), state["result"])
+			support = supported_character_sections(version_var.get(), state["result"])
 			visible = []
 			for title, button in tab_buttons.items():
 				button.pack_forget()
 				if support.get(title, True):
-					button.pack(side="left", padx=(0, 4))
+					button.pack(side="left", padx=(0, 3))
 					visible.append(title)
 			if state["tab"] not in visible:
 				state["tab"] = "Overview"
 			return support
 
 		def show_result(result, avatar=None, cached=False):
+			self.clear_children(profile_summary)
 			self.clear_children(results)
 			state["result"] = result
 			support = refresh_section_tabs()
@@ -4245,63 +4913,71 @@ class LauncherUI:
 			if avatar:
 				try:
 					image = Image.open(io.BytesIO(avatar)).convert("RGBA")
-					image = ImageOps.fit(image, (52, 52), method=Image.Resampling.LANCZOS)
-					image.putalpha(make_rounded_mask(52, 52, 7))
+					image = ImageOps.fit(image, (64, 64), method=Image.Resampling.LANCZOS)
+					image.putalpha(make_rounded_mask(64, 64, 8))
 					photo = ImageTk.PhotoImage(image, master=self.root)
 				except (OSError, ValueError):
 					photo = None
 			state["photo"] = photo   # keep a reference or Tk drops the image
-			header = tk.Frame(results, bg=self.theme["surface"], padx=10, pady=8)
+			header = tk.Frame(profile_summary, bg=self.theme["surface"], padx=16, pady=8)
 			header.pack(fill="x")
 			if photo is not None:
 				tk.Label(header, image=photo, bg=self.theme["surface"], bd=0).pack(side="left", padx=(0, 12))
 			titles = tk.Frame(header, bg=self.theme["surface"])
 			titles.pack(side="left", fill="x", expand=True)
 			tk.Label(titles, text=result["name"], bg=self.theme["surface"], fg=self.theme["accent"], anchor="w",
-					 font=self.ui_font(15, bold=True)).pack(anchor="w")
+					 font=self.ui_font(20, bold=True)).pack(anchor="w")
 			level = f"Level {result['level']} " if result.get("level") else ""
 			summary = " ".join(part for part in (
 				result.get("race"), result.get("spec"), result.get("class")) if part)
 			tk.Label(titles, text=(level + summary).strip(), bg=self.theme["surface"], fg=self.theme["text"],
 					 anchor="w", font=self.ui_font(10)).pack(anchor="w")
+			tk.Label(titles, text=f"{result['realm']}  •  {result['region'].upper()}  •  {result['version']}",
+				bg=self.theme["surface"], fg=self.theme["muted"], anchor="w",
+				font=self.ui_font(8)).pack(anchor="w", pady=(4, 0))
 			self.style_popup_row(header)
-			metrics = tk.Frame(results, bg=self.theme["panel"])
-			metrics.pack(fill="x", pady=(4, 4))
+			metrics = tk.Frame(profile_summary, bg=self.theme["panel"])
+			metrics.pack(fill="x", pady=(3, 0))
 			for column, (label, value) in enumerate((
 				("ITEM LEVEL", result.get("item_level")),
 				*([("ACHIEVEMENTS", result.get("achievement_points"))] if support["Achievements"] else []),
 				("FACTION", result.get("faction")),
 				("GUILD", result.get("guild")))):
 				metrics.columnconfigure(column, weight=1, uniform="metrics")
-				card = tk.Frame(metrics, bg=self.theme["surface"], padx=8, pady=4)
+				card = tk.Frame(metrics, bg=self.theme["surface"], padx=12, pady=5)
 				card.grid(row=0, column=column, sticky="nsew", padx=(0, 6))
 				tk.Label(card, text=label, bg=self.theme["surface"], fg=self.theme["muted"],
 					font=self.ui_font(7, bold=True), anchor="w").pack(fill="x")
-				tk.Label(card, text=str(value) if value not in (None, "") else "Unavailable",
+				value_row = tk.Frame(card, bg=self.theme["surface"])
+				value_row.pack(fill="x", pady=(3, 0))
+				if label == "GUILD" and value:
+					guild_image = stat_icon("Guild")
+					guild_badge = tk.Label(value_row, image=guild_image, bg=self.theme["surface"], bd=0)
+					guild_badge.image = guild_image
+					guild_badge.pack(side="left", padx=(0, 6))
+					request_icon("ui-icon", UI_ICON_REFS["guild"]["guild"], guild_badge, size=24)
+				tk.Label(value_row, text=str(value) if value not in (None, "") else "Unavailable",
 					bg=self.theme["surface"], fg=self.theme["text"], anchor="w",
-					wraplength=160, font=self.ui_font(10, bold=True)).pack(fill="x", pady=(3, 0))
+					wraplength=130 if label == "GUILD" else 160, font=self.ui_font(10, bold=True)).pack(side="left", fill="x", expand=True)
 				self.style_popup_row(card)
-			tk.Label(results, text=f"{'Saved snapshot' if cached else 'Updated just now'} • {result['source']} • {result['realm']} / {result['region'].upper()}",
-				bg=self.theme["panel"], fg=self.theme["muted"], anchor="w",
-				font=self.ui_font(7)).pack(fill="x", side="bottom", pady=(3, 0))
 			search_row = tk.Frame(results, bg=self.theme["panel"])
-			search_row.pack(fill="x", side="bottom", pady=(4, 0))
+			search_row.pack(fill="x", side="bottom", pady=(2, 0))
 			view_note = tk.Label(search_row, text="", bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(7))
 			view_note.pack(side="left")
 			tk.Entry(search_row, textvariable=filter_var, bg=self.theme["control"], fg=self.theme["text"],
 				insertbackground=self.theme["text"], relief="flat", bd=0, highlightthickness=0,
-				font=self.ui_font(8), width=20).pack(side="right", ipady=3)
+				font=self.ui_font(8), width=20).pack(side="right", ipady=1)
 			tk.Label(search_row, text="FIND", bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(7)).pack(side="right", padx=5)
 			content = tk.Frame(results, bg=self.theme["panel"])
-			content.pack(fill="both", expand=True)
+			content.pack(fill="both", expand=True, pady=(0, 2))
 			state.update(content=content, view_note=view_note)
 			filter_var.set("")
 			content.bind("<Configure>", lambda _event: schedule_details())
 			render_details()
 			lookup_status.config(text="Saved profile. Refresh to check for changes." if cached else "Character loaded. Save it for quick access.", fg=self.theme["muted"])
-			self.apply_theme(self.version.get(), subtree=window)
-			search_summary.config(text=f"{result['name']} • {result['realm']} • {result['version']}\nSave this character or select View Character.")
-			viewer_status.config(text="Saved profile" if cached else "Character loaded")
+			apply_armory_theme()
+			search_summary.config(text=f"{result['name']} • {result['realm']}")
+			viewer_status.config(text=f"{'Saved snapshot' if cached else 'Updated just now'} • {result['source']}")
 			view_character()
 
 		def switch_tab(title):
@@ -4331,17 +5007,36 @@ class LauncherUI:
 			result, title = state["result"], state["tab"]
 			if title == "Achievements":
 				for label, button in tab_buttons.items():
-					button.set_label(label.upper() + (" •" if label == title else ""))
+					button.set_label(label)
+					button.config(bg=self.theme["control"] if label == title else self.theme["panel"],
+						fg=self.theme["accent"] if label == title else self.theme["muted"])
 				render_achievements(content, result)
 				return
 			for label, button in tab_buttons.items():
-				button.set_label(label.upper() + (" •" if label == title else ""))
+				button.set_label(label)
+				button.config(bg=self.theme["control"] if label == title else self.theme["panel"],
+					fg=self.theme["accent"] if label == title else self.theme["muted"])
+			if title == "Stats":
+				render_stats(content, result)
+				return
+			if title == "Professions":
+				render_professions(content, result)
+				return
+			if title == "Guild":
+				render_guild(content, result)
+				return
 			if title == "Overview":
 				rows = [("Game version", result.get("version")), ("Realm", result.get("realm")),
 					("Region", result.get("region", "").upper()), ("Race", result.get("race")),
 					("Class", result.get("class")), ("Specialization", result.get("spec")),
 					("Level", result.get("level")), ("Last login", result.get("last_login")),
 					*result.get("extras", [])]
+				# Keep PvP totals visible for fresh lookups and saved snapshots.
+				existing_labels = {caption for caption, _ in rows}
+				for caption, value in result.get("details", {}).get("progress", []):
+					if caption in ("Honorable kills", "Honor level") and caption not in existing_labels:
+						rows.append((caption, value))
+						existing_labels.add(caption)
 			else:
 				rows = result.get("details", {}).get(title.lower(), [])
 			query_text = filter_var.get().strip().casefold()
@@ -4355,14 +5050,11 @@ class LauncherUI:
 			capacity = max(columns, columns * max(1, height // (line_height * 2 + 10)))
 			total = len(rows)
 			# Very large lists use an honest summary, never another hidden page.
-			if title in ("Guild", "Achievements", "Progress", "Professions") and total > capacity:
-				if title == "Progress" and not query_text:
-					rows = rows[-capacity:]
-				else:
-					rows = rows[:capacity]
+			if title in ("Guild", "Achievements", "Professions") and total > capacity:
+				rows = rows[:capacity]
 				state["view_note"].config(text=f"Showing {len(rows)} of {total} entries • use Find to narrow results")
 			else:
-				state["view_note"].config(text="Hover over a value for full details")
+				state["view_note"].config(text="Hover for details" if title == "Equipment" else "")
 			if not rows:
 				message = "No matches. Try another search." if query_text else result.get("detail_messages", {}).get(title.lower(),
 					"These details are unavailable for this character or game version.")
@@ -4371,7 +5063,9 @@ class LauncherUI:
 				return
 			row_count = (len(rows) + columns - 1) // columns
 			# Place cells within the existing viewport, so labels cannot grow it.
-			cell_width = max(70, width // columns - 24)
+			gap = 6
+			cell_height = min(66, max(1, (height - gap * (row_count - 1)) // row_count))
+			cell_width = max(70, width // columns - (24 if title == "Stats" else 30))
 			def fit_text(text, available=cell_width):
 				if font.measure(text) <= available:
 					return text
@@ -4380,11 +5074,28 @@ class LauncherUI:
 				return text + "…"
 			for index, (caption, value) in enumerate(rows):
 				text = str(value) if value not in (None, "") else "Unavailable"
-				card = tk.Frame(content, bg=self.theme["surface"], padx=6, pady=2)
-				card.place(relx=(index % columns) / columns, rely=(index // columns) / row_count,
-					relwidth=1 / columns, relheight=1 / row_count)
+				if title == "Stats":
+					card = tk.Frame(content, bg=self.theme["surface"], padx=6, pady=2)
+					card.place(relx=(index % columns) / columns, rely=(index // columns) / row_count,
+						relwidth=1 / columns, relheight=1 / row_count)
+				else:
+					card = tk.Frame(content, bg=self.theme["surface"], padx=10, pady=6)
+					card.place(x=(index % columns) * width // columns,
+						y=(index // columns) * (cell_height + gap),
+						width=max(1, width // columns - gap), height=cell_height)
 				ref = (result.get("icon_refs", {}).get(title.lower(), {})).get(caption)
 				text_parent, text_width = card, cell_width
+				if title == "Stats":
+					identifier = UI_ICON_REFS["stats"].get(caption.casefold())
+					if identifier:
+						stat_image = stat_icon(caption)
+						icon = tk.Label(card, image=stat_image, bg=self.theme["surface"], bd=0)
+						icon.image = stat_image
+						icon.pack(side="left", padx=(0, 6))
+						text_parent = tk.Frame(card, bg=self.theme["surface"])
+						text_parent.pack(side="left", fill="both", expand=True)
+						text_width = max(40, cell_width - 30)
+						request_icon("ui-icon", identifier, icon, size=24)
 				if isinstance(ref, dict):
 					icon = tk.Label(card, text="□", bg=self.theme["surface"], fg=self.theme["muted"],
 						font=self.ui_font(18), bd=0, padx=3)
@@ -4393,13 +5104,27 @@ class LauncherUI:
 					text_parent.pack(side="left", fill="both", expand=True)
 					text_width = max(40, cell_width - 42)
 					request_icon(ref.get("kind"), ref.get("id"), icon)
-				tk.Label(text_parent, text=fit_text(caption, text_width), bg=self.theme["surface"], fg=self.theme["accent"],
-					anchor="w", font=self.ui_font(7, bold=True)).pack(fill="x")
+				heading_parent = text_parent
+				heading_width = text_width
+				if title == "Equipment":
+					level_match = re.search(r"(?:^|[•\n])\s*Item level\s+([0-9]+(?:\.[0-9]+)?)\s*(?=•|\n|$)", text)
+					if level_match:
+						heading_parent = tk.Frame(text_parent, bg=self.theme["surface"])
+						heading_parent.pack(fill="x")
+						level_text = f"iLvl {level_match.group(1)}"
+						level_font = self.ui_font(8, bold=True)
+						tk.Label(heading_parent, text=level_text, bg=self.theme["surface"],
+							fg=self.theme["accent"], font=level_font, anchor="e").pack(side="right", padx=(6, 0))
+						heading_width = max(20, text_width - level_font.measure(level_text) - 6)
+				tk.Label(heading_parent, text=fit_text(caption, heading_width), bg=self.theme["surface"],
+					fg=self.theme["accent"] if title == "Stats" else self.theme["muted"],
+					anchor="w", font=self.ui_font(7, bold=True) if title == "Stats" else self.ui_font(8)).pack(
+					fill="x", side="left", expand=True)
 				# Equipment names are prominent; enchants and gems remain in the hover detail.
-				preview = text.replace("\n", " • ")
+				preview = text.split(" • ", 1)[0] if title == "Equipment" else text.replace("\n", " • ")
 				label = tk.Label(text_parent, text=fit_text(preview, text_width), bg=self.theme["surface"], fg=self.theme["text"],
 					anchor="w", font=font)
-				label.pack(fill="x")
+				label.pack(fill="x", pady=(0 if title == "Stats" else 3, 0))
 				# Bind the value once; parent/child Enter events must not create competing popups.
 				label.bind("<Enter>", lambda _event, source=label, heading=caption, detail=text:
 					queue_tooltip(source, heading, detail))
@@ -4407,65 +5132,445 @@ class LauncherUI:
 				label.bind("<ButtonPress-1>", lambda _event: hide_tooltip())
 				label.bind("<Destroy>", lambda event: cancel_source_tooltip(event.widget))
 
-		def render_achievements(content, result):
-			state["view_note"].config(text="Expand a category to see its achievements; collapse it to free space")
-			style_name = f"Armory{str(id(window))}.Treeview"
+		def profession_icon(name):
+			# Small vector-style symbols also work offline and with saved profiles.
+			key = (name.casefold(), self.theme["accent"], self.theme["control"])
+			cache = state.setdefault("profession_photos", {})
+			if key in cache:
+				return cache[key]
+			image = Image.new("RGBA", (64, 64), self.theme["surface"])
+			draw = ImageDraw.Draw(image)
+			ink = self.theme["accent"]
+			draw.rounded_rectangle((2, 2, 62, 62), radius=10, fill=self.theme["control"])
+			name = name.casefold()
+			if "alchemy" in name:
+				draw.line((25, 12, 25, 27, 14, 49, 17, 53, 47, 53, 50, 49, 39, 27, 39, 12), fill=ink, width=4)
+				draw.line((22, 12, 42, 12), fill=ink, width=4)
+				draw.polygon((22, 39, 42, 39, 46, 49, 18, 49), fill=ink)
+			elif "cooking" in name:
+				draw.rounded_rectangle((15, 28, 49, 50), radius=5, outline=ink, width=4)
+				draw.line((10, 30, 54, 30), fill=ink, width=4)
+				draw.line((22, 14, 22, 23), fill=ink, width=3)
+				draw.line((32, 10, 32, 23), fill=ink, width=3)
+				draw.line((42, 14, 42, 23), fill=ink, width=3)
+			elif "fishing" in name:
+				draw.ellipse((14, 23, 44, 43), outline=ink, width=4)
+				draw.polygon((42, 33, 54, 23, 54, 43), outline=ink)
+				draw.ellipse((21, 29, 25, 33), fill=ink)
+			elif "first aid" in name:
+				draw.rounded_rectangle((14, 17, 50, 49), radius=4, outline=ink, width=3)
+				draw.rectangle((28, 22, 36, 44), fill=ink)
+				draw.rectangle((21, 29, 43, 37), fill=ink)
+			elif "jewel" in name:
+				draw.polygon((12, 25, 23, 14, 41, 14, 52, 25, 32, 51), outline=ink)
+				draw.line((12, 25, 52, 25), fill=ink, width=3)
+				draw.line((23, 14, 24, 25, 32, 51, 40, 25, 41, 14), fill=ink, width=3)
+			elif "herbal" in name:
+				draw.line((30, 52, 34, 15), fill=ink, width=4)
+				draw.ellipse((14, 21, 31, 35), fill=ink)
+				draw.ellipse((34, 13, 51, 27), fill=ink)
+				draw.ellipse((32, 34, 49, 46), fill=ink)
+			elif "enchant" in name:
+				draw.line((16, 50, 43, 23), fill=ink, width=5)
+				draw.line((44, 10, 44, 22), fill=ink, width=3)
+				draw.line((49, 25, 57, 25), fill=ink, width=3)
+				draw.line((32, 15, 38, 21), fill=ink, width=3)
+			elif "engineer" in name:
+				for angle in range(0, 360, 45):
+					rad = math.radians(angle)
+					draw.line((32+17*math.cos(rad), 32+17*math.sin(rad), 32+25*math.cos(rad), 32+25*math.sin(rad)), fill=ink, width=7)
+				draw.ellipse((16, 16, 48, 48), outline=ink, width=5)
+				draw.ellipse((26, 26, 38, 38), outline=ink, width=3)
+			elif "tailor" in name:
+				draw.rectangle((21, 17, 43, 47), outline=ink, width=3)
+				for y in (14, 24, 31, 38, 50):
+					draw.line((17 if y in (14, 50) else 22, y, 47 if y in (14, 50) else 42, y), fill=ink, width=3)
+			elif "leather" in name:
+				draw.polygon((15, 14, 26, 19, 38, 19, 49, 14, 53, 27, 45, 34, 49, 51, 36, 47, 28, 47, 15, 51, 19, 34, 11, 27), outline=ink)
+			elif "inscription" in name:
+				draw.line((17, 50, 45, 15), fill=ink, width=3)
+				draw.polygon((24, 39, 28, 21, 48, 11, 49, 27, 34, 37), outline=ink)
+			elif "skin" in name:
+				draw.line((16, 51, 28, 37), fill=ink, width=7)
+				draw.polygon((26, 33, 47, 11, 49, 29, 33, 40), outline=ink)
+			elif "archaeology" in name:
+				draw.line((22, 12, 39, 43), fill=ink, width=4)
+				draw.polygon((31, 42, 45, 35, 51, 48, 40, 55), outline=ink)
+			else:
+				# Pickaxe for mining; hammer for smithing and unknown trades.
+				draw.line((18, 51, 40, 19), fill=ink, width=5)
+				if "mining" in name:
+					draw.arc((12, 14, 56, 49), 200, 335, fill=ink, width=5)
+				else:
+					draw.polygon((21, 14, 34, 10, 51, 23, 43, 32), fill=ink)
+			photo = ImageTk.PhotoImage(image.resize((24, 24), Image.Resampling.LANCZOS), master=self.root)
+			cache[key] = photo
+			return photo
+
+		def stat_icon(name):
+			key = (name, self.theme["accent"], self.theme["surface"])
+			cache = state.setdefault("stat_photos", {})
+			if key in cache:
+				return cache[key]
+			image = Image.new("RGBA", (48, 48), self.theme["surface"])
+			draw = ImageDraw.Draw(image)
+			ink = self.theme["accent"]
+			name = name.casefold()
+			if name == "health" or name == "leech":
+				draw.ellipse((7, 8, 25, 26), fill=ink)
+				draw.ellipse((23, 8, 41, 26), fill=ink)
+				draw.polygon((8, 19, 40, 19, 24, 41), fill=ink)
+			elif name in ("armor", "stamina", "block", "guild"):
+				draw.polygon((8, 8, 40, 8, 38, 29, 24, 42, 10, 29), outline=ink)
+				draw.line((24, 12, 24, 35), fill=ink, width=3)
+			elif "haste" in name or name == "speed":
+				draw.ellipse((7, 7, 41, 41), outline=ink, width=3)
+				draw.line((24, 13, 24, 24, 34, 24), fill=ink, width=3)
+			elif "critical" in name:
+				draw.ellipse((10, 10, 38, 38), outline=ink, width=3)
+				draw.line((24, 3, 24, 45), fill=ink, width=2)
+				draw.line((3, 24, 45, 24), fill=ink, width=2)
+			elif name == "intellect" or name == "spirit":
+				draw.rectangle((8, 10, 40, 38), outline=ink, width=3)
+				draw.line((24, 11, 24, 37), fill=ink, width=2)
+			elif name in ("resource", "spell power", "spell critical strike", "mastery"):
+				draw.polygon((24, 4, 40, 24, 24, 44, 8, 24), outline=ink)
+				draw.line((24, 4, 24, 44), fill=ink, width=3)
+			else:
+				draw.line((9, 40, 35, 10), fill=ink, width=4)
+				draw.line((11, 26, 25, 38), fill=ink, width=4)
+			photo = ImageTk.PhotoImage(image.resize((24, 24), Image.Resampling.LANCZOS), master=self.root)
+			cache[key] = photo
+			return photo
+
+		def section_tree(parent, section, columns, headings, show="headings", rowheight=30):
+			style_name = f"Armory{section}{id(window)}.Treeview"
 			style = ttk.Style(self.root)
+			# Clone only this table's elements so macOS native headings do not ignore colors.
+			# The launcher's global ttk theme stays intact.
+			field_element = f"{style_name}.field"
+			cell_element = f"{style_name}.heading.cell"
+			border_element = f"{style_name}.heading.border"
+			try:
+				elements = style.element_names()
+				for target, source in ((field_element, "Treeview.field"),
+					(cell_element, "Treeheading.cell"), (border_element, "Treeheading.border")):
+					if target not in elements:
+						style.element_create(target, "from", "clam", source)
+				tree_area = ("Treeview.treearea", {"sticky": "nswe"})
+				table_padding = ("Treeview.padding", {"sticky": "nswe", "children": [tree_area]})
+				style.layout(style_name, [(field_element, {"sticky": "nswe", "children": [table_padding]})])
+				heading_text = ("Treeheading.text", {"sticky": "we"})
+				heading_image = ("Treeheading.image", {"side": "right", "sticky": ""})
+				heading_padding = ("Treeheading.padding", {"sticky": "nswe", "children": [heading_image, heading_text]})
+				style.layout(style_name + ".Heading", [(cell_element, {"sticky": "nswe"}),
+					(border_element, {"sticky": "nswe", "children": [heading_padding]})])
+			except tk.TclError:
+				pass  # fall back to the installed platform layout if clam is unavailable
 			style.configure(style_name, background=self.theme["surface"], fieldbackground=self.theme["surface"],
-				foreground=self.theme["text"], borderwidth=0, font=self.ui_font(9), rowheight=26)
-			style.configure(style_name + ".Heading", background=self.theme["control"], foreground=self.theme["text"], font=self.ui_font(8, bold=True))
+				foreground=self.theme["text"], borderwidth=0, relief="flat", padding=(8, 4), font=self.ui_font(9),
+				rowheight=max(rowheight, self.ui_font(9).metrics("linespace") + 12))
+			style.configure(style_name + ".Heading", background=self.theme["panel_alt"],
+				foreground=self.theme["muted"], relief="flat", borderwidth=0, padding=(10, 7),
+				font=self.ui_font(8, bold=True))
+			style.map(style_name + ".Heading", background=[("active", self.theme["control"])],
+				foreground=[("active", self.theme["text"])])
 			style.map(style_name, background=[("selected", self.theme["control_active"])],
 				foreground=[("selected", self.theme["bright"])])
-			tree = ttk.Treeview(content, style=style_name, columns=("completed",), show="tree headings", selectmode="browse")
-			tree.heading("#0", text="Category / achievement")
-			tree.heading("completed", text="Completed")
-			tree.column("#0", width=490, minwidth=220)
-			tree.column("completed", width=160, minwidth=140, stretch=False)
-			scrollbar = ttk.Scrollbar(content, orient="vertical", command=tree.yview)
+			outline = tk.Frame(parent, bg=self.theme["border"], padx=1, pady=1)
+			outline._armory_outline = True
+			outline.pack(fill="both", expand=True)
+			tree = ttk.Treeview(outline, style=style_name, columns=columns, show=show, selectmode="browse")
+			for column, caption, size in headings:
+				tree.heading(column, text=caption, anchor="w")
+				tree.column(column, width=size, minwidth=120, anchor="w")
+			scrollbar = ttk.Scrollbar(outline, orient="vertical", command=tree.yview)
 			scrollbar.pack(side="right", fill="y")
 			tree.config(yscrollcommand=scrollbar.set)
 			tree.pack(fill="both", expand=True)
-			state["achievement_tree"] = tree
-			state["achievement_icon_nodes"], state["achievement_icon_requested"] = {}, set()
+			return tree
+
+		def render_stats(content, result):
+			rows = result.get("details", {}).get("stats", [])
+			query = filter_var.get().strip().casefold()
+			if query:
+				rows = [(caption, value) for caption, value in rows if query in f"{caption} {value}".casefold()]
+			tree = section_tree(content, "Stats", ("value",),
+				[("#0", "Statistic", 420), ("value", "Value", 280)], show="tree headings", rowheight=36)
+			tree.tag_configure("alternate", background=self.theme["panel"])
+			tree.tag_configure("message", foreground=self.theme["muted"])
+			for index, (caption, value) in enumerate(rows):
+				row = tree.insert("", "end", text=caption, image=stat_icon(caption),
+					values=(str(value) if value not in (None, "") else "Unavailable",),
+					tags=("alternate",) if index % 2 else ())
+				identifier = UI_ICON_REFS["stats"].get(caption.casefold())
+				if identifier:
+					request_icon("ui-icon", identifier, tree, size=24, tree_item=row)
+			if not rows:
+				tree.insert("", "end", text="No matching statistics." if query else
+					result.get("detail_messages", {}).get("stats", "Statistics are unavailable for this character."), tags=("message",))
+			state["view_note"].config(text=f"{len(rows)} statistics • Find by name or value")
+
+		def hidden_achievement_category(category, result=None):
+			result = result or state["result"] or {}
+			if result.get("version") != "Mists of Pandaria Classic" or not isinstance(category, dict):
+				return False
+			name = " ".join(str(category.get("name", "")).casefold().split())
+			return name in ("bcc", "bcc classic", "burning crusade classic", "the burning crusade classic", "tbc classic") or name.startswith("bcc ")
+
+		def render_professions(content, result):
+			groups = result.get("profession_groups")
+			if not isinstance(groups, dict):
+				# Older saved snapshots still get secondary grouping and icons.
+				groups = {"primaries": [], "secondaries": []}
+				entries = {}
+				for name, value in result.get("details", {}).get("professions", []):
+					group = "secondaries" if name.casefold() in ("cooking", "fishing", "first aid", "archaeology") else "primaries"
+					key = (group, name)
+					if key not in entries:
+						entries[key] = {"name": name, "tiers": []}
+						groups[group].append(entries[key])
+					label, sep, rank = str(value).partition(" • ")
+					entries[key]["tiers"].append({"name": label if sep else "", "value": rank if sep else label})
+			query = filter_var.get().strip().casefold()
+			tree = section_tree(content, "Professions", ("skill",),
+				[("#0", "Profession / expansion", 350), ("skill", "Skill", 350)], show="tree headings", rowheight=36)
+			tree.tag_configure("group", foreground=self.theme["accent"],
+				background=blend_hex(self.theme["surface"], self.theme["accent"], .10), font=self.ui_font(9, bold=True))
+			for key, caption in (("primaries", "Primary professions"), ("secondaries", "Secondary professions")):
+				parent = tree.insert("", "end", text=caption, open=True, tags=("group",))
+				count = 0
+				for profession in groups.get(key, []):
+					name = profession["name"]
+					tiers = profession.get("tiers", [])
+					if query and query not in name.casefold():
+						tiers = [tier for tier in tiers if query in f"{tier['name']} {tier['value']}".casefold()]
+						if not tiers:
+							continue
+					count += 1
+					value = (f"{tiers[0]['name']} • {tiers[0]['value']}" if tiers[0]["name"] else tiers[0]["value"]) if len(tiers) == 1 else f"{len(tiers)} skill tiers"
+					row = tree.insert(parent, "end", text=name, image=profession_icon(name), values=(value,), open=bool(query))
+					if len(tiers) > 1:
+						for tier in tiers:
+							tree.insert(row, "end", text=tier["name"] or "Skill", values=(tier["value"],))
+				if not count:
+					tree.insert(parent, "end", text="No matches" if query else "No professions reported by the Armory")
+			state["view_note"].config(text="Expand a profession to view its skill tiers")
+
+		def guild_roster(result, metadata):
+			if isinstance(result.get("guild_members"), list):
+				return [dict(member) for member in result["guild_members"] if isinstance(member, dict) and member.get("name")]
+			# Older saved profiles have roster details as display strings.
+			members = []
+			for name, details in result.get("details", {}).get("guild", []):
+				if name in metadata:
+					continue
+				text = str(details)
+				level = re.search(r"\bLevel\s+(\d+)", text)
+				rank = re.search(r"\bRank\s+(\d+)", text)
+				parts = [part.strip() for part in text.split(" • ") if not part.startswith(("Level ", "Rank ")) and part != "Guild leader"]
+				members.append({"name": name, "realm": metadata.get("Realm") or result.get("realm"),
+					"level": int(level.group(1)) if level else None,
+					"rank": 0 if "Guild leader" in text else int(rank.group(1)) if rank else None,
+					"class": " • ".join(parts), "race": ""})
+			return members
+
+		def sorted_guild_members(members, column, descending):
+			# Unknown numeric values stay at the end in both directions.
+			if column == "name":
+				return sorted(members, key=lambda member: member["name"].casefold(), reverse=descending)
+			if column == "class":
+				known = sorted((member for member in members if member.get("class")), key=lambda member: member["name"].casefold())
+				known.sort(key=lambda member: member["class"].casefold(), reverse=descending)
+				unknown = sorted((member for member in members if not member.get("class")), key=lambda member: member["name"].casefold())
+				return known + unknown
+			known = sorted((member for member in members if member.get(column) is not None), key=lambda member: member["name"].casefold())
+			known.sort(key=lambda member: member[column], reverse=descending)
+			unknown = sorted((member for member in members if member.get(column) is None), key=lambda member: member["name"].casefold())
+			return known + unknown
+
+		def render_guild(content, result):
+			rows = result.get("details", {}).get("guild", [])
+			metadata_names = {"Guild name", "Realm", "Faction", "Created", "Guild achievement points", "Members in published roster", "Additional details"}
+			metadata = {caption: value for caption, value in rows if caption in metadata_names}
+			members = guild_roster(result, metadata)
+			name = metadata.get("Guild name") or result.get("guild")
+			if not name:
+				tk.Label(content, text=result.get("detail_messages", {}).get("guild", "This character has no guild listed."),
+					bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(10),
+					anchor="w", wraplength=700).pack(fill="x", pady=12)
+				state["view_note"].config(text="")
+				return
+			header = tk.Frame(content, bg=self.theme["surface"], padx=12, pady=10)
+			header.pack(fill="x", pady=(0, 8))
+			name_row = tk.Frame(header, bg=self.theme["surface"])
+			name_row.pack(fill="x")
+			guild_image = stat_icon("Guild")
+			guild_badge = tk.Label(name_row, image=guild_image, bg=self.theme["surface"], bd=0)
+			guild_badge.image = guild_image
+			guild_badge.pack(side="left", padx=(0, 8))
+			request_icon("ui-icon", UI_ICON_REFS["guild"]["guild"], guild_badge, size=24)
+			tk.Label(name_row, text=name, bg=self.theme["surface"], fg=self.theme["accent"],
+				font=self.ui_font(14, bold=True), anchor="w").pack(side="left", fill="x", expand=True)
+			summary = [str(metadata.get("Realm") or result.get("realm") or ""), str(metadata.get("Faction") or result.get("faction") or "")]
+			for caption, label in (("Created", "Founded"), ("Guild achievement points", "Achievement points"), ("Members in published roster", "Members")):
+				if metadata.get(caption) is not None:
+					summary.append(f"{label}: {metadata[caption]}")
+			tk.Label(header, text=" • ".join(part for part in summary if part), bg=self.theme["surface"],
+				fg=self.theme["text"], font=self.ui_font(8), anchor="w", justify="left",
+				wraplength=max(200, content.winfo_width() - 32)).pack(fill="x", pady=(4, 0))
+			query = filter_var.get().strip().casefold()
+			visible = [member for member in members if not query or query in
+				f"{member['name']} {member.get('class', '')} {member.get('race', '')} {member.get('level', '')} {member.get('rank', '')} {'Guild leader' if member.get('rank') == 0 else ''}".casefold()]
+			if members:
+				actions = tk.Frame(content, bg=self.theme["panel"])
+				actions.pack(fill="x", pady=(0, 6))
+				tk.Label(actions, text="Click a heading to sort • Double-click a player to view", bg=self.theme["panel"],
+					fg=self.theme["muted"], font=self.ui_font(8)).pack(side="left")
+				view_button = stone(actions, "VIEW PLAYER", lambda: open_member(), size=7, pady=1)
+				view_button.pack(side="right")
+				view_button.set_disabled(True)
+				tree = section_tree(content, "Guild", ("name", "rank", "level", "class"),
+					[("name", "Name", 240), ("rank", "Rank", 100), ("level", "Level", 80), ("class", "Class", 260)])
+				tree.column("rank", width=100, minwidth=85, stretch=False)
+				tree.column("level", width=80, minwidth=65, stretch=False)
+				tree.tag_configure("alternate", background=self.theme["panel"])
+				row_members = {}
+				sort_column, descending = state.get("guild_sort", ("rank", False))
+				for index, member in enumerate(sorted_guild_members(visible, sort_column, descending)):
+					rank = member.get("rank")
+					row = tree.insert("", "end", values=(member["name"], "Guild leader" if rank == 0 else rank if rank is not None else "—",
+						member.get("level") if member.get("level") is not None else "—", member.get("class") or "—"),
+						tags=("alternate",) if index % 2 else ())
+					row_members[row] = member
+				def sort_roster(column):
+					old_column, old_direction = state.get("guild_sort", ("rank", False))
+					state["guild_sort"] = (column, not old_direction if column == old_column else column == "level")
+					render_details()
+				for column, caption in (("name", "Name"), ("rank", "Rank"), ("level", "Level"), ("class", "Class")):
+					tree.heading(column, text=caption + ((" ↓" if descending else " ↑") if column == sort_column else ""),
+						command=lambda column=column: sort_roster(column))
+				def open_member(event=None):
+					if state["busy"]:
+						return
+					if event is not None and hasattr(event, "y"):
+						row = tree.identify_row(event.y)
+						if not row:
+							return
+					else:
+						selection = tree.selection()
+						row = selection[0] if selection else tree.focus()
+					member = row_members.get(row)
+					if not member:
+						return
+					name_var.set(member["name"])
+					realm_var.set(member.get("realm") or result["realm"])
+					region_var.set(result["region"])
+					state["tab"] = "Overview"
+					filter_var.set("")
+					start_lookup()
+				tree.bind("<Double-1>", open_member)
+				tree.bind("<Return>", lambda _event: open_member())
+				tree.bind("<<TreeviewSelect>>", lambda _event: view_button.set_disabled(not tree.selection()))
+				state["view_note"].config(text=f"{len(visible)} of {len(members)} members • Find by name, class, rank or level")
+			else:
+				tk.Label(content, text=metadata.get("Additional details") or "Guild roster is unavailable. Refresh to check for current data.",
+					bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(9),
+					anchor="w", justify="left", wraplength=700).pack(fill="x", pady=8)
+				state["view_note"].config(text="Guild details")
+
+		def render_achievements(content, result):
 			completed = result.get("achievement_records", [])
 			query_text = filter_var.get().strip().casefold()
+			state["view_note"].config(text="Search by achievement name or date" if query_text else "Click a category arrow to browse")
+			summary = tk.Frame(content, bg=self.theme["surface"], padx=12, pady=8)
+			summary.pack(fill="x", pady=(0, 8))
+			tk.Label(summary, text="Achievements", bg=self.theme["surface"], fg=self.theme["text"],
+				font=self.ui_font(11, bold=True)).pack(side="left")
+			tk.Label(summary, text=f"{result.get('achievement_points', '—')} points  •  {len(completed)} completed",
+				bg=self.theme["surface"], fg=self.theme["accent"], font=self.ui_font(9)).pack(side="right")
+			tree_area = tk.Frame(content, bg=self.theme["panel"])
+			tree_area.pack(fill="both", expand=True)
+			tree = section_tree(tree_area, "Achievements", ("completed",),
+				[("#0", "Achievement / Category", 520), ("completed", "Earned", 170)],
+				show="tree headings", rowheight=38)
+			tree.column("completed", width=170, minwidth=150, stretch=False)
+			tree.tag_configure("category", foreground=self.theme["accent"],
+				background=blend_hex(self.theme["surface"], self.theme["accent"], .10), font=self.ui_font(9, bold=True))
+			tree.tag_configure("alternate", background=self.theme["panel"])
+			tree.tag_configure("message", foreground=self.theme["muted"])
+			state["achievement_tree"] = tree
+			state["achievement_icon_nodes"], state["achievement_icon_requested"] = {}, set()
 			if query_text:
-				for item in completed:
-					if query_text in f"{item['name']} {item['completed']}".casefold():
-						row = tree.insert("", "end", text=item["name"], values=(item["completed"],))
-						state["achievement_icon_nodes"][row] = item["id"]
+				matches = [item for item in completed if query_text in f"{item['name']} {item['completed']}".casefold()]
+				for index, item in enumerate(matches):
+					add_achievement(tree, "", item, index)
+				if not matches:
+					tree.insert("", "end", text="No completed achievements match your search.", tags=("message",))
+				state["view_note"].config(text=f"{len(matches)} matching achievements")
 				return
-			history_note = f"{len(completed)} completed achievements" if "achievement_records" in result else "Refresh to load achievement history"
-			tree.insert("", "end", text=f"{result.get('achievement_points', 'Unavailable')} points • {history_note}")
-			roots = result.get("achievement_categories", [])
+			roots = [category for category in result.get("achievement_categories", []) if not hidden_achievement_category(category, result)]
 			for category in roots:
 				add_category(tree, "", category)
-			tree.insert("", "end", iid="all-history", text="All completed achievements", open=False)
-			tree.insert("all-history", "end", text="Expand to view saved achievement history")
-			tree.bind("<<TreeviewOpen>>", lambda _event: expand_category(tree))
+			tree.insert("", "end", iid="all-history", text=f"All completed achievements ({len(completed)})",
+				open=not roots, tags=("category",))
+			if completed:
+				state["achievement_icon_nodes"]["all-history"] = completed[0]["id"]
+			# Saved history is already available, so it needs no loading placeholder.
+			for index, item in enumerate(completed):
+				add_achievement(tree, "all-history", item, index)
+			if not completed:
+				tree.insert("all-history", "end", text="No completed achievements reported. Refresh to check for updates.", tags=("message",))
+			# Set focus before Tk's class binding opens the clicked disclosure arrow.
+			# On macOS the arrow can otherwise expand a row while leaving focus elsewhere.
+			tree.bind("<Button-1>", lambda event: focus_achievement_row(tree, event), add="+")
+			tree.bind("<<TreeviewOpen>>", lambda _event: expand_category(tree, tree.focus()))
+
+		def focus_achievement_row(tree, event):
+			row = tree.identify_row(event.y)
+			if row:
+				tree.focus(row)
+
+		def add_achievement(tree, parent, item, index=0):
+			row = tree.insert(parent, "end", text=item["name"], values=(item.get("completed") or "Date unavailable",),
+				tags=("alternate",) if index % 2 else ())
+			state["achievement_icon_nodes"][row] = item["id"]
+			return row
 
 		def add_category(tree, parent, category):
+			if hidden_achievement_category(category):
+				return
+			if not isinstance(category, dict) or not isinstance(category.get("id"), int):
+				return
 			key = f"category:{category['id']}"
 			if tree.exists(key):
 				return
-			tree.insert(parent, "end", iid=key, text=category["name"], open=False)
-			tree.insert(key, "end", iid=key + ":placeholder", text="Expand to load category")
+			tree.insert(parent, "end", iid=key, text=category.get("name") or "Category", open=False, tags=("category",))
+			state["achievement_icon_nodes"][key] = {"kind": "achievement-category", "id": category["id"]}
+			# A blank child supplies the disclosure arrow. Opening replaces it immediately.
+			tree.insert(key, "end", iid=key + ":placeholder", text="", tags=("message",))
 
-		def expand_category(tree):
-			key = tree.focus()
-			if key == "all-history":
-				for child in tree.get_children(key):
-					tree.delete(child)
-				for item in state["result"].get("achievement_records", []):
-					row = tree.insert(key, "end", text=item["name"], values=(item["completed"],))
-					state["achievement_icon_nodes"][row] = item["id"]
-				return
-			if not key.startswith("category:") or key.endswith(":placeholder"):
+		def clear_achievement_children(tree, key):
+			def forget(row):
+				for child in tree.get_children(row):
+					forget(child)
+				state["achievement_icon_nodes"].pop(row, None)
+				state["achievement_icon_requested"].discard(row)
+			for child in tree.get_children(key):
+				forget(child)
+				tree.delete(child)
+
+		def expand_category(tree, key=None):
+			key = key or tree.focus()
+			if not tree.winfo_exists() or not tree.exists(key) or not key.startswith("category:") or key.endswith(":placeholder"):
 				return
 			category_id = int(key.split(":")[1])
-			if category_id in state["categories"]:
-				fill_category(tree, key, state["categories"][category_id])
+			cached = state["categories"].get(category_id)
+			if cached and not cached.get("error"):
+				fill_category(tree, key, cached)
 				return
+			clear_achievement_children(tree, key)
+			tree.insert(key, "end", text="Loading achievements…", tags=("message",))
 			if category_id in state["category_pending"]:
 				return
 			state["category_pending"].add(category_id)
@@ -4484,20 +5589,27 @@ class LauncherUI:
 		def fill_category(tree, key, data):
 			if not tree.winfo_exists() or not tree.exists(key):
 				return
-			for child in tree.get_children(key):
-				tree.delete(child)
+			clear_achievement_children(tree, key)
 			if data.get("error"):
-				tree.insert(key, "end", text=data["error"])
+				tree.insert(key, "end", text=data["error"], tags=("message",))
+				tree.insert(key, "end", text="Close and reopen this category to retry.", tags=("message",))
 				return
-			for child in data.get("subcategories", []):
+			category = data.get("category") if isinstance(data.get("category"), dict) else data
+			children = [child for child in (category.get("subcategories", category.get("sub_categories", [])) or [])
+				if not hidden_achievement_category(child)]
+			for child in children:
 				add_category(tree, key, child)
-			ids = {item["id"] for item in data.get("achievements", [])}
+			ids = set()
+			for item in category.get("achievements", []) or []:
+				if isinstance(item, dict):
+					identifier = item.get("id") or (item.get("achievement") or {}).get("id")
+					if isinstance(identifier, int):
+						ids.add(identifier)
 			rows = [item for item in state["result"].get("achievement_records", []) if item["id"] in ids]
-			for item in rows:
-				row = tree.insert(key, "end", text=item["name"], values=(item["completed"],))
-				state["achievement_icon_nodes"][row] = item["id"]
-			if not rows and not data.get("subcategories"):
-				tree.insert(key, "end", text="No completed achievements in this category")
+			for index, item in enumerate(rows):
+				add_achievement(tree, key, item, index)
+			if not rows and not children:
+				tree.insert(key, "end", text="No completed achievements in this category.", tags=("message",))
 
 		def hide_tooltip():
 			state["hover_generation"] = state.get("hover_generation", 0) + 1
@@ -4566,7 +5678,9 @@ class LauncherUI:
 					realm_slug(item.get("realm", "")), item.get("name", "").casefold())
 
 		def refresh_list():
-			visible_characters[:] = [item for item in characters if item["version"] == self.version.get()]
+			visible_characters[:] = [item for item in characters if item["version"] == version_var.get()]
+			saved_heading.config(text=f"Saved characters ({len(visible_characters)})")
+			remove_button.set_disabled(not visible_characters)
 			saved_choices.clear()
 			menu = character_picker["menu"]
 			menu.delete(0, "end")
@@ -4584,7 +5698,7 @@ class LauncherUI:
 
 		def save_character():
 			result = state["result"]
-			if not result or result.get("version") != self.version.get():
+			if not result or result.get("version") != version_var.get():
 				lookup_status.config(text="Look up a character first.", fg=self.theme["warning"])
 				return
 			item = {key: result[key] for key in ("region", "realm", "name", "version")}
@@ -4650,31 +5764,31 @@ class LauncherUI:
 				state["queue"].put((generation, "error", f"Lookup failed: {error}", None))
 
 		def sync_version():
-			state["version"] = self.version.get()
+			state["version"] = version_var.get()
 			state["generation"] += 1
 			state["busy"], state["result"], state["url"] = False, None, ""
 			state["photo"] = None
 			refresh_section_tabs()
 			show_search()
-			search_summary.config(text="Search for a character or choose a saved profile.")
-			self.apply_theme(self.version.get(), subtree=window)
+			search_summary.config(text="")
+			apply_armory_theme()
 			version_menu["menu"].config(bg=self.theme["control"], fg=self.theme["text"],
 				activebackground=self.theme["control_active"], activeforeground=self.theme["bright"])
 			self.clear_children(results)
 			refresh_list()
-			available = self.version.get() in ARMORY_VERSIONS
+			available = version_var.get() in ARMORY_VERSIONS
 			lookup_button.set_disabled(not available)
 			tk.Label(results, text="Find a character" if available else "Armory unavailable",
 				bg=self.theme["panel"], fg=self.theme["accent"], font=self.ui_font(15, bold=True)
 			).pack(anchor="w", pady=(25, 6), padx=12)
-			tk.Label(results, text="Enter a name and realm above, or choose a saved character.\nEquipment, combat stats, professions and progress appear in the tabs."
-				if available else f"Character data is not available for {self.version.get()}.\nUse the version menu above to browse another game.",
+			tk.Label(results, text="Enter a name and realm above, or choose a saved character.\nEquipment, combat stats, professions, guild and achievements appear in the tabs."
+				if available else f"Character data is not available for {version_var.get()}.\nUse the version menu above to browse another game.",
 				bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(9),
 				justify="left", anchor="w", wraplength=700).pack(fill="x", padx=12)
 			lookup_status.config(text="Enter a character or select a saved profile." if available else
-				f"Character lookups are not available for {self.version.get()}.",
+				f"Character lookups are not available for {version_var.get()}.",
 				fg=self.theme["muted"] if available else self.theme["warning"])
-			self.apply_theme(self.version.get(), subtree=window)
+			apply_armory_theme()
 
 		def poll():
 			if not body.winfo_exists():
@@ -4682,7 +5796,7 @@ class LauncherUI:
 			source = state.get("tooltip_source")
 			if source is not None and not still_hovering(source):
 				hide_tooltip()
-			if state["version"] != self.version.get():
+			if state["version"] != version_var.get():
 				sync_version()
 			while True:
 				try:
@@ -4724,11 +5838,11 @@ class LauncherUI:
 			state["poll"] = self.root.after(150, poll)
 
 		def start_lookup(_event=None):
-			if state["version"] != self.version.get():
+			if state["version"] != version_var.get():
 				sync_version()
 			if state["busy"]:
 				return
-			version = self.version.get()
+			version = version_var.get()
 			if version not in ARMORY_VERSIONS:
 				lookup_status.config(text=f"Character lookups are not available for {version}.", fg=self.theme["warning"])
 				return
@@ -4742,6 +5856,7 @@ class LauncherUI:
 			state["generation"] += 1
 			state["busy"] = True
 			state["url"], state["result"] = "", None
+			search_summary.config(text="")
 			self.clear_children(results)
 			lookup_status.config(text="Looking up character…", fg=self.theme["muted"])
 			viewer_status.config(text="Refreshing character…", fg=self.theme["muted"])
@@ -4761,6 +5876,7 @@ class LauncherUI:
 				hide_tooltip()
 				if state.get("icon_executor"):
 					state["icon_executor"].shutdown(wait=False, cancel_futures=True)
+				self.apply_theme(self.version.get())
 				for timer in (state.get("poll"), state.get("resize")):
 					if timer:
 						self.root.after_cancel(timer)
@@ -4826,8 +5942,9 @@ def set_windows_app_id():
 		pass
 
 
-if __name__ == "__main__": 
-	set_windows_app_id() 
-	app = tk.Tk() 
-	LauncherUI(app) 
+
+if __name__ == "__main__":
+	set_windows_app_id()
+	app = tk.Tk()
+	LauncherUI(app)
 	app.mainloop()
