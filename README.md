@@ -4,7 +4,7 @@
 
 A classic-styled, unofficial launcher for your World of Warcraft installations. Pick a game, read the news, manage your addons, and press Play, all from one window and without opening the Battle.net app.
 
-**Current version: 1.0.0**
+**Current version: 1.0.1**
 
 > **Unofficial fan project.** Not affiliated with, endorsed by, or sponsored by Blizzard Entertainment. See the [Disclaimer](#disclaimer).
 
@@ -72,9 +72,24 @@ PyInstaller is used to package the launcher into a standalone Windows applicatio
 pip install pyinstaller
 ```
 
-### Using the included spec file
+### Spec files by operating system
 
-The repository includes `WoWLauncher.spec`, which contains the launcher entry point, bundled artwork folders/files, application name, and Windows icon configuration.
+PyInstaller cannot cross-compile. You must build on the same operating system you are targeting, and each OS uses its own spec file. Each spec file contains the entry point, bundled artwork folders/files, application name, and the icon format for that platform.
+
+| OS | Spec file | Icon | Output |
+|---|---|---|---|
+| Windows | `WoWLauncher.spec` | `wowicon.ico` | `dist\WoWLauncher\WoWLauncher.exe` |
+| macOS | `WoWLauncher-mac.spec` | `.icns` | `dist/WoWLauncher.app` |
+| Linux | `WoWLauncher-linux.spec` | none (window icon set at runtime from `wowicon.png`) | `dist/WoWLauncher/WoWLauncher` |
+
+Why they differ:
+
+- **Icons:** Windows uses `.ico`, macOS uses `.icns`, and Linux executables do not embed an icon.
+- **Bundle format:** macOS builds produce a `.app` bundle. Windows and Linux produce a folder containing the executable.
+- **Data file separators:** bundled artwork paths use `;` on Windows and `:` on macOS and Linux.
+- **Windowed mode:** all specs build a windowed app, so no console window is shown.
+
+### Building on Windows
 
 From the project folder, run:
 
@@ -82,21 +97,43 @@ From the project folder, run:
 python -m PyInstaller WoWLauncher.spec --noconfirm --clean
 ```
 
-The completed application will be placed in:
-
-```text
-dist\WoWLauncher\
-```
-
-Run:
+Then run:
 
 ```text
 dist\WoWLauncher\WoWLauncher.exe
 ```
 
-### What the spec file includes
+### Building on macOS
 
-The PyInstaller configuration bundles:
+From the project folder, run:
+
+```bash
+python3 -m PyInstaller WoWLauncher-mac.spec --noconfirm --clean
+```
+
+Then open:
+
+```text
+dist/WoWLauncher.app
+```
+
+### Building on Linux
+
+Tkinter must be installed first (for example, `sudo apt install python3-tk` on Debian/Ubuntu). Then, from the project folder, run:
+
+```bash
+python3 -m PyInstaller WoWLauncher-linux.spec --noconfirm --clean
+```
+
+Then run:
+
+```text
+dist/WoWLauncher/WoWLauncher
+```
+
+### What the spec files include
+
+Every spec file bundles:
 
 - `main.py` as the application entry point
 - `wowicon.ico` and `wowicon.png`
@@ -107,17 +144,9 @@ The PyInstaller configuration bundles:
 - `screenshots/`
 - `fonts/`
 
-It also builds the application as a windowed executable, so a console window is not shown.
-
 ### Rebuilding after changes
 
-If you change the launcher source code or bundled artwork, rebuild the application:
-
-```bash
-python -m PyInstaller WoWLauncher.spec --noconfirm --clean
-```
-
-For a clean rebuild, remove the previous `build/` and `dist/` folders first.
+If you change the launcher source code or bundled artwork, rebuild with the spec file for your OS (see above). For a clean rebuild, remove the previous `build/` and `dist/` folders first.
 
 ### Important
 
