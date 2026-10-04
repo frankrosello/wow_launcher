@@ -14,7 +14,7 @@ A classic-styled, unofficial launcher for your World of Warcraft installations. 
 
 ### Game launcher
 
-- **One launcher for every client:** WoW Forever Beta, Retail, Classic Era, Mists of Pandaria Classic, and TBC Anniversary. An optional extra slot supports the Crusader Storm loader.
+- **One launcher for every client:** WoW Forever Beta, Retail, Classic Era, Mists of Pandaria Classic, and TBC Anniversary.
 - **Custom clients are picked up automatically.** Extra WoW flavor folders found next to your installs appear in the version menu.
 - **First-run setup wizard** and an **Auto Search** that scans your drives for installs.
 - **Per-game theming:** each game gets its own colors, logo, background art, and headline text.
@@ -46,8 +46,7 @@ A classic-styled, unofficial launcher for your World of Warcraft installations. 
 - **Unique articles:** stories are deduplicated by article ID across source pages. Game filters use explicit edition names in titles or summaries; general news stays under All Games. Stories covering multiple editions can appear in each relevant filter.
 - **In-app article reader:** read article text and follow links without leaving the launcher. Includes Back, Forward, Reload, Home, and Open in Browser controls, with no address bar.
 - **Mouse wheel and trackpad scrolling** throughout the news list, including over article cards, with macOS, Windows, and Linux wheel handling.
-- **Crusader Storm resources:** its main-page news area shows useful links, including the community Discord, instead of patch notes. Its Armory button opens the server's website in your browser.
-
+  
 ### Character Armory
 
 - **Search by character name, realm, and region** for Retail, Classic Era, Mists of Pandaria Classic, and TBC Anniversary, subject to the data available from the Armory service.
