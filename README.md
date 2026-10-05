@@ -15,7 +15,7 @@
 
 A classic-styled, unofficial launcher for your World of Warcraft installations. Pick a game, read the news, manage your addons, and press Play, all from one window and without opening the Battle.net app.
 
-**Current version: 1.1**
+**Current version: 1.1** (not currently in releases section)
 
 > **Unofficial fan project.** Not affiliated with, endorsed by, or sponsored by Blizzard Entertainment. See the [Disclaimer](#disclaimer).
 
@@ -79,6 +79,14 @@ A classic-styled, unofficial launcher for your World of Warcraft installations. 
 - Reads the installed build from each game's own `.build.info` file and compares it with Blizzard's public version service.
 - The **CHECK UPDATES** button turns into **UPDATE AVAILABLE** when the selected game is out of date.
 - **Notify-only:** the launcher never downloads or patches game files. Install game updates through Battle.net.
+
+---
+
+## Running from Releases
+
+### How do download
+
+Go to <a href="https://github.com/frankrosello/wow_launcher/releases">Releases</a> page and find the most recent version of the game, find the setup file for your OS, and run it to setup.
 
 ---
 
