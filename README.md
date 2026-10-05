@@ -1,6 +1,8 @@
 # World of Warcraft Launcher
 
 <img width="1102" height="732" alt="image" src="https://github.com/user-attachments/assets/5eca758b-674a-400d-915f-94efa72e6fda" />
+<img width="1212" height="844" alt="Screenshot 2026-10-05 at 2 35 03 PM" src="https://github.com/user-attachments/assets/ad16fdc4-6569-4deb-98f9-57e15afef3c6" />
+
 
 A classic-styled, unofficial launcher for your World of Warcraft installations. Pick a game, read the news, manage your addons, and press Play, all from one window and without opening the Battle.net app.
 
