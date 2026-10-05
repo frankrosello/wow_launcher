@@ -829,6 +829,17 @@ class GameOptionMenu(ttk.Combobox):
         labels = [self._menu.entrycget(i, "label") for i in range(end + 1)] if end is not None else []
         super().configure(values=labels)
         popup = self.tk.call("ttk::combobox::PopdownWindow", self._w)
+        listbox = str(popup) + ".f.l"
+        if not int(self.tk.call("winfo", "exists", listbox)):
+            # Aqua builds use a native Menu, rebuilt by ttk after this callback.
+            # Its postcommand applies availability after rebuilding, before display.
+            native_menu = str(popup) + ".menu"
+            if int(self.tk.call("winfo", "exists", native_menu)):
+                if not hasattr(self, "_native_popup_command"):
+                    self._native_popup_command = self.register(self._style_native_popup)
+                self.tk.call(native_menu, "configure", "-postcommand",
+                             (self._native_popup_command, native_menu))
+            return
         bg, fg = self._colors["bg"], self._colors["fg"]
         self.tk.call(str(popup) + ".f.l", "configure", "-background", bg,
                      "-foreground", fg, "-selectbackground", self._colors["activebackground"],
@@ -879,7 +890,22 @@ class GameOptionMenu(ttk.Combobox):
             color = self._menu.entrycget(i, "foreground") or fg
             if self._menu.entrycget(i, "state") == "disabled":
                 color = self._menu.entrycget(i, "foreground") or "#827b70"
-            self.tk.call(listbox, "itemconfigure", i, "-foreground", color)
+            selected_color = (color if self._menu.entrycget(i, "state") == "disabled"
+                              else self._colors["activeforeground"])
+            self.tk.call(listbox, "itemconfigure", i, "-foreground", color,
+                         "-selectforeground", selected_color)
+
+    def _style_native_popup(self, native_menu):
+        """Transfer disabled states to Aqua's actual menu, not the backing menu."""
+        if not self.winfo_exists() or not int(self.tk.call("winfo", "exists", native_menu)):
+            return
+        end = self._menu.index("end")
+        native_end = self.tk.call(native_menu, "index", "end")
+        if end is None or str(native_end) == "none":
+            return
+        for i in range(min(end, int(native_end)) + 1):
+            self.tk.call(native_menu, "entryconfigure", i, "-state",
+                         self._menu.entrycget(i, "state"))
 
     def _select(self, event=None):
         index = self.current()
