@@ -1,6 +1,17 @@
 # World of Warcraft Launcher
 
-<img width="1102" height="732" alt="image" src="https://github.com/user-attachments/assets/5eca758b-674a-400d-915f-94efa72e6fda" />
+<table>
+  <tr>
+    <td width="50%"><img width="1102" height="732" alt="image" src="https://github.com/user-attachments/assets/fdb988ad-4ee6-4f5e-a4db-0871bf4b4a05" /></td>
+    <td width="50%"><img width="1212" height="844" alt="Screenshot 2026-10-05 at 2 35 03 PM" src="https://github.com/user-attachments/assets/ad16fdc4-6569-4deb-98f9-57e15afef3c6" /></td>
+  </tr>
+  <tr>
+    <td width="50%"><img width="1212" height="844" alt="Screenshot 2026-10-05 at 3 27 19 PM" src="https://github.com/user-attachments/assets/6030f4be-82d4-4bdb-b65d-93908d60c5c4" /></td>
+    <td width="50%"><img width="1212" height="844" alt="Screenshot 2026-10-05 at 3 28 08 PM" src="https://github.com/user-attachments/assets/3605f979-6da1-40df-af11-e775941d1062" /></td>
+  </tr>
+</table>
+
+
 
 A classic-styled, unofficial launcher for your World of Warcraft installations. Pick a game, read the news, manage your addons, and press Play, all from one window and without opening the Battle.net app.
 
@@ -14,7 +25,7 @@ A classic-styled, unofficial launcher for your World of Warcraft installations. 
 
 ### Game launcher
 
-- **One launcher for every client:** WoW Forever Beta, Retail, Classic Era, Mists of Pandaria Classic, and TBC Anniversary. An optional extra slot supports the Crusader Storm loader.
+- **One launcher for every client:** WoW Forever Beta, Retail, Classic Era, Mists of Pandaria Classic, and TBC Anniversary.
 - **Custom clients are picked up automatically.** Extra WoW flavor folders found next to your installs appear in the version menu.
 - **First-run setup wizard** and an **Auto Search** that scans your drives for installs.
 - **Per-game theming:** each game gets its own colors, logo, background art, and headline text.
@@ -46,8 +57,7 @@ A classic-styled, unofficial launcher for your World of Warcraft installations. 
 - **Unique articles:** stories are deduplicated by article ID across source pages. Game filters use explicit edition names in titles or summaries; general news stays under All Games. Stories covering multiple editions can appear in each relevant filter.
 - **In-app article reader:** read article text and follow links without leaving the launcher. Includes Back, Forward, Reload, Home, and Open in Browser controls, with no address bar.
 - **Mouse wheel and trackpad scrolling** throughout the news list, including over article cards, with macOS, Windows, and Linux wheel handling.
-- **Crusader Storm resources:** its main-page news area shows useful links, including the community Discord, instead of patch notes. Its Armory button opens the server's website in your browser.
-
+  
 ### Character Armory
 
 - **Search by character name, realm, and region** for Retail, Classic Era, Mists of Pandaria Classic, and TBC Anniversary, subject to the data available from the Armory service.
