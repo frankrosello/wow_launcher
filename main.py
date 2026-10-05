@@ -31,9 +31,11 @@ import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from addon_manager import AddonManager, Overlay
-from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager
+from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager, install_overlay_animation
+from launcher_updates import LauncherUpdateController
 
 AddonManager = backup_addon_manager(AddonManager)
+install_overlay_animation(Overlay)
 from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug, lookup_achievement_category, supported_character_sections, fetch_media_icon, UI_ICON_REFS
 from update_manager import UpdateController
 
@@ -1619,6 +1621,10 @@ class LauncherUI(LauncherPreferencesMixin):
 		if self._startup_screen is not None:
 			self._startup_screen.destroy()
 			self._startup_screen = None
+		if not getattr(self, "_launcher_update_scheduled", False):
+			self._launcher_update_scheduled = True
+			if self.preferences["launcher_update_checks"]:
+				self.root.after(1500, self.launcher_updates.check)
 		# First-run setup appears once the launcher is visible.
 		if not self.setup_complete and not getattr(self, "_startup_setup_scheduled", False):
 			self._startup_setup_scheduled = True
@@ -1976,6 +1982,11 @@ class LauncherUI(LauncherPreferencesMixin):
 				child.destroy()
 
 	def build_header(self):
+		self.launcher_updates = LauncherUpdateController(self)
+		self.launcher_update_button = StoneButton(
+			self.root, text="LAUNCHER UPDATE", command=self.launcher_updates.open_release,
+			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
+			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme, style="subtle")
 		self.update_button = StoneButton(
 			self.root, text="UPDATE AVAILABLE", command=lambda: self.updates.check_selected(),
 			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
@@ -3514,14 +3525,23 @@ class LauncherUI(LauncherPreferencesMixin):
 			value.pack(anchor="w")
 			metrics.append(value)
 			self.add_rounded_surface(card, "surface", radius=7)
-		canvas = tk.Canvas(body, bg=theme["surface"], bd=0, highlightthickness=0, height=260)
-		canvas.pack(fill="both", expand=True)
-		hover = tk.Label(body, text="Move over the graph for daily playtime.", bg=panel,
-			fg=theme["text"], font=self.ui_font(9), anchor="w")
-		hover.pack(fill="x", pady=(8, 2))
+		# Reserve the footer before the expanding graph, so hover text stays visible.
 		tk.Label(body, text=f"Daily history starts {self.playtime_history_started}. Earlier totals have no dates. "
 			"Tracking runs while the launcher is open.", bg=panel, fg=theme["muted"],
-			font=self.ui_font(8), anchor="w", wraplength=790).pack(fill="x")
+			font=self.ui_font(8), anchor="w", wraplength=790).pack(side="bottom", fill="x")
+		hover = tk.Label(body, text="Move over the graph for daily playtime.", bg=panel,
+			fg=theme["text"], font=self.ui_font(9), anchor="w")
+		hover.pack(side="bottom", fill="x", pady=(8, 2))
+		canvas = tk.Canvas(body, bg=theme["surface"], bd=0, highlightthickness=0, height=260)
+		canvas.pack(fill="both", expand=True)
+
+		def daily_parts(day):
+			values = self.playtime_history.get(day.isoformat(), {})
+			return [(name, values[name]) for name in versions[1:]
+				if values.get(name, 0) > 0]
+
+		def game_color(name):
+			return GAME_THEMES.get(name, theme)["accent"]
 
 		def choose_range(days):
 			state["days"] = days
@@ -3545,6 +3565,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				str(sum(seconds > 0 for seconds in known)), self.format_total_time(lifetime))):
 				label.config(text=value)
 			range_label.config(text=f"{series[0][0]:%b %d, %Y} – {series[-1][0]:%b %d, %Y}  ·  {selected.get()}")
+			state["hover_index"] = None
 			canvas.delete("all")
 			width, height = max(200, canvas.winfo_width()), max(140, canvas.winfo_height())
 			left, right, top, bottom = 58, width - 18, 20, height - 35
@@ -3559,15 +3580,22 @@ class LauncherUI(LauncherPreferencesMixin):
 				canvas.create_text(left - 8, y, text=label, anchor="e", fill=theme["muted"], font=self.ui_font(8))
 			step_width = (right - left) / len(series)
 			points = []
-			for index, (_, seconds) in enumerate(series):
+			for index, (day, seconds) in enumerate(series):
 				if seconds is None:
 					continue
 				x = left + (index + .5) * step_width
 				y = bottom - seconds / ceiling * (bottom - top)
-				if state["days"] <= 30:
+				if selected.get() == "All versions":
+					stack_y = bottom
+					for name, duration in daily_parts(day):
+						segment_top = stack_y - duration / ceiling * (bottom - top)
+						canvas.create_rectangle(x - step_width * .34, segment_top,
+							x + step_width * .34, stack_y, fill=game_color(name), outline="")
+						stack_y = segment_top
+				elif state["days"] <= 30:
 					if seconds > 0:
 						canvas.create_rectangle(x - step_width * .34, y, x + step_width * .34, bottom,
-							fill=theme["accent"], outline="")
+							fill=game_color(selected.get()), outline="")
 				else:
 					points.extend((x, y))
 			if len(points) >= 4:
@@ -3575,7 +3603,9 @@ class LauncherUI(LauncherPreferencesMixin):
 			elif points:
 				x, y = points
 				canvas.create_oval(x-3, y-3, x+3, y+3, fill=theme["accent"], outline="")
-			for index in sorted({0, len(series)//4, len(series)//2, 3*len(series)//4, len(series)-1}):
+			label_indices = range(len(series)) if state["days"] == 7 else sorted(
+				{0, len(series)//4, len(series)//2, 3*len(series)//4, len(series)-1})
+			for index in label_indices:
 				canvas.create_text(left + (index + .5)*step_width, bottom + 18,
 					text=series[index][0].strftime("%b %d"), fill=theme["muted"], font=self.ui_font(8))
 			if not peak:
@@ -3587,17 +3617,48 @@ class LauncherUI(LauncherPreferencesMixin):
 			if "bounds" not in state:
 				return
 			left, right, top, bottom, ceiling = state["bounds"]
-			canvas.delete("cursor")
 			if not left <= event.x <= right or not top <= event.y <= bottom:
+				leave(event)
 				return
 			index = min(len(state["series"])-1, int((event.x-left)/(right-left)*len(state["series"])))
+			if state.get("hover_index") == index:
+				return
+			state["hover_index"] = index
+			canvas.delete("cursor")
+			canvas.delete("tooltip")
 			day, seconds = state["series"][index]
 			value = self.format_session_time(seconds) if seconds is not None else "No dated history"
-			hover.config(text=f"{day:%A, %b %d, %Y}  ·  {value}")
+			hover.config(text=f"{day:%A, %b %d, %Y}  ·  Total: {value}")
+			lines = [f"{day:%A, %b %d}", f"Total: {value}"]
+			if seconds is not None and selected.get() == "All versions":
+				lines.extend(f"{name}: {self.format_session_time(duration)}"
+					for name, duration in daily_parts(day))
+			elif seconds is not None:
+				lines.append(selected.get())
 			x = left + (index+.5)*(right-left)/len(state["series"])
 			canvas.create_line(x, top, x, bottom, fill=theme["muted"], dash=(3,3), tags="cursor")
+			# Canvas items keep pointer events on the graph. No child widget can
+			# steal Enter/Leave, and no recursive idle layout is needed to measure.
+			tip_text = canvas.create_text(0, 0, text="\n".join(lines), anchor="nw",
+				font=self.ui_font(9), fill=theme["text"], justify="left",
+				width=min(310, max(100, right-left-28)), tags="tooltip")
+			box = canvas.bbox(tip_text)
+			if box is None:
+				return
+			tip_w, tip_h = box[2]-box[0]+20, box[3]-box[1]+14
+			# Keep the card at the opposite side of the hovered bar, rather than
+			# chasing the pointer and jumping around while it moves within a day.
+			tip_x = right-tip_w if x < (left+right)/2 else left
+			tip_x = max(4, min(tip_x, canvas.winfo_width()-tip_w-4))
+			tip_y = max(4, min(top, canvas.winfo_height()-tip_h-4))
+			canvas.move(tip_text, tip_x+10-box[0], tip_y+7-box[1])
+			card = canvas.create_rectangle(tip_x, tip_y, tip_x+tip_w, tip_y+tip_h,
+				fill=theme["control"], outline=theme["border"], tags="tooltip")
+			canvas.tag_lower(card, tip_text)
 
 		def leave(event):
+			state["hover_index"] = None
+			canvas.delete("tooltip")
 			canvas.delete("cursor")
 			hover.config(text="Move over the graph for daily playtime.")
 
@@ -4321,17 +4382,23 @@ class LauncherUI(LauncherPreferencesMixin):
 			return
 		self.open_preferences(StoneButton, Overlay, GameOptionMenu, self.game_versions)
 
-	def open_game_options(self):
+	def open_game_options(self, parent=None, window=None):
 		extra_height = 66  # how much the panel grows for each extra row
 		shown_extras = sum(1 for name in EXTRA_VERSIONS if name in self.enabled_extras)
-		window = Overlay(self.root, 820, 580 + extra_height * shown_extras)
+		embedded = parent is not None
+		if not embedded:
+			window = Overlay(self.root, 820, 580 + extra_height * shown_extras)
 
 		def stone(parent, text, command, size=8, padx=8, pady=4):
+			backdrop_role = getattr(parent, "_button_backdrop_role", "panel")
 			return StoneButton(parent, text=text, command=command,
 							   font=self.ui_font(size, bold=True), padx=padx, pady=pady,
-							   bg="#211c18", theme_provider=lambda: self.theme, style="subtle", version_colored=True)
+							   bg=self.theme[backdrop_role],
+							   background_provider=lambda button, width, height: Image.new(
+								   "RGBA", (width, height), self.theme[backdrop_role]),
+							   theme_provider=lambda: self.theme, style="subtle", version_colored=True)
 
-		body = window.make_body()
+		body = parent if embedded else window.make_body()
 		tk.Label(body, text="GAME INSTALLATIONS", bg="#211c18", fg=GOLD,
 				 font=self.ui_font(15, bold=True)).pack(anchor="w")
 		tk.Label(body,
@@ -4348,11 +4415,13 @@ class LauncherUI(LauncherPreferencesMixin):
 		footer = tk.Frame(body, bg="#211c18")
 		footer.pack(fill="x", side="bottom", pady=(10, 0))
 		setup_controls = tk.Frame(body, bg="#211c18")
-		setup_controls.pack(side="bottom", fill="x", pady=(8, 0))
+		if not embedded:
+			setup_controls.pack(side="bottom", fill="x", pady=(8, 0))
 		def reopen_setup():
 			window.destroy()
 			self.root.after(50, self.open_setup_wizard)
-		stone(setup_controls, "SHOW WELCOME / RUN SETUP AGAIN", reopen_setup).pack(side="left")
+		if not embedded:
+			stone(setup_controls, "SHOW WELCOME / RUN SETUP AGAIN", reopen_setup).pack(side="left")
 		options_status = tk.Label(body, text="Settings are saved on this computer.",
 								  bg="#211c18", fg=MUTED, font=self.ui_font(8), anchor="w")
 		options_status.pack(fill="x", side="bottom", pady=(8, 0))
@@ -4361,12 +4430,62 @@ class LauncherUI(LauncherPreferencesMixin):
 		stone(footer, "EXTRA", lambda: add_extra()).pack(side="left")
 		stone(footer, "CONFIG", lambda: self.open_game_config(parent=window, paths=entries)
 			).pack(side="left", padx=(8, 0))
-		stone(footer, "SAVE", lambda: self.save_options(window, entries, options_status, arg_vars),
-			  size=9, padx=12).pack(side="right")
-		stone(footer, "CANCEL", window.destroy).pack(side="right", padx=(0, 8))
+		if embedded:
+			stone(footer, "RUN SETUP AGAIN", reopen_setup).pack(side="left", padx=(8, 0))
+		if not embedded:
+			stone(footer, "SAVE", lambda: self.save_options(window, entries, options_status, arg_vars),
+				  size=9, padx=12).pack(side="right")
+			stone(footer, "CANCEL", window.destroy).pack(side="right", padx=(0, 8))
 
-		rows_frame = tk.Frame(body, bg="#211c18")
-		rows_frame.pack(fill="both", expand=True)
+		# Give rows their requested height inside a scrollable viewport. Packing
+		# them directly into a short tab clips later installations and buttons.
+		viewport = tk.Frame(body, bg=self.theme["panel"])
+		viewport.pack(fill="both", expand=True)
+		rows_canvas = tk.Canvas(viewport, bg=self.theme["panel"], bd=0,
+								 highlightthickness=0, height=320)
+		style = ttk.Style(window)
+		serial = self.root.tk.call("incr", "::wow_launcher_scroll_style_serial")
+		scroll_style = f"GameOptions{serial}.Vertical.TScrollbar"
+		trough, thumb = scroll_style + ".trough", scroll_style + ".thumb"
+		style.element_create(trough, "from", "clam", "Vertical.Scrollbar.trough")
+		style.element_create(thumb, "from", "clam", "Vertical.Scrollbar.thumb")
+		style.layout(scroll_style, [(trough, {"sticky": "ns", "children": [
+			(thumb, {"sticky": "nswe", "expand": True})]})])
+		style.configure(scroll_style, background=self.theme["border"],
+			troughcolor=self.theme["control"], bordercolor=self.theme["border"],
+			lightcolor=self.theme["border"], darkcolor=self.theme["border"], width=12)
+		style.map(scroll_style, background=[("active", self.theme["accent"])])
+		rows_scroll = ttk.Scrollbar(viewport, orient="vertical",
+			command=rows_canvas.yview, style=scroll_style)
+		rows_scroll.pack(side="right", fill="y", padx=(6, 0))
+		rows_canvas.pack(side="left", fill="both", expand=True)
+		rows_canvas.configure(yscrollcommand=rows_scroll.set)
+		rows_frame = tk.Frame(rows_canvas, bg=self.theme["panel"])
+		rows_item = rows_canvas.create_window(0, 0, window=rows_frame, anchor="nw")
+		rows_frame.bind("<Configure>", lambda event:
+			rows_canvas.configure(scrollregion=rows_canvas.bbox("all")))
+		rows_canvas.bind("<Configure>", lambda event:
+			rows_canvas.itemconfigure(rows_item, width=event.width))
+
+		def scroll_rows(event):
+			if rows_frame.winfo_reqheight() <= rows_canvas.winfo_height():
+				return
+			if getattr(event, "num", None) in (4, 5):
+				units = -1 if event.num == 4 else 1
+			else:
+				delta = event.delta
+				if not delta:
+					return
+				units = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+			rows_canvas.yview_scroll(units, "units")
+			return "break"
+
+		def bind_row_scroll(widget):
+			for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+				widget.bind(sequence, scroll_rows, add="+")
+			for child in widget.winfo_children():
+				bind_row_scroll(child)
+		bind_row_scroll(rows_canvas)
 
 		def refresh_chip(version, path_var, chip):
 			text = path_var.get().strip()
@@ -4379,6 +4498,7 @@ class LauncherUI(LauncherPreferencesMixin):
 
 		def add_row(version, path=None):
 			row = tk.Frame(rows_frame, bg="#181614", padx=8, pady=5)
+			row._button_backdrop_role = "surface"
 			row.pack(fill="x", pady=3)
 			tk.Label(row, text=version, width=24, anchor="w", bg="#181614",
 					 fg=TEXT, font=self.ui_font(9, bold=True)).pack(side="left", padx=(2, 8))
@@ -4412,6 +4532,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			refresh_chip(version, path_var, chip)
 			entries[version] = path_var
 			self.style_popup_row(row)
+			bind_row_scroll(row)
 			return row
 
 		for version in self.game_versions:
@@ -4458,7 +4579,8 @@ class LauncherUI(LauncherPreferencesMixin):
 			else:
 				row = add_row(name, folder)
 				window.update_idletasks()
-				window.resize(window.winfo_height() + extra_height)
+				if not embedded:
+					window.resize(window.winfo_height() + extra_height)
 				self.apply_theme(self.version.get(), subtree=row)
 			options_status.config(text=f"{name} added. Press SAVE to keep it.",
 								  fg=self.theme["success"])
@@ -4480,7 +4602,8 @@ class LauncherUI(LauncherPreferencesMixin):
 			elif version in EXTRA_VERSIONS:
 				row = add_row(version, path)
 				window.update_idletasks()
-				window.resize(window.winfo_height() + extra_height)
+				if not embedded:
+					window.resize(window.winfo_height() + extra_height)
 				self.apply_theme(self.version.get(), subtree=row)
 			else:
 				return
@@ -4543,7 +4666,8 @@ class LauncherUI(LauncherPreferencesMixin):
 
 		window.bind("<Destroy>", on_options_destroyed, add="+")
 		self.style_popup(window, body)
-		self.apply_theme(self.version.get(), subtree=window)
+		self.apply_theme(self.version.get(), subtree=body)
+		return entries, arg_vars, options_status
 
 	def scan_roots(self):
 		"""Drives (or common folders on other systems) to search for game installs."""

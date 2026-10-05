@@ -16,16 +16,66 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import uuid
 import zipfile
+import webbrowser
+from launcher_updates import LAUNCHER_VERSION, RELEASES_URL
 
 DEFAULT_PREFERENCES = {
     'launch_behavior': 'Keep open', 'news_refresh_minutes': 30,
     'animations_enabled': True, 'addon_backups_enabled': True,
-    'playtime_paused': False,
+    'playtime_paused': False, 'launcher_update_checks': True,
 }
 NEWS_CHOICES = {'Manual only': 0, 'Every 15 minutes': 15, 'Every 30 minutes': 30,
                 'Every hour': 60, 'Every 3 hours': 180}
 BACKUP_NAMES = ('AddOns', 'AddOns_Disabled', 'AddOns_curseforge.json',
                 'AddOns_curseforge_matches_v2.json')
+
+
+def install_overlay_animation(overlay_class):
+    """Animate the shared overlay class, including windows created by addons."""
+    if getattr(overlay_class, '_opening_animation_installed', False):
+        return
+    original_init = overlay_class.__init__
+
+    def animated_init(panel, root, *args, **kwargs):
+        original_init(panel, root, *args, **kwargs)
+        owner = root
+        while owner is not None and not hasattr(owner, 'launcher'):
+            owner = getattr(owner, 'master', None)
+        app = getattr(owner, 'launcher', None)
+        if app is None or not app.preferences.get('animations_enabled', True):
+            return
+        target_y = int(panel.place_info().get('y', 0))
+        panel.place_configure(y=target_y + 14)
+        timer = {'id': None, 'start': None}
+
+        def cancel(event):
+            if event.widget is panel and timer['id'] is not None:
+                try:
+                    root.after_cancel(timer['id'])
+                except tk.TclError:
+                    pass
+                timer['id'] = None
+
+        def step():
+            timer['id'] = None
+            if not panel.winfo_exists() or panel.winfo_manager() != 'place':
+                return
+            if timer['start'] is None:
+                timer['start'] = time.monotonic()
+            progress = min(1.0, (time.monotonic() - timer['start']) / .18)
+            if not app.preferences.get('animations_enabled', True):
+                progress = 1.0
+            # Ease out into the final position without resizing/repainting content.
+            offset = round(14 * (1.0 - progress) ** 3)
+            panel.place_configure(y=target_y + offset)
+            if progress < 1.0:
+                timer['id'] = root.after(16, step)
+
+        panel.bind('<Destroy>', cancel, add='+')
+        timer['id'] = root.after_idle(step)
+
+    overlay_class.__init__ = animated_init
+    overlay_class._opening_animation_installed = True
 
 
 def clean_preferences(value):
@@ -36,7 +86,7 @@ def clean_preferences(value):
         result['launch_behavior'] = value['launch_behavior']
     if type(value.get('news_refresh_minutes')) is int and value['news_refresh_minutes'] in NEWS_CHOICES.values():
         result['news_refresh_minutes'] = value['news_refresh_minutes']
-    for key in ('animations_enabled', 'addon_backups_enabled', 'playtime_paused'):
+    for key in ('animations_enabled', 'addon_backups_enabled', 'playtime_paused', 'launcher_update_checks'):
         if type(value.get(key)) is bool:
             result[key] = value[key]
     return result
@@ -329,7 +379,7 @@ class LauncherPreferencesMixin:
         def select(name):
             for page in pages.values(): page.pack_forget()
             pages[name].pack(fill='both', expand=True)
-        for name in ('General', 'Games', 'Addons', 'Data'):
+        for name in ('General', 'Games', 'Addons', 'Data', 'Updates'):
             pages[name] = tk.Frame(content, bg=panel)
             button(tabs, name.upper(), lambda name=name: select(name)).pack(side='left', padx=(0, 8))
         def dropdown(parent, caption, variable, values):
@@ -348,17 +398,13 @@ class LauncherPreferencesMixin:
         news_choice = tk.StringVar(value=next(name for name, value in NEWS_CHOICES.items() if value == self.preferences['news_refresh_minutes']))
         dropdown(general, 'NEWS REFRESH', news_choice, tuple(NEWS_CHOICES))
         label(general, 'Manual only keeps the Refresh button available. News still loads when you open or switch games.', 9, 'muted')
-        checkbox(general, 'Animate backgrounds and rotate screenshots', 'animations_enabled')
+        checkbox(general, 'Animate panels, backgrounds, and screenshots', 'animations_enabled')
         checkbox(general, 'Pause playtime tracking', 'playtime_paused')
         label(general, 'Minimize to tray requires pystray. If the tray is unavailable, the launcher minimizes normally.', 9, 'muted')
         def leave_and_open(callback):
             window.destroy(); self.root.after(50, callback)
         games = pages['Games']
-        label(games, 'GAME INSTALLATIONS', 14, 'accent')
-        label(games, 'Manage each game folder, launch arguments, additional clients, and game configuration files.')
-        button(games, 'GAME LOCATIONS AND LAUNCH ARGUMENTS', lambda: leave_and_open(self.open_game_options)).pack(anchor='w', pady=8)
-        button(games, 'SHOW WELCOME / RUN SETUP AGAIN', lambda: leave_and_open(self.open_setup_wizard)).pack(anchor='w', pady=8)
-        label(games, 'Choose a game folder, not its executable. READY means a compatible executable was found.', 10, 'muted')
+        game_entries, game_args, game_status = self.open_game_options(parent=games, window=window)
         addons = pages['Addons']
         checkbox(addons, 'Back up addons before installs and updates', 'addon_backups_enabled')
         label(addons, 'Snapshots include enabled and disabled addons and CurseForge metadata. Each install/update batch gets one backup. Restoring also backs up your current addons.')
@@ -427,13 +473,22 @@ class LauncherPreferencesMixin:
             tk.Checkbutton(data, text=text, variable=variable, bg=panel, fg=theme['text'], selectcolor=theme['control'],
                 activebackground=panel, activeforeground=theme['accent'], font=self.ui_font(10)).pack(anchor='w', pady=3)
         button(data, 'RESET SETTINGS', lambda: self.reset_launcher_settings(window, status, keep_time.get(), keep_characters.get())).pack(anchor='w', pady=6)
+        updates = pages['Updates']
+        label(updates, 'LAUNCHER UPDATES', 14, 'accent')
+        label(updates, 'Installed launcher version: ' + LAUNCHER_VERSION)
+        checkbox(updates, 'Check for launcher updates at startup', 'launcher_update_checks')
+        label(updates, 'Checks published stable releases on GitHub in the background. Download the Windows, macOS, or Linux build from the release page.', 10, 'muted')
+        button(updates, 'CHECK FOR UPDATES', lambda: self.launcher_updates.check(manual=True)).pack(anchor='w', pady=8)
+        button(updates, 'OPEN RELEASES', lambda: webbrowser.open(RELEASES_URL)).pack(anchor='w', pady=8)
         def save():
             self.preferences = clean_preferences({key: variable.get() for key, variable in controls.items() if key != 'news_refresh_minutes'})
             self.preferences['news_refresh_minutes'] = NEWS_CHOICES[news_choice.get()]
             self.preferred_version = default_game.get()
-            if self.persist_settings():
-                self.apply_launcher_preferences(); window.destroy()
-            else: status.set('Settings could not be saved.')
+            self.save_options(window, game_entries, game_status, game_args)
+            if not window.winfo_exists():
+                self.apply_launcher_preferences()
+            else:
+                status.set('Settings could not be saved. See the Games tab for details.')
         button(footer, 'SAVE', save).pack(side='right')
         button(footer, 'CANCEL', window.destroy).pack(side='right', padx=(0, 8))
         select('General')
