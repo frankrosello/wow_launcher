@@ -31,6 +31,9 @@ import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from addon_manager import AddonManager, Overlay
+from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager
+
+AddonManager = backup_addon_manager(AddonManager)
 from armory import ARMORY_VERSIONS, ArmoryError, REGIONS, fetch_avatar, lookup_character, realm_slug, lookup_achievement_category, supported_character_sections, fetch_media_icon, UI_ICON_REFS
 from update_manager import UpdateController
 
@@ -713,6 +716,192 @@ def split_launch_args(text):
 
 
 
+class GameOptionMenu(ttk.Combobox):
+    """Standard ttk dropdown with a non-native, game-colored popup."""
+    def __init__(self, master, variable, value, *values, command=None):
+        self.variable = variable
+        self._previous = variable.get()
+        self._colors = {"bg": "#20313d", "fg": TEXT,
+                        "activebackground": "#2d4655", "activeforeground": TEXT,
+                        "bordercolor": "#435360", "focusbordercolor": "#e3c36e"}
+        # ttk retains elements after widgets are destroyed. Python object IDs
+        # can be reused, so allocate names in the Tcl interpreter instead.
+        style_id = master.tk.call("incr", "::wow_launcher_dropdown_style_serial")
+        self._style_name = f"GameDropdownSerial{style_id}.TCombobox"
+        # ttk writes its selection before emitting ComboboxSelected. Keep that
+        # tentative value separate from the application's traced game variable.
+        self._display_variable = tk.StringVar(master=master, value=variable.get())
+        super().__init__(master, textvariable=self._display_variable, state="readonly",
+                         style=self._style_name, postcommand=self._prepare_popup)
+        self._variable_trace = variable.trace_add("write", self._sync_display)
+        self.bind("<Destroy>", self._remove_variable_trace, add="+")
+        self._menu = tk.Menu(self, tearoff=False)
+        for item in (value, *values):
+            self._menu.add_command(label=item, command=tk._setit(variable, item, command))
+        self.bind("<<ComboboxSelected>>", self._select)
+        self._setup_style()
+
+    def _sync_display(self, *args):
+        value = self.variable.get()
+        if self._display_variable.get() != value:
+            self._display_variable.set(value)
+
+    def _remove_variable_trace(self, event):
+        if event.widget is self:
+            self.variable.trace_remove("write", self._variable_trace)
+
+    def __getitem__(self, key):
+        return self._menu if key == "menu" else super().__getitem__(key)
+
+    def _setup_style(self):
+        style = ttk.Style(self)
+        # Clone clam's drawn elements without changing the application's ttk theme.
+        def element(name):
+            target = self._style_name + "." + name
+            if target not in style.element_names():
+                style.element_create(target, "from", "clam", "Combobox." + name)
+            return target
+        # Keep the field's background/border on ttk's native drawing path.
+        # Stretching a tiny image element across the field can tile thousands
+        # of image fragments each time the widget is drawn.
+        if not hasattr(self, "_arrow_image"):
+            self._arrow_image = tk.PhotoImage(master=self, width=18, height=14)
+        arrow = self._style_name + ".arrow"
+        if arrow not in style.element_names():
+            style.element_create(arrow, "image", self._arrow_image)
+        style.layout(self._style_name, [(element("field"), {"sticky": "nswe", "children": [
+            (arrow, {"side": "right", "sticky": ""}),
+            (element("padding"), {"sticky": "nswe", "children": [
+                (element("textarea"), {"sticky": "nswe"})]})]})])
+        self._paint_style()
+
+    def _paint_style(self):
+        # ttk style mutations notify the whole UI and can trigger more geometry
+        # callbacks. Do not mutate styles or images for unchanged colors.
+        palette = tuple(self._colors.items())
+        if getattr(self, "_painted_palette", None) == palette:
+            return
+        self._painted_palette = palette
+        style = ttk.Style(self)
+        bg, fg = self._colors["bg"], self._colors["fg"]
+        border = self._colors["bordercolor"]
+        focus = self._colors["focusbordercolor"]
+        if hasattr(self, "_arrow_image"):
+            self._arrow_image.put(bg, to=(0, 0, 18, 14))
+            for row in range(5):
+                self._arrow_image.put(fg, to=(4 + row, 5 + row, 13 - row, 6 + row))
+        style.configure(self._style_name, fieldbackground=bg, background=bg,
+                        foreground=fg, arrowcolor=fg, bordercolor=border,
+                        lightcolor=border, darkcolor=border, padding=(8, 4), borderwidth=1,
+                        relief="solid")
+        style.map(self._style_name,
+                  fieldbackground=[("readonly", bg), ("disabled", bg)],
+                  foreground=[("readonly", fg)], background=[("active", self._colors["activebackground"])],
+                  selectbackground=[("readonly", bg)], selectforeground=[("readonly", fg)],
+                  bordercolor=[("focus", focus), ("!focus", border)],
+                  lightcolor=[("focus", focus), ("!focus", border)],
+                  darkcolor=[("focus", focus), ("!focus", border)])
+
+    def configure(self, cnf=None, **options):
+        if cnf:
+            options.update(cnf)
+        if not options:
+            return super().configure()
+        for key, alias in (("background", "bg"), ("foreground", "fg")):
+            if key in options:
+                options[alias] = options.pop(key)
+        for key in self._colors:
+            if key in options:
+                self._colors[key] = options.pop(key)
+        for key in ("relief", "bd", "borderwidth", "highlightthickness", "highlightbackground",
+                    "highlightcolor", "anchor", "padx", "pady"):
+            options.pop(key, None)
+        if options.get("state") == "normal":
+            options["state"] = "readonly"
+        result = super().configure(**options)
+        self._paint_style()
+        return result
+    config = configure
+
+    def _prepare_popup(self):
+        self._previous = self.variable.get()
+        end = self._menu.index("end")
+        labels = [self._menu.entrycget(i, "label") for i in range(end + 1)] if end is not None else []
+        super().configure(values=labels)
+        popup = self.tk.call("ttk::combobox::PopdownWindow", self._w)
+        bg, fg = self._colors["bg"], self._colors["fg"]
+        self.tk.call(str(popup) + ".f.l", "configure", "-background", bg,
+                     "-foreground", fg, "-selectbackground", self._colors["activebackground"],
+                     "-selectforeground", self._colors["activeforeground"], "-borderwidth", 0,
+                     "-highlightthickness", 1, "-highlightbackground", self._colors["bordercolor"],
+                     "-highlightcolor", self._colors["bordercolor"], "-font", self.cget("font"))
+        # The popup's enclosing frame otherwise retains a bright platform border.
+        popup_style = self._style_name + ".Popup.TFrame"
+        ttk.Style(self).configure(popup_style, background=bg, borderwidth=0, relief="flat")
+        self.tk.call(str(popup) + ".f", "configure", "-style", popup_style, "-borderwidth", 0)
+        # Intercept disabled choices ahead of ttk's select-and-close bindings.
+        listbox = str(popup) + ".f.l"
+        if not hasattr(self, "_popup_guard_command"):
+            self._popup_guard_command = self.register(self._popup_choice_allowed)
+        guard_tag = self._style_name + ".SelectionGuard"
+        tags = self.tk.splitlist(self.tk.call("bindtags", listbox))
+        if guard_tag not in tags:
+            self.tk.call("bindtags", listbox, (guard_tag, *tags))
+        for event in ("<ButtonPress-1>", "<ButtonRelease-1>"):
+            self.tk.call("bind", guard_tag, event,
+                         f"if {{![{self._popup_guard_command} {listbox} mouse %y]}} {{break}}")
+        for event in ("<Return>", "<KP_Enter>", "<space>"):
+            self.tk.call("bind", guard_tag, event,
+                         f"if {{![{self._popup_guard_command} {listbox} keyboard 0]}} {{break}}")
+        # postcommand runs before ttk fills the Listbox. Style individual rows
+        # on idle, after ttk has configured and populated the popup.
+        self.after_idle(self._style_popup_rows, str(popup) + ".f.l")
+
+    def _popup_choice_allowed(self, listbox, mode, y):
+        if mode == "mouse":
+            index = int(self.tk.call(listbox, "nearest", y))
+        else:
+            selection = self.tk.splitlist(self.tk.call(listbox, "curselection"))
+            if not selection:
+                return False
+            index = int(selection[0])
+        end = self._menu.index("end")
+        return (end is not None and 0 <= index <= end
+                and self._menu.entrycget(index, "state") != "disabled")
+
+    def _style_popup_rows(self, listbox):
+        if not self.winfo_exists() or not int(self.tk.call("winfo", "exists", listbox)):
+            return
+        end = self._menu.index("end")
+        count = min(int(self.tk.call(listbox, "size")), end + 1 if end is not None else 0)
+        fg = self._colors["fg"]
+        for i in range(count):
+            color = self._menu.entrycget(i, "foreground") or fg
+            if self._menu.entrycget(i, "state") == "disabled":
+                color = self._menu.entrycget(i, "foreground") or "#827b70"
+            self.tk.call(listbox, "itemconfigure", i, "-foreground", color)
+
+    def _select(self, event=None):
+        index = self.current()
+        if index < 0:
+            return
+        if self._menu.entrycget(index, "state") == "disabled":
+            self._sync_display()
+            return
+        self._menu.invoke(index)
+        self._sync_display()
+        self._previous = self.variable.get()
+
+
+def style_option_menu(widget, theme):
+    widget.configure(bg=theme["control"], fg=theme["text"],
+        activebackground=theme["control_active"], activeforeground=theme["bright"],
+        bordercolor=theme["border"], focusbordercolor=theme["accent"])
+    widget["menu"].configure(bg=theme["control"], fg=theme["text"],
+        activebackground=theme["control_active"], activeforeground=theme["bright"],
+        font=widget.cget("font"), relief="flat", bd=0)
+
+
 class NewsArticleParser(HTMLParser):
 	"""Extract readable blocks without relying on a site's CSS or JavaScript."""
 	SKIP = {"script", "style", "nav", "footer", "aside", "noscript", "svg", "button", "form"}
@@ -1304,8 +1493,130 @@ class GradientSurface:
 		return self.image.crop((x, y, x + width, y + height)).convert("RGBA")
 
 
-class LauncherUI:
+class LauncherUI(LauncherPreferencesMixin):
 	def __init__(self, root):
+		self.root = root
+		self._closing = False
+		self._startup_complete = False
+		self._startup_news_ready = False
+		self._startup_news_timeout = None
+		root.title(APP_TITLE)
+		root.geometry("1100x700")
+		root.minsize(860, 580)
+		root.resizable(False, False)
+		palette = GAME_THEMES[GAME_VERSIONS[0]]
+		# Register bundled Friz before constructing any startup text. Named Font
+		# objects stay alive in the same cache used by the main launcher.
+		self._font_cache = {}
+		self._registered_font_paths = set()
+		self._font_family = "Friz Quadrata"
+		self.game_paths = {}
+		self.register_friz_fonts()
+		self.refresh_friz_font()
+		root.configure(bg=BG)
+		self._startup_screen = tk.Frame(root, bg=BG)
+		self._startup_screen.place(relwidth=1, relheight=1)
+		outline = tk.Frame(self._startup_screen, bg=palette["border"], padx=1, pady=1)
+		outline.place(relx=.5, rely=.5, anchor="center")
+		center = tk.Frame(outline, bg=palette["surface"], padx=42, pady=36)
+		center.pack()
+		self._startup_title = tk.Label(center, text="WORLD OF WARCRAFT", bg=palette["surface"],
+			fg=palette["accent"], font=self.ui_font(26, bold=True))
+		self._startup_title.pack(pady=(0, 6))
+		self._startup_subtitle = tk.Label(center, text="LAUNCHER", bg=palette["surface"],
+			fg=palette["text"], font=self.ui_font(14, bold=True))
+		self._startup_subtitle.pack(pady=(0, 22))
+		tk.Frame(center, bg=palette["border"], height=1).pack(fill="x", pady=(0, 22))
+		self._startup_status = tk.Label(center, text="Starting launcher…", bg=palette["surface"],
+			fg=palette["text"], font=self.ui_font(11, bold=True))
+		self._startup_status.pack(pady=(0, 14))
+		self._startup_progress = tk.Canvas(center, width=360, height=10, bg=palette["control"],
+			bd=0, highlightthickness=1, highlightbackground=palette["border"])
+		self._startup_progress.pack()
+		self._startup_bar = self._startup_progress.create_rectangle(2, 2, 14, 8,
+			fill=palette["accent"], outline="")
+		self._startup_hint = tk.Label(center, text="Preparing your games, artwork, and news", bg=palette["surface"],
+			fg=palette["muted"], font=self.ui_font(9))
+		self._startup_hint.pack(pady=(14, 0))
+		self._startup_steps = self._initialize(root)
+		# Map the loading screen before starting expensive initialization.
+		root.after(50, self._advance_startup)
+
+	def _advance_startup(self):
+		if self._closing or not self.root.winfo_exists():
+			return
+		try:
+			message, progress = next(self._startup_steps)
+		except StopIteration:
+			self._startup_complete = True
+			self._startup_status.config(text="Loading news…")
+			if self._startup_news_ready:
+				self._finish_startup()
+			else:
+				# News errors and slow/offline connections must not block the launcher.
+				self._startup_news_timeout = self.root.after(8000, self._finish_startup)
+			return
+		self._startup_status.config(text=message)
+		self._startup_progress.coords(self._startup_bar, 2, 2, 2 + round(356 * progress), 8)
+		self._startup_screen.lift()
+		self.root.after(25, self._advance_startup)
+
+	def _load_startup_backdrop(self):
+		"""Use the opening game's artwork behind the loading panel."""
+		if self._startup_screen is None:
+			return
+		version = self.preferred_version if self.preferred_version in self.game_versions else GAME_VERSIONS[0]
+		source = self.selected_background(version)
+		if source is None:
+			return
+		width = max(1100, self.root.winfo_width())
+		height = max(700, self.root.winfo_height())
+		# Blur at half resolution to keep startup inexpensive. Fit uses the same
+		# crop as the main background, then a light shade keeps text readable.
+		backdrop = ImageOps.fit(source, (width // 2, height // 2),
+			method=Image.Resampling.BILINEAR).filter(ImageFilter.GaussianBlur(10))
+		backdrop = backdrop.resize((width, height), Image.Resampling.BILINEAR).convert("RGBA")
+		backdrop = Image.alpha_composite(backdrop, Image.new("RGBA", backdrop.size, (0, 0, 0, 65)))
+		photo = ImageTk.PhotoImage(backdrop, master=self.root)
+		background = tk.Label(self._startup_screen, image=photo, bg=BG, bd=0,
+			highlightthickness=0)
+		background.image = photo
+		background.place(relwidth=1, relheight=1)
+		background.lower()
+
+	def _finish_startup(self):
+		if not self._startup_complete:
+			return
+		if self._startup_news_timeout is not None:
+			self.root.after_cancel(self._startup_news_timeout)
+			self._startup_news_timeout = None
+		if self._startup_screen is not None:
+			self._startup_screen.destroy()
+			self._startup_screen = None
+		# First-run setup appears once the launcher is visible.
+		if not self.setup_complete and not getattr(self, "_startup_setup_scheduled", False):
+			self._startup_setup_scheduled = True
+			self.root.after(400, self.open_setup_wizard)
+
+	def _prepare_startup_art(self):
+		"""Prepare the final selected backdrop before exposing the launcher."""
+		version = self._initial_version
+		self.selected_background(version)
+		self.selected_logo(version)
+		size = (max(1100, self.root.winfo_width()), max(700, self.root.winfo_height()))
+		self.compose_game_background(version, size)
+		self._startup_art_warning = None
+		if version in GAME_ART:
+			logo_stem, background_stem = GAME_ART[version]
+			missing = []
+			if self.game_backgrounds.get(version) is None:
+				missing.append(f"backgrounds/{background_stem}.*")
+			if self.game_logos.get(version) is None:
+				missing.append(f"logos/{logo_stem}.*")
+			if missing:
+				self._startup_art_warning = f"{version} artwork missing or unreadable: " + ", ".join(missing)
+
+	def _initialize(self, root):
 		self.root = root
 		root.launcher = self   # lets popups read the current theme
 		root.title(APP_TITLE)
@@ -1339,6 +1650,7 @@ class LauncherUI:
 		self.news_hub_generation = 0
 		self.selection_generation = 0
 		self.dynamic_versions = {}
+		yield "Loading settings and finding game installations…", .12
 		self.game_paths = self.load_settings()
 		if not self.settings_path.exists():
 			try:
@@ -1348,6 +1660,9 @@ class LauncherUI:
 					"playtime_history": self.playtime_history,
 					"playtime_history_started": self.playtime_history_started,
 					"setup_complete": self.setup_complete,
+					"preferences": self.preferences,
+					"preferred_version": self.preferred_version,
+					"onboarding_hints_seen": sorted(self.onboarding_hints_seen),
 					"launch_args": self.launch_args,
 					"armory": self.armory,
 					"extras_enabled": sorted(self.enabled_extras),
@@ -1358,7 +1673,8 @@ class LauncherUI:
 					f"Could not create launcher settings:\n{self.settings_path}\n\n{error}", parent=root)
 		self.discovered_versions = self.discover_game_versions()
 		self.game_versions = self.compute_game_versions()
-		self.game_copy = GAME_COPY[GAME_VERSIONS[0]]
+		self._initial_version = self.preferred_version if self.preferred_version in self.game_versions else GAME_VERSIONS[0]
+		self.game_copy = self.copy_for_version(self._initial_version)
 		self.art_text = (self.game_copy["headline"], self.game_copy["tagline"])
 		self.art_text_fade = 1.0
 		self.running_version = None
@@ -1371,13 +1687,15 @@ class LauncherUI:
 		self.last_playtime_poll = time.monotonic()
 		self.last_playtime_save = self.last_playtime_poll
 		self.playtime_poll_id = None
-		self._font_cache = {}
-		self._registered_font_paths = set()
-		self._font_family = "Friz Quadrata"
-		self.theme = GAME_THEMES[GAME_VERSIONS[0]]
+		self.theme = GAME_THEMES.get(self._initial_version, GAME_THEMES[GAME_VERSIONS[0]])
 		self.surfaces = []
+		yield "Loading fonts…", .3
 		self.register_friz_fonts()
 		self.refresh_friz_font()
+		self._startup_title.config(font=self.ui_font(26, bold=True))
+		self._startup_subtitle.config(font=self.ui_font(14, bold=True))
+		self._startup_status.config(font=self.ui_font(11, bold=True))
+		self._startup_hint.config(font=self.ui_font(9))
 		self.game_logos = {}
 		self.game_backgrounds = {}
 		self._background_cache = {}
@@ -1393,16 +1711,19 @@ class LauncherUI:
 		self._shaded_cache = {}
 		self._art_mask_cache = {}
 		self._news_page_cache = {}
+		yield "Loading artwork…", .45
 		self.fallback_logo = self.load_image(resource_path("wow_logo.png"), "RGBA", (1100, 340))
 		self.base_background = self.load_image(resource_path("image.png"), "RGBA", (2200, 1400))
-		self.active_art_version = GAME_VERSIONS[0]
+		self._load_startup_backdrop()
+		self._prepare_startup_art()
+		self.active_art_version = self._initial_version
 		self.displayed_background = None
 		self.options_button = None
 		self.background_transition_id = None
 		self.background_transition_generation = 0
 		self._slideshow_cache = {}   # screenshot set key -> loaded images
-		self.slideshow_key = SLIDESHOW_PREFIXES.get(GAME_VERSIONS[0], "")
-		self.slideshow_images = self.slideshow_for(GAME_VERSIONS[0])
+		self.slideshow_key = SLIDESHOW_PREFIXES.get(self._initial_version, "")
+		self.slideshow_images = self.slideshow_for(self._initial_version)
 		self.slideshow_index = 0
 		self.art_photo = None
 		self.current_art_frame = None
@@ -1413,11 +1734,12 @@ class LauncherUI:
 		self.background.place(relwidth=1, relheight=1)
 		self.background.bind("<Configure>", self.draw_background)
 
+		yield "Building the launcher…", .65
 		self.build_header()
 		self.build_hero()
 		self.build_footer()
 		self.updates = UpdateController(self, excluded=LOADER_VERSIONS)
-		if self.slideshow_images:
+		if self.slideshow_images and self.preferences["animations_enabled"]:
 			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
 		self.status = tk.Label(root, text="Launcher ready", bg=BG, fg=MUTED,
 							   font=self.ui_font(8))
@@ -1428,16 +1750,19 @@ class LauncherUI:
 		self.news_poll_id = self.root.after(250, self.poll_news_queue)
 
 		self._background_poll_id = self.root.after(30, self.poll_background_queue)
+		yield "Applying the game theme…", .82
 		self.update_install_status()
-		self.apply_theme(GAME_VERSIONS[0])
+		self.apply_theme(self.version.get())
 		self.update_game_copy()
+		self.switch_game_art(self.version.get())
+		yield "Loading news…", .95
 		self.load_game_news()
 		if self.discovered_versions:
 			if self.persist_settings():
 				games = ", ".join(self.discovered_versions)
 				self.set_status(f"New game installs detected: {games}")
-		if not self.setup_complete:
-			self.root.after(400, self.open_setup_wizard)
+		if self._startup_art_warning:
+			self.set_status(self._startup_art_warning)
 
 	def set_app_icon(self):
 		"""Set a crisp window/taskbar icon (Win32 API on Windows, PNG on Linux and when
@@ -1680,15 +2005,16 @@ class LauncherUI:
 
 		tk.Label(inner, text="GAME VERSION", bg="#211c18", fg=MUTED,
 				 font=self.ui_font(8, bold=True)).pack(anchor="w", pady=(2, 5))
-		self.version = tk.StringVar(value=GAME_VERSIONS[0])
+		self.version = tk.StringVar(value=self._initial_version)
 		self.version.trace_add("write", self.on_version_changed)
-		version_menu = tk.OptionMenu(inner, self.version, *self.game_versions)
+		version_menu = GameOptionMenu(inner, self.version, *self.game_versions)
 		version_menu.config(bg="#302922", fg=TEXT, activebackground="#51422c",
 						activeforeground=GOLD, relief="raised", bd=2,
 						font=self.ui_font(11, bold=True), anchor="w", padx=10)
 		version_menu["menu"].config(bg="#302922", fg=TEXT,
 								 activebackground="#806b42", activeforeground="white")
 		self.version_menu = version_menu
+		style_option_menu(version_menu, self.theme)
 		version_menu.pack(fill="x")
 
 		news = tk.Frame(inner, bg="#211c18", bd=0, highlightthickness=0, padx=0, pady=0)
@@ -1810,10 +2136,20 @@ class LauncherUI:
 		self.learned_clients = {}
 		self.tracked_clients = {}  # pid -> (game, create_time)
 		self.setup_complete = False
+		self.preferences = clean_preferences(None)
+		self.preferred_version = GAME_VERSIONS[0]
+		self.onboarding_hints_seen = set()
 		self.launch_args = {}   # game -> argument text passed to the client
 		self.armory = {}   # last lookup and saved character summaries; no API credentials
 		try:
 			data = read_settings_json(self.settings_path)
+			self.preferences = clean_preferences(data.get("preferences"))
+			preferred = data.get("preferred_version")
+			if isinstance(preferred, str):
+				self.preferred_version = preferred
+			seen = data.get("onboarding_hints_seen", [])
+			if isinstance(seen, list):
+				self.onboarding_hints_seen = {key for key in seen if isinstance(key, str)}
 			folders = data.get("game_paths", {})
 			saved_playtime = data.get("playtime_seconds", {})
 			if isinstance(saved_playtime, dict):
@@ -2227,6 +2563,9 @@ class LauncherUI:
 
 	def open_news_hub(self):
 		"""Open the all-games news home page with a game filter."""
+		if self.show_first_use_hint('News',
+			'Filter news by game and select an article to read it inside the launcher. News and article loading require an internet connection.', self.open_news_hub):
+			return
 		existing = getattr(self, "news_hub", None)
 		if existing is not None and existing.winfo_exists():
 			existing.lift()
@@ -2249,12 +2588,13 @@ class LauncherUI:
 			font=self.ui_font(7, bold=True)).pack(side="left", padx=(0, 6))
 		filter_var = tk.StringVar(value="ALL GAMES")
 		versions = ["ALL GAMES", *self.news_hub_versions()]
-		filter_menu = tk.OptionMenu(filter_frame, filter_var, *versions)
+		filter_menu = GameOptionMenu(filter_frame, filter_var, *versions)
 		filter_menu.config(bg=theme["control"], fg=theme["text"], activebackground=theme["control_active"],
 			activeforeground=theme["bright"], relief="raised", bd=1,
 			font=self.ui_font(8, bold=True), padx=8, pady=2)
 		filter_menu["menu"].config(bg=theme["control"], fg=theme["text"],
 			activebackground=theme["control_active"], activeforeground=theme["bright"])
+		style_option_menu(filter_menu, self.theme)
 		filter_menu.pack(side="left")
 
 		status = tk.Label(body, text="Loading news…", bg=theme["panel"], fg=theme["muted"],
@@ -2435,6 +2775,7 @@ class LauncherUI:
 		render()
 
 	def load_game_news(self, force=False):
+		self.schedule_news_refresh()
 		version = self.version.get()
 		self.news_generation += 1
 		generation = self.news_generation
@@ -2497,6 +2838,8 @@ class LauncherUI:
 			if generation != self.news_generation or version != self.version.get():
 				continue
 			self.render_game_news(version, articles, errors, matched)
+			self._startup_news_ready = True
+			self._finish_startup()
 		self.update_news_age()
 		self.news_poll_id = self.root.after(250, self.poll_news_queue)
 
@@ -3053,14 +3396,14 @@ class LauncherUI:
 		caption = version.upper()
 		if len(caption) > 22:
 			caption = caption[:21] + "\u2026"
-		self.playtime_total_caption.config(text=f"TOTAL \u00b7 {caption}")
+		self.playtime_total_caption.config(text=f"TOTAL \u00b7 {caption}" + (" · PAUSED" if self.preferences["playtime_paused"] else ""))
 		self.playtime_total_label.config(
 			text=self.format_total_time(self.playtime_seconds.get(version, 0)),
 			fg=self.theme["text"])
 
 	def record_playtime(self, version, seconds, end_timestamp=None):
 		"""Use monotonic elapsed seconds; split history at local midnight."""
-		if not math.isfinite(seconds) or seconds <= 0:
+		if self.preferences["playtime_paused"] or not math.isfinite(seconds) or seconds <= 0:
 			return
 		end = time.time() if end_timestamp is None else end_timestamp
 		cursor = end - seconds
@@ -3086,6 +3429,9 @@ class LauncherUI:
 
 	def open_playtime_viewer(self):
 		"""A responsive native graph; hover details stay inside the panel."""
+		if self.show_first_use_hint('Playtime',
+			'Playtime is recorded while this launcher is running and detects a game process. Keep the launcher open while playing to build your history.', self.open_playtime_viewer):
+			return
 		theme = dict(self.theme)
 		panel = theme["panel"]
 		window = Overlay(self.root, 860, 570)
@@ -3104,7 +3450,7 @@ class LauncherUI:
 		selected = tk.StringVar(value=self.version.get())
 		versions = list(dict.fromkeys(["All versions", *self.game_versions,
 			*self.playtime_seconds, *(name for values in self.playtime_history.values() for name in values)]))
-		menu = tk.OptionMenu(controls, selected, *versions, command=lambda _: draw())
+		menu = GameOptionMenu(controls, selected, *versions, command=lambda _: draw())
 		menu_font = self.ui_font(8)
 		# Reserve the longest title, so changing versions cannot squeeze other controls.
 		menu_width = math.ceil(max(menu_font.measure(name) for name in versions) /
@@ -3113,6 +3459,7 @@ class LauncherUI:
 			highlightthickness=0, font=menu_font, width=menu_width, anchor="w",
 			activebackground=theme["control_active"])
 		menu["menu"].config(bg=theme["control"], fg=theme["text"], font=self.ui_font(8))
+		style_option_menu(menu, self.theme)
 		menu.pack(side="left", padx=(0, 12))
 		state = {"days": 30, "end": date.today(), "timer": None, "series": []}
 		navigation = tk.Frame(body, bg=panel)
@@ -3305,6 +3652,9 @@ class LauncherUI:
 				"playtime_history": self.playtime_history,
 				"playtime_history_started": self.playtime_history_started,
 				"setup_complete": self.setup_complete,
+				"preferences": self.preferences,
+				"preferred_version": self.preferred_version,
+				"onboarding_hints_seen": sorted(self.onboarding_hints_seen),
 				"launch_args": self.launch_args,
 				"armory": self.armory,
 				"extras_enabled": sorted(self.enabled_extras),
@@ -3317,6 +3667,8 @@ class LauncherUI:
 		return True
 
 	def close_launcher(self):
+		self._closing = True
+		self.stop_tray()
 		self.updates.shutdown()
 		if self.running_version is not None:
 			self.record_playtime(self.running_version, max(0.0, time.monotonic() - self.last_playtime_poll))
@@ -3337,6 +3689,18 @@ class LauncherUI:
 		return self._font_cache[key]
 
 	def apply_theme(self, version, subtree=None):
+		# Destroy events for overlays also run while the entire launcher closes.
+		# Tk may have deleted the main dropdown's Menu before deleting the root.
+		if getattr(self, "_closing", False):
+			return
+		try:
+			if not self.root.winfo_exists():
+				return
+			if subtree is None and hasattr(self, "version_menu"):
+				if not self.version_menu.winfo_exists() or not self.version_menu["menu"].winfo_exists():
+					return
+		except tk.TclError:
+			return
 		self.theme = GAME_THEMES.get(version, GAME_THEMES[GAME_VERSIONS[0]])
 		color_roles = {color.casefold(): role
 					   for role, color in self.theme.items()}
@@ -3363,6 +3727,8 @@ class LauncherUI:
 						widget.configure(**{option: self.theme[role]})
 					except tk.TclError:
 						pass
+			if isinstance(widget, GameOptionMenu):
+				style_option_menu(widget, self.theme)
 			if isinstance(widget, StoneButton):
 				widget.redraw()
 
@@ -3452,10 +3818,9 @@ class LauncherUI:
 			return False
 		try:
 			# kCTFontManagerScopeProcess = 1. Returns False if already registered; harmless.
-			core_text.CTFontManagerRegisterFontsForURL(url, 1, None)
+			return bool(core_text.CTFontManagerRegisterFontsForURL(url, 1, None))
 		finally:
 			core_foundation.CFRelease(url)
-		return True
 
 	@staticmethod
 	def register_font_linux():
@@ -3483,6 +3848,7 @@ class LauncherUI:
 			"Friz Quadrata")
 		for font in self._font_cache.values():
 			font.configure(family=self._font_family)
+
 
 	def load_image(self, path, mode, max_size=None):
 		try:
@@ -3550,11 +3916,12 @@ class LauncherUI:
 	def compose_game_preview(self, version, size):
 		"""Fast interim backdrop; the full per-game art is composed off-thread afterward."""
 		width, height = size
-		if self.base_background is None:
+		source = self.game_backgrounds.get(version) or self.base_background
+		if source is None:
 			preview = Image.new("RGBA", size, self.theme["window"])
 		else:
 			preview = ImageOps.fit(
-				self.base_background, size, method=Image.Resampling.BILINEAR)
+				source, size, method=Image.Resampling.BILINEAR)
 		logo = self.game_logos.get(version) or self.fallback_logo
 		if logo is not None:
 			logo = logo.copy()
@@ -3656,6 +4023,9 @@ class LauncherUI:
 			start, end, self.art_transition_generation, 1, 5, self.art_text)
 
 	def advance_slideshow(self):
+		if not self.preferences["animations_enabled"]:
+			self.slideshow_after_id = None
+			return
 		if not self.slideshow_images or not self.root.winfo_exists():
 			return
 		self.slideshow_index = (self.slideshow_index + 1) % len(self.slideshow_images)
@@ -3674,6 +4044,11 @@ class LauncherUI:
 	def animate_slideshow_transition(self, start, end, generation, frame_index, steps,
 									 old_text):
 		if generation != self.art_transition_generation:
+			return
+		if not self.preferences["animations_enabled"]:
+			self.art_text, self.art_text_fade = self.slide_text(), 1
+			self.art_transitioning = False
+			self.render_art_frame(end)
 			return
 		t = frame_index / steps
 		if t < .5:
@@ -3797,6 +4172,18 @@ class LauncherUI:
 		self._background_requested = request
 		self.background_transition_generation += 1
 		generation = self.background_transition_generation
+		if self.background_transition_id is not None:
+			self.root.after_cancel(self.background_transition_id)
+			self.background_transition_id = None
+		self._background_frames = None
+		if self._background_future is not None:
+			self._background_future.cancel()
+		cached = self._background_cache.get(request)
+		if cached is not None:
+			# Startup prepares this exact image. Display it immediately, without
+			# relying on an async completion or briefly showing the fallback art.
+			self.draw_background_frame(cached)
+			return
 		old_background = self.displayed_background
 		if old_background is not None and old_background.size != size:
 			old_background = None
@@ -3815,7 +4202,7 @@ class LauncherUI:
 		def completed(result):
 			try:
 				new_background = result.result()
-				if old_background is None:
+				if old_background is None or not self.preferences["animations_enabled"]:
 					frames = (new_background,)
 				else:
 					frames = tuple(Image.blend(old_background, new_background, amount)
@@ -3874,7 +4261,41 @@ class LauncherUI:
 		self.version_menu.config(
 			fg=self.theme["text"] if selected_installed else self.theme["disabled"])
 
+	def show_first_use_hint(self, key, description, open_section):
+		"""Show a themed, dismissible tip once before entering a feature."""
+		if key in self.onboarding_hints_seen:
+			return False
+		window = Overlay(self.root, 600, 260)
+		body = window.make_body()
+		footer = tk.Frame(body, bg=self.theme["panel"])
+		footer.pack(side="bottom", fill="x", pady=(12, 0))
+		tk.Label(body, text=key.upper(), bg=self.theme["panel"], fg=self.theme["accent"],
+			font=self.ui_font(16, bold=True)).pack(anchor="w", pady=(0, 12))
+		tk.Label(body, text=description, bg=self.theme["panel"], fg=self.theme["text"],
+			font=self.ui_font(11), wraplength=520, justify="left").pack(anchor="w")
+		def continue_to_section():
+			self.onboarding_hints_seen.add(key)
+			self.persist_settings()
+			window.destroy()
+			self.root.after(50, open_section)
+		StoneButton(footer, text="GOT IT", command=continue_to_section,
+			font=self.ui_font(9, bold=True), padx=12, pady=4, bg=self.theme["panel"],
+			theme_provider=lambda: self.theme).pack(side="right")
+		StoneButton(footer, text="CLOSE", command=window.destroy,
+			font=self.ui_font(9, bold=True), padx=12, pady=4, bg=self.theme["panel"],
+			theme_provider=lambda: self.theme).pack(side="left")
+		return True
+
+	def tray_icon_path(self):
+		return resource_path("wowicon.png")
+
 	def open_options(self):
+		if self.show_first_use_hint("Options",
+			"General controls startup, news, animation, and tracking. Games manages paths and launch arguments. Addons manages backups. Data provides exports and reset controls.", self.open_options):
+			return
+		self.open_preferences(StoneButton, Overlay, GameOptionMenu, self.game_versions)
+
+	def open_game_options(self):
 		extra_height = 66  # how much the panel grows for each extra row
 		shown_extras = sum(1 for name in EXTRA_VERSIONS if name in self.enabled_extras)
 		window = Overlay(self.root, 820, 580 + extra_height * shown_extras)
@@ -3900,6 +4321,12 @@ class LauncherUI:
 		# Bottom first so it is never pushed off the panel: buttons, then the status line.
 		footer = tk.Frame(body, bg="#211c18")
 		footer.pack(fill="x", side="bottom", pady=(10, 0))
+		setup_controls = tk.Frame(body, bg="#211c18")
+		setup_controls.pack(side="bottom", fill="x", pady=(8, 0))
+		def reopen_setup():
+			window.destroy()
+			self.root.after(50, self.open_setup_wizard)
+		stone(setup_controls, "SHOW WELCOME / RUN SETUP AGAIN", reopen_setup).pack(side="left")
 		options_status = tk.Label(body, text="Settings are saved on this computer.",
 								  bg="#211c18", fg=MUTED, font=self.ui_font(8), anchor="w")
 		options_status.pack(fill="x", side="bottom", pady=(8, 0))
@@ -4156,15 +4583,60 @@ class LauncherUI:
 			results.put(("done", checked, cancel.is_set()))
 
 	def open_setup_wizard(self):
-		"""First launch: search every drive for game installs and let the user confirm them."""
+		"""First launch: introduce the features, then confirm game locations."""
 		window = Overlay(self.root, 820, 680)
 
-		body = window.make_body()
-		tk.Label(body, text="FIRST-TIME SETUP", bg="#211c18", fg=GOLD,
+		shell = window.make_body()
+		welcome = tk.Frame(shell, bg="#211c18")
+		welcome.pack(fill="both", expand=True)
+		# Reserve navigation before packing the expanding feature grid. Tk's
+		# packer otherwise clips later siblings when fonts need more space.
+		welcome_footer = tk.Frame(welcome, bg="#211c18")
+		welcome_footer.pack(side="bottom", fill="x", pady=(10, 0))
+		tk.Frame(welcome_footer, bg="#51432f", height=1).pack(fill="x", pady=(0, 10))
+		tk.Label(welcome_footer, text="Next: find and confirm your game folders.",
+			bg="#211c18", fg=MUTED, font=self.ui_font(9)).pack(side="left")
+		tk.Label(welcome, text="WELCOME TO WOW LAUNCHER", bg="#211c18", fg=GOLD,
+			font=self.ui_font(18, bold=True)).pack(anchor="w", pady=(0, 6))
+		tk.Label(welcome, text="Your games, addons, characters, and news in one place.",
+			bg="#211c18", fg=TEXT, font=self.ui_font(10),
+			wraplength=740, justify="left").pack(anchor="w")
+		tk.Label(welcome, text="STEP 1 OF 3  ·  EXPLORE THE LAUNCHER", bg="#211c18",
+			fg=MUTED, font=self.ui_font(9, bold=True)).pack(anchor="w", pady=(16, 10))
+		features = (
+			("GAME VERSIONS", "Launch Forever, Retail, and Classic with separate settings for each game."),
+			("ADDON MANAGER", "Browse CurseForge and install, update, or enable addons for each game."),
+			("CHARACTER ARMORY", "Save characters and view gear, stats, achievements, and guilds where supported."),
+			("NEWS READER", "Read Blizzard news directly inside the launcher."),
+			("PLAYTIME", "Track time in each game and view your history in graphs."),
+			("GAME UPDATES", "Compare installed versions with Blizzard's data to check for updates."),
+			("GAME OPTIONS", "Set game folders and launch arguments, with a theme for each version."),
+			("INSTALLATION DETECTION", "Find installed games automatically or choose their folders on the next page."),
+		)
+		feature_grid = tk.Frame(welcome, bg="#211c18")
+		feature_grid.pack(fill="both", expand=True)
+		for column in range(2):
+			feature_grid.columnconfigure(column, weight=1, uniform="features")
+		for row_index in range(4):
+			feature_grid.rowconfigure(row_index, weight=1, uniform="feature_rows")
+		for index, (title, description) in enumerate(features):
+			card = tk.Frame(feature_grid, bg="#181614", padx=14, pady=9,
+				highlightthickness=1, highlightbackground="#51432f")
+			card.grid(row=index // 2, column=index % 2, sticky="nsew",
+				padx=(0, 6) if index % 2 == 0 else (6, 0), pady=(0, 8))
+			tk.Label(card, text=title, bg="#181614", fg=GOLD,
+				font=self.ui_font(11, bold=True), anchor="w").pack(fill="x")
+			tk.Label(card, text=description, bg="#181614", fg=TEXT,
+				font=self.ui_font(10), wraplength=320, justify="left", anchor="nw").pack(fill="x", pady=(7, 0))
+
+		ready_page = tk.Frame(shell, bg="#211c18")
+		starting_version = tk.StringVar(value="")
+		body = tk.Frame(shell, bg="#211c18")
+		tk.Label(body, text="GAME FILE LOCATIONS", bg="#211c18", fg=GOLD,
 				 font=self.ui_font(15, bold=True)).pack(anchor="w")
 		tk.Label(body,
-				 text="Welcome! The launcher is searching your drives for World of Warcraft "
-					  "installs. Review what it finds, and use BROWSE to pick any folder it misses.",
+				 text="STEP 2 OF 3  ·  The launcher is searching your drives for World of Warcraft "
+					  "installs. Review what it finds, and use BROWSE to select a game folder, not the executable.",
 				 bg="#211c18", fg="#c7baa0", font=self.ui_font(9),
 				 wraplength=740, justify="left").pack(anchor="w", pady=(3, 8))
 		tk.Frame(body, bg="#78613c", height=1).pack(fill="x", pady=(0, 6))
@@ -4195,7 +4667,7 @@ class LauncherUI:
 			rows[version] = (path_var, state_label)
 
 		state = {"cancel": threading.Event(), "queue": queue.Queue(),
-				 "scanning": False, "closed": False, "extras": {}}
+				 "scanning": False, "scan_started": False, "closed": False, "extras": {}}
 
 		def is_ready(version, path):
 			return bool(path) and self.find_executable(version, path) is not None
@@ -4260,6 +4732,7 @@ class LauncherUI:
 				window.after(100, poll)
 
 		def start_scan():
+			state["scan_started"] = True
 			state["cancel"] = threading.Event()
 			state["queue"] = queue.Queue()
 			state["scanning"] = True
@@ -4287,9 +4760,14 @@ class LauncherUI:
 					if not self.game_paths.get(name):
 						self.game_paths[name] = extra_path
 					self.enabled_extras.add(name)
+			chosen = starting_version.get() if save else ""
+			if chosen in rows and is_ready(chosen, rows[chosen][0].get().strip()):
+				self.preferred_version = chosen
 			self.setup_complete = True
 			window.destroy()
 			self.apply_setup_results()
+			if chosen and chosen == self.preferred_version:
+				self.version.set(chosen)
 
 		def on_continue():
 			if ready_count() == 0 and not messagebox.askyesno(
@@ -4297,15 +4775,61 @@ class LauncherUI:
 					"No valid game folders are selected yet. Continue anyway?\n\n"
 					"You can set them later from OPTIONS.", parent=window):
 				return
-			finish(True)
+			show_ready()
+
+		def show_ready():
+			state["cancel"].set()
+			state["queue"] = queue.Queue()
+			state["scanning"] = False
+			scan_button.set_label("SCAN AGAIN")
+			body.pack_forget()
+			for child in ready_page.winfo_children():
+				child.destroy()
+			ready_page.pack(fill="both", expand=True)
+			ready_footer = tk.Frame(ready_page, bg="#211c18")
+			ready_footer.pack(side="bottom", fill="x", pady=(12, 0))
+			StoneButton(ready_footer, text="BACK", command=show_locations,
+				font=self.ui_font(9, bold=True), padx=12, pady=4, bg="#211c18",
+				theme_provider=lambda: self.theme).pack(side="left")
+			StoneButton(ready_footer, text="OPEN LAUNCHER", command=lambda: finish(True),
+				font=self.ui_font(9, bold=True), padx=12, pady=4, bg="#211c18",
+				theme_provider=lambda: self.theme).pack(side="right")
+			tk.Label(ready_page, text="READY TO PLAY", bg="#211c18", fg=GOLD,
+				font=self.ui_font(18, bold=True)).pack(anchor="w", pady=(0, 8))
+			tk.Label(ready_page, text="STEP 3 OF 3  ·  CHOOSE YOUR STARTING GAME",
+				bg="#211c18", fg=MUTED, font=self.ui_font(9, bold=True)).pack(anchor="w", pady=(0, 14))
+			installed = [name for name, (variable, _) in rows.items() if is_ready(name, variable.get().strip())]
+			if starting_version.get() not in installed:
+				starting_version.set(self.preferred_version if self.preferred_version in installed else (installed[0] if installed else ""))
+			tk.Label(ready_page, text=f"{len(installed)} game installation(s) ready. " +
+				("Choose which game to show when the launcher opens." if installed else "You can add game folders later in OPTIONS."),
+				bg="#211c18", fg=TEXT, font=self.ui_font(10), wraplength=740, justify="left").pack(anchor="w", pady=(0, 12))
+			for name in installed:
+				row = tk.Frame(ready_page, bg="#181614", padx=10, pady=7, highlightthickness=1, highlightbackground="#51432f")
+				row.pack(fill="x", pady=3)
+				tk.Radiobutton(row, text=name, variable=starting_version, value=name,
+					bg="#181614", fg=TEXT, selectcolor="#302922", activebackground="#181614",
+					activeforeground=GOLD, font=self.ui_font(11, bold=True), anchor="w").pack(fill="x")
+				tk.Label(row, text=short_path(rows[name][0].get().strip()), bg="#181614", fg=MUTED,
+					font=self.ui_font(9), anchor="w", wraplength=700, justify="left").pack(fill="x", padx=(22, 0))
+			tk.Label(ready_page, text="You can revisit setup from OPTIONS at any time.", bg="#211c18", fg=MUTED,
+				font=self.ui_font(9)).pack(anchor="w", pady=(16, 0))
+			self.apply_theme(self.version.get(), subtree=window)
+
+		def show_welcome():
+			body.pack_forget()
+			welcome.pack(fill="both", expand=True)
 
 		footer = tk.Frame(body, bg="#211c18")
 		footer.pack(fill="x", side="bottom", pady=(12, 0))
+		StoneButton(footer, text="BACK", command=show_welcome,
+					font=self.ui_font(8, bold=True), padx=8, pady=4, bg="#211c18",
+					theme_provider=lambda: self.theme).pack(side="left", padx=(0, 8))
 		scan_button = StoneButton(footer, text="STOP SEARCH", command=toggle_scan,
 					font=self.ui_font(8, bold=True), padx=8, pady=4, bg="#211c18",
 					theme_provider=lambda: self.theme)
 		scan_button.pack(side="left")
-		StoneButton(footer, text="CONTINUE", command=on_continue,
+		StoneButton(footer, text="NEXT: READY TO PLAY", command=on_continue,
 					font=self.ui_font(9, bold=True), padx=12, pady=4, bg="#211c18",
 					theme_provider=lambda: self.theme).pack(side="right")
 		StoneButton(footer, text="SKIP", command=lambda: finish(False),
@@ -4313,11 +4837,27 @@ class LauncherUI:
 					theme_provider=lambda: self.theme).pack(side="right", padx=(0, 6))
 
 		window.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+		window.bind("<Escape>", lambda _event: finish(False))
+		def on_setup_destroyed(event):
+			if event.widget is window:
+				state["closed"] = True
+				state["cancel"].set()
+		window.bind("<Destroy>", on_setup_destroyed, add="+")
 		for path_var, _label in rows.values():
 			path_var.trace_add("write", refresh_states)
-		self.style_popup(window, body)
+
+		def show_locations():
+			ready_page.pack_forget()
+			welcome.pack_forget()
+			body.pack(fill="both", expand=True)
+			if not state["scan_started"]:
+				start_scan()
+
+		StoneButton(welcome_footer, text="NEXT: GAME LOCATIONS", command=show_locations,
+			font=self.ui_font(9, bold=True), padx=12, pady=5, bg="#211c18",
+			theme_provider=lambda: self.theme).pack(side="right")
+		self.style_popup(window, shell)
 		self.apply_theme(self.version.get(), subtree=window)
-		start_scan()
 
 	def apply_setup_results(self):
 		"""Refresh the version list and selection after first-time setup."""
@@ -4444,7 +4984,7 @@ class LauncherUI:
 		width, height = event.width, event.height
 		if width <= 1 or height <= 1:
 			return
-		self.active_art_version = self.version.get() if hasattr(self, "version") else GAME_VERSIONS[0]
+		self.active_art_version = self.version.get() if hasattr(self, "version") else self._initial_version
 		self.switch_game_art(self.active_art_version)
 
 	def draw_art(self, event):
@@ -4599,6 +5139,9 @@ class LauncherUI:
 			self.open_directory(directory / "Interface" / "AddOns", "AddOns")
 
 	def open_addon_manager(self):
+		if self.show_first_use_hint('Addons',
+			'Addon installs, updates, and enable/disable changes apply to the selected game version. Check the version before making changes.', self.open_addon_manager):
+			return
 		directory = self.selected_game_directory()
 		if directory is not None:
 			AddonManager(self, directory / "Interface" / "AddOns",
@@ -4618,9 +5161,10 @@ class LauncherUI:
 		top.pack(fill="x", pady=(0, 8))
 		tk.Label(top, text="GAME CONFIG", bg=panel, fg=self.theme["accent"],
 			font=self.ui_font(15, bold=True)).pack(side="left")
-		menu = tk.OptionMenu(top, selected, *paths, command=lambda _: load())
+		menu = GameOptionMenu(top, selected, *paths, command=lambda _: load())
 		menu.config(bg=self.theme["control"], fg=self.theme["text"],
 			font=self.ui_font(9), bd=0, highlightthickness=0)
+		style_option_menu(menu, self.theme)
 		menu.pack(side="right")
 		footer = tk.Frame(body, bg=panel)
 		footer.pack(side="bottom", fill="x", pady=(10, 0))
@@ -4692,6 +5236,9 @@ class LauncherUI:
 
 	def open_armory(self):
 		"""Look up an official character, or open the private server's live armory."""
+		if self.show_first_use_hint('Armory',
+			'Choose a supported game version, region, realm, and character name to look up a character. Armory availability varies by game version; saved characters can be revisited later.', self.open_armory):
+			return
 		if self.version.get() == "Crusader Storm":
 			webbrowser.open(CRUSADER_STORM_ARMORY_URL)
 			return
@@ -4699,7 +5246,7 @@ class LauncherUI:
 		selected_version = self.version.get()
 		version_var = tk.StringVar(master=self.root, value=selected_version if selected_version in ARMORY_VERSIONS else "Retail")
 		panel = self.theme["panel"]
-		window = Overlay(self.root, 860, 420)
+		window = Overlay(self.root, 1020, 420)
 		body = window.make_body()
 		body.config(bg=panel)
 		search_page = tk.Frame(body, bg=self.theme["panel"])
@@ -4720,7 +5267,7 @@ class LauncherUI:
 			widgets = [window]
 			for widget in widgets:
 				widgets.extend(widget.winfo_children())
-				if isinstance(widget, (tk.OptionMenu, tk.Entry)):
+				if isinstance(widget, tk.Entry):
 					widget.configure(highlightthickness=1, highlightbackground=self.theme["border"],
 						highlightcolor=self.theme["accent"], bd=0, relief="flat")
 				if getattr(widget, "_armory_outline", False):
@@ -4747,13 +5294,14 @@ class LauncherUI:
 		top.pack(fill="x", pady=(0, 12))
 		tk.Label(top, text="CHARACTER ARMORY", bg=panel, fg=self.theme["accent"],
 				 font=self.ui_font(15, bold=True)).pack(side="left")
-		version_menu = tk.OptionMenu(top, version_var,
+		version_menu = GameOptionMenu(top, version_var,
 			*(version for version in dict.fromkeys((*GAME_VERSIONS, *self.game_versions))
 			  if version in ARMORY_VERSIONS),
 			command=lambda _value: sync_version())
 		version_menu.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
 			relief="flat", bd=0, highlightthickness=0, font=self.ui_font(9), padx=10, pady=4)
+		style_option_menu(version_menu, self.theme)
 		version_menu.pack(side="right")
 
 		search_card = tk.Frame(search_page, bg=self.theme["surface"], padx=14, pady=12)
@@ -4770,12 +5318,13 @@ class LauncherUI:
 		tk.Label(region_box, text="Region", bg=self.theme["surface"], fg=self.theme["muted"],
 			font=self.ui_font(8, bold=True), anchor="w").pack(anchor="w", pady=(0, 6))
 		region_var = tk.StringVar(value=saved.get("region", "us") if saved.get("region", "us") in REGIONS else "us")
-		region_entry = tk.OptionMenu(region_box, region_var, *REGIONS)
+		region_entry = GameOptionMenu(region_box, region_var, *REGIONS)
 		region_entry.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
 			font=self.ui_font(9), relief="flat", bd=0, highlightthickness=0, padx=10, pady=5)
 		region_entry["menu"].config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"])
+		style_option_menu(region_entry, self.theme)
 		region_entry.pack(fill="x")
 		name_box.grid(row=0, column=0, sticky="ew", padx=(0, 12))
 		realm_box.grid(row=0, column=1, sticky="ew", padx=(0, 12))
@@ -4804,10 +5353,11 @@ class LauncherUI:
 		library_row = tk.Frame(saved_card, bg=self.theme["surface"])
 		library_row.pack(fill="x")
 		saved_var = tk.StringVar(value="No saved characters")
-		character_picker = tk.OptionMenu(library_row, saved_var, "No saved characters")
+		character_picker = GameOptionMenu(library_row, saved_var, "No saved characters")
 		character_picker.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
 			relief="flat", bd=0, highlightthickness=0, anchor="w", font=self.ui_font(9), padx=8, pady=5)
+		style_option_menu(character_picker, self.theme)
 		character_picker.pack(side="left", fill="x", expand=True, padx=(0, 10))
 		remove_button = stone(library_row, "REMOVE", lambda: remove_character(), pady=2)
 		remove_button.pack(side="right")
@@ -4848,23 +5398,28 @@ class LauncherUI:
 
 		profile_summary = tk.Frame(character_page, bg=panel)
 		profile_summary.pack(fill="x", pady=(0, 6))
-		tab_row = tk.Frame(character_page, bg=panel)
-		tab_row.pack(fill="x", pady=(0, 2))
+		viewer_layout = tk.Frame(character_page, bg=panel)
+		viewer_layout.pack(fill="both", expand=True, pady=(6, 4))
+		tab_row = tk.Frame(viewer_layout, bg=self.theme["surface"], width=138, padx=8, pady=12)
+		tab_row.pack(side="left", fill="y", padx=(0, 12))
+		tab_row.pack_propagate(False)
+		tk.Label(tab_row, text="CHARACTER", bg=self.theme["surface"], fg=self.theme["muted"],
+			font=self.ui_font(7), anchor="w").pack(fill="x", pady=(0, 10))
 		tab_buttons = {}
 		for title in ("Overview", "Equipment", "Stats", "Professions", "Guild", "Achievements"):
 			button = tk.Label(tab_row, text=title, bg=panel, fg=self.theme["muted"],
-				font=self.ui_font(9, bold=True), padx=12, pady=7, cursor="hand2", takefocus=True)
-			button.set_label = lambda text, target=button: target.config(text=text)
+				font=self.ui_font(9, bold=True), anchor="w", padx=8, pady=10, cursor="hand2", takefocus=True)
+			button.set_label = lambda text, target=button: target.config(text={"Overview": "Summary", "Stats": "Statistics"}.get(text, text))
 			button.bind("<Button-1>", lambda _event, value=title: switch_tab(value))
 			button.bind("<Return>", lambda _event, value=title: switch_tab(value))
 			button.bind("<space>", lambda _event, value=title: switch_tab(value))
 			button.bind("<FocusIn>", lambda _event, target=button: target.config(highlightthickness=1, highlightbackground=self.theme["accent"]))
 			button.bind("<FocusOut>", lambda _event, target=button: target.config(highlightthickness=0))
-			button.pack(side="left", padx=(0, 3))
+			button.pack(fill="x", pady=(0, 4))
 			tab_buttons[title] = button
 
-		detail_area = tk.Frame(character_page, bg=panel)
-		detail_area.pack(fill="both", expand=True, pady=(6, 4))
+		detail_area = tk.Frame(viewer_layout, bg=panel)
+		detail_area.pack(side="left", fill="both", expand=True)
 		results = tk.Frame(detail_area, bg=panel)
 		results.pack(fill="both", expand=True)
 		filter_var = tk.StringVar(value="")
@@ -4932,7 +5487,7 @@ class LauncherUI:
 			for title, button in tab_buttons.items():
 				button.pack_forget()
 				if support.get(title, True):
-					button.pack(side="left", padx=(0, 3))
+					button.pack(fill="x", pady=(0, 4))
 					visible.append(title)
 			if state["tab"] not in visible:
 				state["tab"] = "Overview"
@@ -4944,58 +5499,46 @@ class LauncherUI:
 			state["result"] = result
 			support = refresh_section_tabs()
 			state["categories"], state["category_pending"] = {}, set()
+			state["achievement_selected"], state["achievement_page"] = "summary", 0
 			state["url"] = result.get("profile_url", "")
+			portrait_bytes = avatar.get("avatar") if isinstance(avatar, dict) else avatar
 			photo = None
-			if avatar:
+			if portrait_bytes:
 				try:
-					image = Image.open(io.BytesIO(avatar)).convert("RGBA")
+					image = Image.open(io.BytesIO(portrait_bytes)).convert("RGBA")
 					image = ImageOps.fit(image, (64, 64), method=Image.Resampling.LANCZOS)
 					image.putalpha(make_rounded_mask(64, 64, 8))
 					photo = ImageTk.PhotoImage(image, master=self.root)
 				except (OSError, ValueError):
 					photo = None
 			state["photo"] = photo   # keep a reference or Tk drops the image
-			header = tk.Frame(profile_summary, bg=self.theme["surface"], padx=16, pady=8)
+			state["character_image_bytes"] = avatar.get("render") if isinstance(avatar, dict) else None
+			if isinstance(avatar, dict):
+				avatar = avatar.get("avatar")
+			header = tk.Frame(profile_summary, bg=self.theme["panel"], padx=4, pady=6)
 			header.pack(fill="x")
-			if photo is not None:
-				tk.Label(header, image=photo, bg=self.theme["surface"], bd=0).pack(side="left", padx=(0, 12))
-			titles = tk.Frame(header, bg=self.theme["surface"])
+			item_level = tk.Frame(header, bg=self.theme["panel"])
+			item_level.pack(side="right", padx=(16, 4))
+			tk.Label(item_level, text=str(result.get("item_level") or "—"), bg=self.theme["panel"],
+				fg=self.theme["bright"], font=self.ui_font(28), anchor="e").pack(anchor="e")
+			tk.Label(item_level, text="EQUIPPED ITEM LEVEL", bg=self.theme["panel"],
+				fg=self.theme["muted"], font=self.ui_font(7)).pack(anchor="e")
+			titles = tk.Frame(header, bg=self.theme["panel"])
 			titles.pack(side="left", fill="x", expand=True)
-			tk.Label(titles, text=result["name"], bg=self.theme["surface"], fg=self.theme["accent"], anchor="w",
-					 font=self.ui_font(20, bold=True)).pack(anchor="w")
-			level = f"Level {result['level']} " if result.get("level") else ""
-			summary = " ".join(part for part in (
-				result.get("race"), result.get("spec"), result.get("class")) if part)
-			tk.Label(titles, text=(level + summary).strip(), bg=self.theme["surface"], fg=self.theme["text"],
-					 anchor="w", font=self.ui_font(10)).pack(anchor="w")
-			tk.Label(titles, text=f"{result['realm']}  •  {result['region'].upper()}  •  {result['version']}",
-				bg=self.theme["surface"], fg=self.theme["muted"], anchor="w",
-				font=self.ui_font(8)).pack(anchor="w", pady=(4, 0))
-			self.style_popup_row(header)
-			metrics = tk.Frame(profile_summary, bg=self.theme["panel"])
-			metrics.pack(fill="x", pady=(3, 0))
-			for column, (label, value) in enumerate((
-				("ITEM LEVEL", result.get("item_level")),
-				*([("ACHIEVEMENTS", result.get("achievement_points"))] if support["Achievements"] else []),
-				("FACTION", result.get("faction")),
-				("GUILD", result.get("guild")))):
-				metrics.columnconfigure(column, weight=1, uniform="metrics")
-				card = tk.Frame(metrics, bg=self.theme["surface"], padx=12, pady=5)
-				card.grid(row=0, column=column, sticky="nsew", padx=(0, 6))
-				tk.Label(card, text=label, bg=self.theme["surface"], fg=self.theme["muted"],
-					font=self.ui_font(7, bold=True), anchor="w").pack(fill="x")
-				value_row = tk.Frame(card, bg=self.theme["surface"])
-				value_row.pack(fill="x", pady=(3, 0))
-				if label == "GUILD" and value:
-					guild_image = stat_icon("Guild")
-					guild_badge = tk.Label(value_row, image=guild_image, bg=self.theme["surface"], bd=0)
-					guild_badge.image = guild_image
-					guild_badge.pack(side="left", padx=(0, 6))
-					request_icon("ui-icon", UI_ICON_REFS["guild"]["guild"], guild_badge, size=24)
-				tk.Label(value_row, text=str(value) if value not in (None, "") else "Unavailable",
-					bg=self.theme["surface"], fg=self.theme["text"], anchor="w",
-					wraplength=130 if label == "GUILD" else 160, font=self.ui_font(10, bold=True)).pack(side="left", fill="x", expand=True)
-				self.style_popup_row(card)
+			tk.Label(titles, text=result["name"], bg=self.theme["panel"], fg=self.theme["bright"],
+				font=self.ui_font(28), anchor="w").pack(anchor="w")
+			identity_line = " • ".join(str(value) for value in (
+				f"Level {result['level']}" if result.get("level") else None,
+				" ".join(value for value in (result.get("race"), result.get("spec"), result.get("class")) if value),
+				result.get("realm")) if value)
+			tk.Label(titles, text=identity_line, bg=self.theme["panel"], fg=self.theme["accent"],
+				font=self.ui_font(9), anchor="w", wraplength=680).pack(anchor="w")
+			context = " • ".join(str(value) for value in (result.get("guild"), result.get("faction"),
+				f"{result['achievement_points']} achievement points" if result.get("achievement_points") is not None else None,
+				result.get("version")) if value)
+			tk.Label(titles, text=context, bg=self.theme["panel"], fg=self.theme["muted"],
+				font=self.ui_font(8), anchor="w", wraplength=680).pack(anchor="w", pady=(3, 0))
+			tk.Frame(profile_summary, bg=self.theme["border"], height=1).pack(fill="x", pady=(5, 0))
 			search_row = tk.Frame(results, bg=self.theme["panel"])
 			search_row.pack(fill="x", side="bottom", pady=(2, 0))
 			view_note = tk.Label(search_row, text="", bg=self.theme["panel"], fg=self.theme["muted"], font=self.ui_font(7))
@@ -5019,6 +5562,8 @@ class LauncherUI:
 		def switch_tab(title):
 			support = refresh_section_tabs()
 			state["tab"] = title if support.get(title, True) else "Overview"
+			if title == "Achievements":
+				state["achievement_selected"], state["achievement_page"] = "summary", 0
 			filter_var.set("")
 			if state["result"]:
 				render_details()
@@ -5038,6 +5583,7 @@ class LauncherUI:
 			content = state.get("content")
 			if not content or not content.winfo_exists() or not state["result"]:
 				return
+			state["size"] = (content.winfo_width(), content.winfo_height())
 			self.clear_children(content)
 			refresh_section_tabs()
 			result, title = state["result"], state["tab"]
@@ -5061,20 +5607,11 @@ class LauncherUI:
 			if title == "Guild":
 				render_guild(content, result)
 				return
+			state["size"] = (content.winfo_width(), content.winfo_height())
 			if title == "Overview":
-				rows = [("Game version", result.get("version")), ("Realm", result.get("realm")),
-					("Region", result.get("region", "").upper()), ("Race", result.get("race")),
-					("Class", result.get("class")), ("Specialization", result.get("spec")),
-					("Level", result.get("level")), ("Last login", result.get("last_login")),
-					*result.get("extras", [])]
-				# Keep PvP totals visible for fresh lookups and saved snapshots.
-				existing_labels = {caption for caption, _ in rows}
-				for caption, value in result.get("details", {}).get("progress", []):
-					if caption in ("Honorable kills", "Honor level") and caption not in existing_labels:
-						rows.append((caption, value))
-						existing_labels.add(caption)
-			else:
-				rows = result.get("details", {}).get(title.lower(), [])
+				render_character_stage(content, result)
+				return
+			rows = result.get("details", {}).get(title.lower(), [])
 			query_text = filter_var.get().strip().casefold()
 			if query_text:
 				rows = [(caption, value) for caption, value in rows if query_text in f"{caption} {value}".casefold()]
@@ -5167,6 +5704,98 @@ class LauncherUI:
 				label.bind("<Leave>", lambda _event: hide_tooltip())
 				label.bind("<ButtonPress-1>", lambda _event: hide_tooltip())
 				label.bind("<Destroy>", lambda event: cancel_source_tooltip(event.widget))
+
+		def render_character_stage(content, result):
+			"""Equipment silhouettes around the supplied character render or portrait."""
+			bg = self.theme["surface"]
+			stage = tk.Frame(content, bg=bg)
+			stage.pack(fill="both", expand=True)
+			width, height = max(300, content.winfo_width()), max(220, content.winfo_height())
+			left = ("Head", "Neck", "Shoulder", "Back", "Chest", "Shirt", "Tabard", "Wrist")
+			right = ("Hands", "Waist", "Legs", "Feet", "Finger 1", "Finger 2", "Trinket 1", "Trinket 2")
+			bottom = ("Main Hand", "Off Hand", "Ranged")
+			aliases = {"shoulders": "shoulder", "wrists": "wrist", "hand": "hands",
+				"mainhand": "main hand", "offhand": "off hand", "secondary hand": "off hand",
+				"ring 1": "finger 1", "ring 2": "finger 2", "cloak": "back"}
+			items = {}
+			for caption, detail in result.get("details", {}).get("equipment", []):
+				key = aliases.get(caption.casefold(), caption.casefold())
+				if key in ("finger", "ring", "trinket"):
+					base = "finger" if key == "ring" else key
+					key = base + (" 1" if base + " 1" not in items else " 2")
+				items[key] = (caption, str(detail))
+			query = filter_var.get().strip().casefold()
+			def slot(parent, title, side=None):
+				entry = items.get(title.casefold())
+				caption, detail = entry or (title, "No equipment reported for this slot.")
+				quality = next((color for word, color in (("legendary", "#ff8000"), ("epic", "#a335ee"),
+					("rare", "#0070dd"), ("uncommon", "#1eff00")) if word in detail.casefold()), self.theme["border"])
+				if query and query not in (caption + " " + detail).casefold():
+					quality = self.theme["disabled"]
+				icon_box = tk.Frame(parent, width=32, height=32, bg=self.theme["control"])
+				icon_box.pack(side=side or "top", padx=6 if side else 0)
+				icon = tk.Label(icon_box, text="◇" if entry else "·", bg=self.theme["control"],
+					fg=self.theme["muted"], font=self.ui_font(18), bd=0,
+					highlightthickness=1, highlightbackground=quality, cursor="hand2" if entry else "")
+				icon.place(x=0, y=0, width=32, height=32)
+				ref = result.get("icon_refs", {}).get("equipment", {}).get(caption)
+				if isinstance(ref, dict):
+					request_icon(ref.get("kind"), ref.get("id"), icon, size=30)
+				tk.Label(parent, text=title, bg=bg, fg=self.theme["text"],
+					font=self.ui_font(10), anchor="e" if side == "right" else "w" if side else "center").pack(
+					fill="x", expand=bool(side))
+				icon.bind("<Enter>", lambda event, target=icon, heading=caption, text=detail: queue_tooltip(target, heading, text))
+				icon.bind("<Leave>", lambda event: hide_tooltip())
+				icon.bind("<Destroy>", lambda event: cancel_source_tooltip(event.widget))
+			for titles, side in ((left, "left"), (right, "right")):
+				rail = tk.Frame(stage, bg=bg)
+				rail.place(relx=0 if side == "left" else 1, rely=0, anchor="nw" if side == "left" else "ne",
+					width=148, relheight=1, height=-62)
+				for index, title in enumerate(titles):
+					box = tk.Frame(rail, bg=bg)
+					box.place(relx=0, rely=index / len(titles), relwidth=1, relheight=1 / len(titles))
+					slot(box, title, side=side)
+			weapons = tk.Frame(stage, bg=bg)
+			weapons.place(relx=.5, rely=1, anchor="s", width=300, height=60)
+			for title in bottom:
+				box = tk.Frame(weapons, bg=bg, width=100)
+				box.pack(side="left", fill="y", expand=True)
+				slot(box, title)
+			center = tk.Frame(stage, bg=bg)
+			center.place(x=154, y=0, relwidth=1, width=-308, relheight=1, height=-66)
+			data = state.get("character_image_bytes")
+			if data:
+				try:
+					image = Image.open(io.BytesIO(data)).convert("RGBA")
+					# Blizzard renders include transparent canvas around the character.
+					# Fit the visible figure, allowing small source images to grow too.
+					bounds = image.getchannel("A").point(lambda alpha: 255 if alpha > 16 else 0).getbbox()
+					if bounds:
+						image = image.crop(bounds)
+					available_width = max(80, width - 320)
+					available_height = max(80, height - 76)
+					scale = min(available_width / image.width, available_height / image.height) * .94
+					image = image.resize((max(1, round(image.width * scale)),
+						max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
+					photo = ImageTk.PhotoImage(image, master=self.root)
+					label = tk.Label(center, image=photo, bg=bg, bd=0)
+					label.image = photo
+					label.place(relx=.5, rely=.5, anchor="center")
+					state["view_note"].config(text="Equipment • Hover over an item for its details")
+					return
+				except (OSError, ValueError, Image.DecompressionBombError):
+					pass
+			portrait = state.get("photo")
+			if portrait is not None:
+				tk.Label(center, image=portrait, bg=bg, bd=0).pack(pady=(28, 16))
+			tk.Label(center, text=result["name"], bg=bg, fg=self.theme["accent"],
+				font=self.ui_font(22)).pack(pady=(8, 4))
+			for value in (result.get("class"), result.get("guild"), result.get("realm")):
+				if value:
+					tk.Label(center, text=value, bg=bg, fg=self.theme["text"], font=self.ui_font(10)).pack(pady=3)
+			tk.Label(center, text="Full character image unavailable for this profile", bg=bg,
+				fg=self.theme["muted"], font=self.ui_font(8), wraplength=max(100, width - 200)).pack(pady=20)
+			state["view_note"].config(text="Equipment • Hover over an item for its details")
 
 		def profession_icon(name):
 			# Small vector-style symbols also work offline and with saved profiles.
@@ -5295,7 +5924,14 @@ class LauncherUI:
 						style.element_create(target, "from", "clam", source)
 				tree_area = ("Treeview.treearea", {"sticky": "nswe"})
 				table_padding = ("Treeview.padding", {"sticky": "nswe", "children": [tree_area]})
-				style.layout(style_name, [(field_element, {"sticky": "nswe", "children": [table_padding]})])
+				style.layout(style_name, [tree_area])
+				indicator_element = f"{style_name}.indicator"
+				if indicator_element not in elements:
+					style.element_create(indicator_element, "from", "clam", "Treeitem.indicator")
+				style.layout(style_name + ".Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+					(indicator_element, {"side": "left", "sticky": ""}),
+					("Treeitem.image", {"side": "left", "sticky": ""}),
+					("Treeitem.text", {"side": "left", "sticky": "nswe"})]})])
 				heading_text = ("Treeheading.text", {"sticky": "we"})
 				heading_image = ("Treeheading.image", {"side": "right", "sticky": ""})
 				heading_padding = ("Treeheading.padding", {"sticky": "nswe", "children": [heading_image, heading_text]})
@@ -5305,6 +5941,7 @@ class LauncherUI:
 				pass  # fall back to the installed platform layout if clam is unavailable
 			style.configure(style_name, background=self.theme["surface"], fieldbackground=self.theme["surface"],
 				foreground=self.theme["text"], borderwidth=0, relief="flat", padding=(8, 4), font=self.ui_font(9),
+				bordercolor=self.theme["surface"], lightcolor=self.theme["surface"], darkcolor=self.theme["surface"],
 				rowheight=max(rowheight, self.ui_font(9).metrics("linespace") + 12))
 			style.configure(style_name + ".Heading", background=self.theme["panel_alt"],
 				foreground=self.theme["muted"], relief="flat", borderwidth=0, padding=(10, 7),
@@ -5320,7 +5957,28 @@ class LauncherUI:
 			for column, caption, size in headings:
 				tree.heading(column, text=caption, anchor="w")
 				tree.column(column, width=size, minwidth=120, anchor="w")
-			scrollbar = ttk.Scrollbar(outline, orient="vertical", command=tree.yview)
+			# Match the slim, arrowless scrollbar used by the addon section.
+			# Clone clam elements locally so native Windows/macOS controls honor colors.
+			scroll_style = f"Armory{section}{id(window)}.Vertical.TScrollbar"
+			trough_element, thumb_element = scroll_style + ".trough", scroll_style + ".thumb"
+			try:
+				elements = style.element_names()
+				for target, source in ((trough_element, "Vertical.Scrollbar.trough"),
+					(thumb_element, "Vertical.Scrollbar.thumb")):
+					if target not in elements:
+						style.element_create(target, "from", "clam", source)
+				style.layout(scroll_style, [(trough_element, {"sticky": "ns", "children": [
+					(thumb_element, {"expand": "1", "sticky": "nswe"})]})])
+			except tk.TclError:
+				pass
+			flat, thumb = self.theme["surface"], self.theme["control_active"]
+			style.configure(scroll_style, background=thumb, troughcolor=flat, bordercolor=flat,
+				lightcolor=thumb, darkcolor=thumb, relief="flat", borderwidth=0,
+				width=10, arrowsize=10, gripcount=0)
+			for option in ("background", "lightcolor", "darkcolor"):
+				style.map(scroll_style, **{option: [("pressed", self.theme["accent"]),
+					("active", self.theme["accent_dark"])]})
+			scrollbar = ttk.Scrollbar(outline, orient="vertical", command=tree.yview, style=scroll_style)
 			scrollbar.pack(side="right", fill="y")
 			tree.config(yscrollcommand=scrollbar.set)
 			tree.pack(fill="both", expand=True)
@@ -5517,50 +6175,205 @@ class LauncherUI:
 
 		def render_achievements(content, result):
 			completed = result.get("achievement_records", [])
-			query_text = filter_var.get().strip().casefold()
-			state["view_note"].config(text="Search by achievement name or date" if query_text else "Click a category arrow to browse")
+			roots = [category for category in result.get("achievement_categories", [])
+				if not hidden_achievement_category(category, result)]
 			summary = tk.Frame(content, bg=self.theme["surface"], padx=12, pady=8)
 			summary.pack(fill="x", pady=(0, 8))
 			tk.Label(summary, text="Achievements", bg=self.theme["surface"], fg=self.theme["text"],
-				font=self.ui_font(11, bold=True)).pack(side="left")
-			tk.Label(summary, text=f"{result.get('achievement_points', '—')} points  •  {len(completed)} completed",
-				bg=self.theme["surface"], fg=self.theme["accent"], font=self.ui_font(9)).pack(side="right")
-			tree_area = tk.Frame(content, bg=self.theme["panel"])
-			tree_area.pack(fill="both", expand=True)
-			tree = section_tree(tree_area, "Achievements", ("completed",),
-				[("#0", "Achievement / Category", 520), ("completed", "Earned", 170)],
-				show="tree headings", rowheight=38)
-			tree.column("completed", width=170, minwidth=150, stretch=False)
-			tree.tag_configure("category", foreground=self.theme["accent"],
-				background=blend_hex(self.theme["surface"], self.theme["accent"], .10), font=self.ui_font(9, bold=True))
-			tree.tag_configure("alternate", background=self.theme["panel"])
+				font=self.ui_font(12, bold=True)).pack(side="left")
+			tk.Label(summary, text=f"{result.get('achievement_points', '—')} points  •  {len(completed)} earned",
+				bg=self.theme["surface"], fg=self.theme["accent"], font=self.ui_font(10)).pack(side="right")
+			def toggle_earned():
+				state["achievement_earned_only"] = not state.get("achievement_earned_only", False)
+				state["achievement_page"] = 0
+				earned_toggle.set_label("EARNED ONLY: ON" if state["achievement_earned_only"] else "EARNED ONLY: OFF")
+				draw()
+			earned_toggle = stone(summary,
+				"EARNED ONLY: ON" if state.get("achievement_earned_only", False) else "EARNED ONLY: OFF",
+				toggle_earned, pady=2)
+			earned_toggle.pack(side="left", padx=12)
+			layout = tk.Frame(content, bg=self.theme["panel"])
+			layout.pack(fill="both", expand=True)
+			navigation = tk.Frame(layout, bg=self.theme["surface"], width=180)
+			navigation.pack(side="left", fill="y", padx=(0, 10))
+			navigation.pack_propagate(False)
+			tree = section_tree(navigation, "AchievementCategories", (),
+				[("#0", "Categories", 170)], show="tree", rowheight=32)
+			tree.tag_configure("category", foreground=self.theme["accent"], font=self.ui_font(10))
 			tree.tag_configure("message", foreground=self.theme["muted"])
 			state["achievement_tree"] = tree
 			state["achievement_icon_nodes"], state["achievement_icon_requested"] = {}, set()
-			if query_text:
-				matches = [item for item in completed if query_text in f"{item['name']} {item['completed']}".casefold()]
-				for index, item in enumerate(matches):
-					add_achievement(tree, "", item, index)
-				if not matches:
-					tree.insert("", "end", text="No completed achievements match your search.", tags=("message",))
-				state["view_note"].config(text=f"{len(matches)} matching achievements")
-				return
-			roots = [category for category in result.get("achievement_categories", []) if not hidden_achievement_category(category, result)]
+			tree.insert("", "end", iid="summary", text="Summary", tags=("category",))
 			for category in roots:
 				add_category(tree, "", category)
-			tree.insert("", "end", iid="all-history", text=f"All completed achievements ({len(completed)})",
-				open=not roots, tags=("category",))
-			if completed:
-				state["achievement_icon_nodes"]["all-history"] = completed[0]["id"]
-			# Saved history is already available, so it needs no loading placeholder.
-			for index, item in enumerate(completed):
-				add_achievement(tree, "all-history", item, index)
-			if not completed:
-				tree.insert("all-history", "end", text="No completed achievements reported. Refresh to check for updates.", tags=("message",))
-			# Set focus before Tk's class binding opens the clicked disclosure arrow.
-			# On macOS the arrow can otherwise expand a row while leaving focus elsewhere.
+			tree.insert("", "end", iid="all-history", text="All earned", tags=("category",))
+			card_area = tk.Frame(layout, bg=self.theme["panel"])
+			card_area.pack(side="left", fill="both", expand=True)
+			canvas = tk.Canvas(card_area, bg=self.theme["panel"], bd=0, highlightthickness=0)
+			card_scroll = ttk.Scrollbar(card_area, orient="vertical", command=canvas.yview,
+				style=f"ArmoryAchievementCategories{id(window)}.Vertical.TScrollbar")
+			card_scroll.pack(side="right", fill="y")
+			canvas.configure(yscrollcommand=card_scroll.set)
+			canvas.pack(side="left", fill="both", expand=True)
+			cards = tk.Frame(canvas, bg=self.theme["panel"])
+			card_window = canvas.create_window((0, 0), window=cards, anchor="nw")
+			cards.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+			canvas.bind("<Configure>", lambda event: canvas.itemconfigure(card_window, width=event.width))
+			def scroll_cards(event):
+				if getattr(event, "num", None) in (4, 5):
+					steps = -1 if event.num == 4 else 1
+				else:
+					delta = getattr(event, "delta", 0)
+					if not delta:
+						return
+					steps = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+				canvas.yview_scroll(steps, "units")
+				return "break"
+			def bind_card_scroll(widget):
+				for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+					widget.bind(event, scroll_cards)
+				for child in widget.winfo_children():
+					bind_card_scroll(child)
+			bind_card_scroll(canvas)
+			selected = state.get("achievement_selected", "summary")
+			if not tree.exists(selected):
+				selected = "summary"
+			state["achievement_selected"] = selected
+			tree.selection_set(selected)
+			tree.focus(selected)
+			def choose(event=None):
+				selection = tree.selection()
+				if not selection:
+					return
+				key = selection[0]
+				if key not in ("summary", "all-history") and (not key.startswith("category:") or key.endswith(":placeholder")):
+					return
+				if state.get("achievement_selected") != key:
+					state["achievement_page"] = 0
+				state["achievement_selected"] = key
+				if key.startswith("category:"):
+					expand_category(tree, key)
+				draw()
+			def draw():
+				if not cards.winfo_exists():
+					return
+				self.clear_children(cards)
+				key = state.get("achievement_selected", "summary")
+				query = filter_var.get().strip().casefold()
+				rows, definitions = completed, {}
+				heading = "Recent Achievements" if key == "summary" else "All Earned Achievements"
+				message = None
+				if key.startswith("category:"):
+					identifier = int(key.split(":")[1])
+					heading = tree.item(key, "text")
+					data = state["categories"].get(identifier)
+					rows = []
+					if not data:
+						message = "Loading achievements…"
+					elif data.get("error"):
+						message = data["error"] + " Select the category again to retry."
+					else:
+						category = data.get("category") if isinstance(data.get("category"), dict) else data
+						def collect(category):
+							for definition in category.get("achievements", []) or []:
+								if isinstance(definition, dict):
+									item = definition.get("achievement") or definition
+									definitions[item.get("id")] = {**definition, **item}
+							for child in category.get("subcategories", category.get("sub_categories", [])) or []:
+								cached = state["categories"].get(child.get("id"))
+								if cached and not cached.get("error"):
+									collect(cached.get("category", cached))
+						collect(category)
+						earned_by_id = {item["id"]: item for item in completed}
+						rows = [{"id": identifier, "name": definition.get("name") or f"Achievement {identifier}",
+							"earned": identifier in earned_by_id, **earned_by_id.get(identifier, {})}
+							for identifier, definition in definitions.items() if isinstance(identifier, int)]
+						rows.sort(key=lambda item: (not item["earned"], -item.get("timestamp", 0), item["name"]))
+				if query:
+					# Search the entire earned history, independent of the selected category.
+					rows = [item for item in completed if query in f"{item['name']} {item.get('completed', '')}".casefold()]
+					heading, message = "Search Results", None
+				if state.get("achievement_earned_only", False):
+					rows = [item for item in rows if item.get("earned", True)]
+				tk.Label(cards, text=heading, bg=self.theme["panel"], fg=self.theme["accent"],
+					font=self.ui_font(11, bold=True), anchor="w").pack(fill="x", pady=(0, 6))
+				is_summary = key == "summary" and not query
+				capacity = 4 if is_summary else 10
+				page_count = max(1, (len(rows) + capacity - 1) // capacity)
+				page = 0 if is_summary else min(state.get("achievement_page", 0), page_count - 1)
+				state["achievement_page"] = page
+				visible = rows[:capacity] if is_summary else rows[page * capacity:(page + 1) * capacity]
+				for record in visible:
+					definition = definitions.get(record["id"], {})
+					earned = record.get("earned", True)
+					card_bg = blend_hex(self.theme["surface"], self.theme["accent"], .08) if earned else self.theme["surface"]
+					card = tk.Frame(cards, bg=card_bg, padx=8, pady=6,
+						highlightthickness=1, highlightbackground=self.theme["border"])
+					card.pack(fill="x", pady=(0, 6))
+					icon_box = tk.Frame(card, width=42, height=42, bg=card_bg)
+					icon_box.pack(side="left", padx=(0, 8))
+					icon = tk.Label(icon_box, text="★", bg=self.theme["control"], fg=self.theme["accent"], font=self.ui_font(18))
+					icon.place(x=0, y=0, width=42, height=42)
+					request_icon("achievement", record["id"], icon, size=40)
+					points = definition.get("points", record.get("points"))
+					badge = tk.Label(card, text=f"{points}\npoints" if points is not None else "✓\nEarned" if earned else "Not\nearned",
+						bg=self.theme["control"], fg=self.theme["accent"], font=self.ui_font(9), padx=6, pady=3)
+					badge.pack(side="right", padx=(8, 0))
+					text_area = tk.Frame(card, bg=card_bg)
+					text_area.pack(side="left", fill="both", expand=True)
+					tk.Label(text_area, text=record.get("completed") or ("Date unavailable" if earned else "Not earned"), bg=card_bg,
+						fg=self.theme["muted"], font=self.ui_font(9), anchor="e").pack(side="right", anchor="n", padx=(6, 0))
+					name = tk.Label(text_area, text=record["name"], bg=card_bg, fg=self.theme["text"] if earned else self.theme["muted"],
+						font=self.ui_font(10, bold=True), anchor="w", justify="left",
+						wraplength=max(100, content.winfo_width() - 430))
+					name.pack(fill="x")
+					description = definition.get("description") or record.get("description")
+					if description:
+						tk.Label(text_area, text=description, bg=card_bg, fg=self.theme["muted"], font=self.ui_font(9),
+							anchor="w", justify="left", wraplength=max(100, content.winfo_width() - 430)).pack(fill="x")
+					name.bind("<Enter>", lambda event, target=name, item=record, detail=description:
+						queue_tooltip(target, item["name"], detail or item.get("completed", "Earned")))
+					name.bind("<Leave>", lambda event: hide_tooltip())
+					name.bind("<Destroy>", lambda event: cancel_source_tooltip(event.widget))
+				if not visible:
+					tk.Label(cards, text=message or "No earned achievements in this view.", bg=self.theme["panel"],
+						fg=self.theme["muted"], font=self.ui_font(10), wraplength=max(140, content.winfo_width() - 230),
+						justify="left", anchor="w").pack(fill="x", pady=12)
+				if is_summary:
+					tk.Label(cards, text="Progress Overview", bg=self.theme["panel"], fg=self.theme["accent"],
+						font=self.ui_font(11, bold=True), anchor="w").pack(fill="x", pady=(6, 6))
+					tk.Label(cards, text=f"Achievements Earned     {len(completed)}", bg=self.theme["surface"],
+						fg=self.theme["text"], font=self.ui_font(10), padx=10, pady=6, anchor="w",
+						highlightthickness=1, highlightbackground=self.theme["border"]).pack(fill="x", pady=(0, 6))
+					grid = tk.Frame(cards, bg=self.theme["panel"])
+					grid.pack(fill="x")
+					for index, category in enumerate(roots[:6]):
+						button = tk.Button(grid, text=category.get("name", "Category"), bg=self.theme["surface"],
+							fg=self.theme["accent"], activebackground=self.theme["control"], activeforeground=self.theme["bright"],
+							font=self.ui_font(9), relief="flat", bd=0, highlightthickness=1,
+							highlightbackground=self.theme["border"], anchor="w", padx=8, pady=4,
+							command=lambda key=f"category:{category['id']}": tree.selection_set(key))
+						button.grid(row=index // 2, column=index % 2, sticky="ew", padx=3, pady=3)
+					grid.columnconfigure(0, weight=1, uniform="category")
+					grid.columnconfigure(1, weight=1, uniform="category")
+				elif page_count > 1:
+					controls = tk.Frame(cards, bg=self.theme["panel"])
+					controls.pack(fill="x", pady=4)
+					def move(delta):
+						state["achievement_page"] = max(0, min(page_count - 1, page + delta))
+						draw()
+					stone(controls, "PREVIOUS", lambda: move(-1), pady=2).pack(side="left")
+					tk.Label(controls, text=f"{page + 1} / {page_count}", bg=self.theme["panel"],
+						fg=self.theme["muted"], font=self.ui_font(9)).pack(side="left", padx=12)
+					stone(controls, "NEXT", lambda: move(1), pady=2).pack(side="right")
+				state["view_note"].config(text=f"{sum(item.get('earned', True) for item in rows)} earned • {len(rows)} listed • Select a category or use Find")
+				bind_card_scroll(cards)
+				canvas.yview_moveto(0)
+			state["draw_achievement_cards"] = draw
+			tree.bind("<<TreeviewSelect>>", choose)
 			tree.bind("<Button-1>", lambda event: focus_achievement_row(tree, event), add="+")
-			tree.bind("<<TreeviewOpen>>", lambda _event: expand_category(tree, tree.focus()))
+			tree.bind("<<TreeviewOpen>>", lambda event: expand_category(tree, tree.focus()))
+			choose()
 
 		def focus_achievement_row(tree, event):
 			row = tree.identify_row(event.y)
@@ -5628,24 +6441,19 @@ class LauncherUI:
 			clear_achievement_children(tree, key)
 			if data.get("error"):
 				tree.insert(key, "end", text=data["error"], tags=("message",))
-				tree.insert(key, "end", text="Close and reopen this category to retry.", tags=("message",))
+				tree.insert(key, "end", text="Select again to retry.", tags=("message",))
+				redraw = state.get("draw_achievement_cards")
+				if redraw:
+					redraw()
 				return
 			category = data.get("category") if isinstance(data.get("category"), dict) else data
 			children = [child for child in (category.get("subcategories", category.get("sub_categories", [])) or [])
 				if not hidden_achievement_category(child)]
 			for child in children:
 				add_category(tree, key, child)
-			ids = set()
-			for item in category.get("achievements", []) or []:
-				if isinstance(item, dict):
-					identifier = item.get("id") or (item.get("achievement") or {}).get("id")
-					if isinstance(identifier, int):
-						ids.add(identifier)
-			rows = [item for item in state["result"].get("achievement_records", []) if item["id"] in ids]
-			for index, item in enumerate(rows):
-				add_achievement(tree, key, item, index)
-			if not rows and not children:
-				tree.insert(key, "end", text="No completed achievements in this category.", tags=("message",))
+			redraw = state.get("draw_achievement_cards")
+			if redraw:
+				redraw()
 
 		def hide_tooltip():
 			state["hover_generation"] = state.get("hover_generation", 0) + 1
@@ -5793,7 +6601,10 @@ class LauncherUI:
 		def worker(generation, region, realm, name, version):
 			try:
 				result = lookup_character(region, realm, name, version=version)
-				state["queue"].put((generation, "ok", result, fetch_avatar(result.get("avatar_url"))))
+				state["queue"].put((generation, "ok", result, {"avatar": fetch_avatar(result.get("avatar_url"))}))
+				if result.get("render_url"):
+					data = fetch_avatar(result["render_url"])
+					state["queue"].put((generation, "render", data, None))
 			except ArmoryError as error:
 				state["queue"].put((generation, "error", str(error), error.url))
 			except Exception as error:
@@ -5847,6 +6658,11 @@ class LauncherUI:
 						apply_icon(key, data, watcher)
 					continue
 				if generation != state["generation"]:
+					continue
+				if kind == "render":
+					state["character_image_bytes"] = payload
+					if state["tab"] == "Overview":
+						render_details()
 					continue
 				if kind == "category":
 					category_id, data = payload
@@ -5912,10 +6728,14 @@ class LauncherUI:
 				hide_tooltip()
 				if state.get("icon_executor"):
 					state["icon_executor"].shutdown(wait=False, cancel_futures=True)
-				self.apply_theme(self.version.get())
 				for timer in (state.get("poll"), state.get("resize")):
 					if timer:
-						self.root.after_cancel(timer)
+						try:
+							self.root.after_cancel(timer)
+						except tk.TclError:
+							pass
+				state["poll"], state["resize"] = None, None
+				self.apply_theme(self.version.get())
 		body.bind("<Destroy>", cleanup, add="+")
 		sync_version()
 		state["poll"] = self.root.after(150, poll)
@@ -5955,6 +6775,7 @@ class LauncherUI:
 		self.set_status(f"Launching {version}" + (f" with {len(args)} argument(s)" if args else "") + "…")
 		if version in LOADER_VERSIONS:
 			self.watch_for_client(version, executable)
+		self.handle_launch_behavior()
 
 	def watch_for_client(self, version, loader):
 		"""After a loader launch, watch for the WoW client it starts (it may live outside

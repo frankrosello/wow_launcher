@@ -112,8 +112,10 @@ def _blizzard_result(profile, media, region, realm, name, version):
 	"""Turn raw Blizzard profile (+ optional media) JSON into the armory result dict."""
 	classic = version != "Retail"
 	avatar_url = None
+	render_url = None
 	try:
 		assets = {asset.get("key"): asset.get("value") for asset in media.get("assets", [])}
+		render_url = assets.get("main") or assets.get("main-raw") or assets.get("inset")
 		avatar_url = assets.get("avatar") or assets.get("inset") or next(iter(assets.values()), None)
 	except AttributeError:
 		pass   # the portrait is optional
@@ -143,6 +145,7 @@ def _blizzard_result(profile, media, region, realm, name, version):
 		"profile_url": (classic_armory_url(region) if classic else
 						armory_url(region, realm_name, profile.get("name") or name)),
 		"avatar_url": avatar_url,
+		"render_url": render_url,
 	}
 
 
