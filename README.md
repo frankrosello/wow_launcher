@@ -2,12 +2,12 @@
 
 <table>
   <tr>
-    <td><img width="1102" height="732" alt="image" src="https://github.com/user-attachments/assets/5eca758b-674a-400d-915f-94efa72e6fda" /></td>
-    <td><img width="1212" height="844" alt="Screenshot 2026-10-05 at 2 35 03 PM" src="https://github.com/user-attachments/assets/ad16fdc4-6569-4deb-98f9-57e15afef3c6" /></td>
+    <td width="50%"><img width="1102" height="732" alt="image" src="https://github.com/user-attachments/assets/fdb988ad-4ee6-4f5e-a4db-0871bf4b4a05" /></td>
+    <td width="50%"><img width="1212" height="844" alt="Screenshot 2026-10-05 at 2 35 03 PM" src="https://github.com/user-attachments/assets/ad16fdc4-6569-4deb-98f9-57e15afef3c6" /></td>
   </tr>
   <tr>
-    <td><img width="1212" height="844" alt="Screenshot 2026-10-05 at 3 27 19 PM" src="https://github.com/user-attachments/assets/6030f4be-82d4-4bdb-b65d-93908d60c5c4" /></td>
-    <td><img width="1212" height="844" alt="Screenshot 2026-10-05 at 3 28 08 PM" src="https://github.com/user-attachments/assets/3605f979-6da1-40df-af11-e775941d1062" /></td>
+    <td width="50%"><img width="1212" height="844" alt="Screenshot 2026-10-05 at 3 27 19 PM" src="https://github.com/user-attachments/assets/6030f4be-82d4-4bdb-b65d-93908d60c5c4" /></td>
+    <td width="50%"><img width="1212" height="844" alt="Screenshot 2026-10-05 at 3 28 08 PM" src="https://github.com/user-attachments/assets/3605f979-6da1-40df-af11-e775941d1062" /></td>
   </tr>
 </table>
 
