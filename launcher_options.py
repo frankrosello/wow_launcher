@@ -31,50 +31,120 @@ BACKUP_NAMES = ('AddOns', 'AddOns_Disabled', 'AddOns_curseforge.json',
 
 
 def install_overlay_animation(overlay_class):
-    """Animate the shared overlay class, including windows created by addons."""
+    """Animate shared overlays while preserving synchronous destroy/cleanup."""
     if getattr(overlay_class, '_opening_animation_installed', False):
         return
     original_init = overlay_class.__init__
+    original_destroy = overlay_class.destroy
 
     def animated_init(panel, root, *args, **kwargs):
         original_init(panel, root, *args, **kwargs)
         owner = root
         while owner is not None and not hasattr(owner, 'launcher'):
             owner = getattr(owner, 'master', None)
-        app = getattr(owner, 'launcher', None)
+        app = panel._animation_app = getattr(owner, 'launcher', None)
+        panel._opening_timer = None
         if app is None or not app.preferences.get('animations_enabled', True):
             return
         target_y = int(panel.place_info().get('y', 0))
         panel.place_configure(y=target_y + 14)
-        timer = {'id': None, 'start': None}
-
+        started = {'time': None}
         def cancel(event):
-            if event.widget is panel and timer['id'] is not None:
-                try:
-                    root.after_cancel(timer['id'])
-                except tk.TclError:
-                    pass
-                timer['id'] = None
-
+            if event.widget is panel and panel._opening_timer is not None:
+                root.after_cancel(panel._opening_timer)
+                panel._opening_timer = None
         def step():
-            timer['id'] = None
+            panel._opening_timer = None
             if not panel.winfo_exists() or panel.winfo_manager() != 'place':
                 return
-            if timer['start'] is None:
-                timer['start'] = time.monotonic()
-            progress = min(1.0, (time.monotonic() - timer['start']) / .18)
+            if started['time'] is None:
+                started['time'] = time.monotonic()
+            progress = min(1.0, (time.monotonic()-started['time'])/.18)
             if not app.preferences.get('animations_enabled', True):
                 progress = 1.0
-            # Ease out into the final position without resizing/repainting content.
-            offset = round(14 * (1.0 - progress) ** 3)
-            panel.place_configure(y=target_y + offset)
-            if progress < 1.0:
-                timer['id'] = root.after(16, step)
-
+            panel.place_configure(y=target_y + round(14*(1-progress)**3))
+            if progress < 1:
+                panel._opening_timer = root.after(16, step)
         panel.bind('<Destroy>', cancel, add='+')
-        timer['id'] = root.after_idle(step)
+        panel._opening_timer = root.after_idle(step)
+
+    def animated_destroy(panel):
+        app = getattr(panel, '_animation_app', None)
+        ancestor = panel.master
+        closing_parent = False
+        while ancestor is not None:
+            closing_parent = closing_parent or getattr(ancestor, '_closing_animation', False)
+            ancestor = getattr(ancestor, 'master', None)
+        if (app is None or getattr(app, '_closing', False) or closing_parent
+                or not app.preferences.get('animations_enabled', True)
+                or not panel.winfo_exists() or not panel.winfo_ismapped()):
+            return original_destroy(panel)
+        if getattr(panel, '_closing_animation', False):
+            return
+        panel._closing_animation = True
+        root = app.root
+        if getattr(panel, '_opening_timer', None) is not None:
+            root.after_cancel(panel._opening_timer)
+            panel._opening_timer = None
+        start_y = int(panel.place_info().get('y', 0))
+        started = time.monotonic()
+        finished = tk.BooleanVar(master=root, value=False)
+        timer = {'id': None}
+        # Catch clicks while closing, so a Save/Close action cannot run twice.
+        panel.focus_set()
+        def finish():
+            timer['id'] = None
+            if panel.winfo_exists():
+                original_destroy(panel)
+            finished.set(True)
+        def destroyed(event):
+            if event.widget is panel:
+                if timer['id'] is not None:
+                    root.after_cancel(timer['id'])
+                    timer['id'] = None
+                finished.set(True)
+        def step():
+            timer['id'] = None
+            if not panel.winfo_exists():
+                finished.set(True); return
+            progress = min(1, (time.monotonic()-started)/.14)
+            if getattr(app, '_closing', False) or not app.preferences.get('animations_enabled', True):
+                progress = 1
+            panel.place_configure(y=start_y+round(22*progress**2))
+            if progress >= 1:
+                finish()
+            else:
+                timer['id'] = root.after(16, step)
+        panel.bind('<Destroy>', destroyed, add='+')
+        # Consume mouse/key input through a temporary bindtag, preserving pixels.
+        tag = 'ClosingOverlay' + str(id(panel))
+        widgets = [panel]
+        for widget in widgets:
+            widgets.extend(widget.winfo_children())
+            widget.bindtags((tag, *widget.bindtags()))
+        for sequence in ('<ButtonPress>', '<ButtonRelease>', '<KeyPress>', '<KeyRelease>'):
+            panel.bind_class(tag, sequence, lambda _event: 'break')
+        timer['id'] = root.after(0, step)
+        try:
+            # Tk continues processing timers and repainting during this short wait.
+            # Callers still see a fully destroyed panel when destroy() returns.
+            root.wait_variable(finished)
+        except tk.TclError:
+            try:
+                if panel.winfo_exists():
+                    original_destroy(panel)
+            except tk.TclError:
+                pass  # the Tk application may already have shut down
+        finally:
+            if timer['id'] is not None:
+                try: root.after_cancel(timer['id'])
+                except tk.TclError: pass
+            for sequence in ('<ButtonPress>', '<ButtonRelease>', '<KeyPress>', '<KeyRelease>'):
+                try: panel.unbind_class(tag, sequence)
+                except tk.TclError: pass
 
     overlay_class.__init__ = animated_init
+    overlay_class.destroy = animated_destroy
     overlay_class._opening_animation_installed = True
 
 
@@ -246,6 +316,44 @@ def backup_addon_manager(base):
 
 
 class LauncherPreferencesMixin:
+    def animate_content(self, frame):
+        """Reveal a page with a lightweight cover, without moving its widgets."""
+        previous = getattr(frame, '_reveal_cover', None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+        if not self.preferences.get('animations_enabled', True) or self._closing:
+            return
+        cover = tk.Frame(frame, bg=frame.cget('bg'), bd=0, highlightthickness=0)
+        frame._reveal_cover = cover
+        cover.place(x=0, y=0, relwidth=1, relheight=1)
+        cover.lift()
+        state = {'timer': None, 'started': None}
+        def cleanup(event):
+            if event.widget is cover:
+                if state['timer'] is not None:
+                    self.root.after_cancel(state['timer'])
+                    state['timer'] = None
+                if getattr(frame, '_reveal_cover', None) is cover:
+                    frame._reveal_cover = None
+        def step():
+            state['timer'] = None
+            if not cover.winfo_exists():
+                return
+            if self._closing or not frame.winfo_ismapped():
+                cover.destroy(); return
+            if state['started'] is None:
+                state['started'] = time.monotonic()
+            progress = min(1, (time.monotonic()-state['started'])/.16)
+            if not self.preferences.get('animations_enabled', True):
+                progress = 1
+            if progress >= 1:
+                cover.destroy(); return
+            eased = 1-(1-progress)**3
+            cover.place_configure(rely=eased, relheight=1-eased)
+            state['timer'] = self.root.after(16, step)
+        cover.bind('<Destroy>', cleanup, add='+')
+        state['timer'] = self.root.after_idle(step)
+
     def schedule_news_refresh(self):
         timer = getattr(self, '_news_refresh_id', None)
         if timer is not None:
@@ -352,7 +460,7 @@ class LauncherPreferencesMixin:
             icon.stop()
 
     def open_preferences(self, button_class, overlay_class, dropdown_class, versions):
-        window = overlay_class(self.root, 900, 660)
+        window = overlay_class(self.root, 980, 680)
         body = window.make_body()
         theme = self.theme
         panel = theme['panel']
@@ -379,6 +487,7 @@ class LauncherPreferencesMixin:
         def select(name):
             for page in pages.values(): page.pack_forget()
             pages[name].pack(fill='both', expand=True)
+            self.animate_content(pages[name])
         for name in ('General', 'Games', 'Addons', 'Data', 'Updates'):
             pages[name] = tk.Frame(content, bg=panel)
             button(tabs, name.upper(), lambda name=name: select(name)).pack(side='left', padx=(0, 8))
@@ -398,7 +507,7 @@ class LauncherPreferencesMixin:
         news_choice = tk.StringVar(value=next(name for name, value in NEWS_CHOICES.items() if value == self.preferences['news_refresh_minutes']))
         dropdown(general, 'NEWS REFRESH', news_choice, tuple(NEWS_CHOICES))
         label(general, 'Manual only keeps the Refresh button available. News still loads when you open or switch games.', 9, 'muted')
-        checkbox(general, 'Animate panels, backgrounds, and screenshots', 'animations_enabled')
+        checkbox(general, 'Animate windows, tabs, buttons, and graphs', 'animations_enabled')
         checkbox(general, 'Pause playtime tracking', 'playtime_paused')
         label(general, 'Minimize to tray requires pystray. If the tray is unavailable, the launcher minimizes normally.', 9, 'muted')
         def leave_and_open(callback):
@@ -458,6 +567,9 @@ class LauncherPreferencesMixin:
             if messagebox.askyesno('Reset playtime', f'Delete all recorded playtime for {version}?', parent=window):
                 self.last_playtime_poll = time.monotonic()
                 self.playtime_seconds[version] = 0.0
+                self.playtime_session_stats.pop(version, None)
+                if self._session_game == version:
+                    self._session_game = None; self._session_seconds = 0.0
                 for values in self.playtime_history.values(): values.pop(version, None)
                 self.persist_settings(); self.update_playtime_display(time.monotonic()); status.set(f'Playtime reset for {version}.')
         button(row, 'RESET GAME PLAYTIME', reset_playtime).pack(side='left')
@@ -548,7 +660,7 @@ class LauncherPreferencesMixin:
         if not messagebox.askyesno('Reset launcher settings', 'Reset preferences, game paths, launch arguments, and tips? The selected playtime and character data will be kept. Addon files and backups are preserved.', parent=parent): return
         data = {'game_paths': {}, 'setup_complete': False, 'preferences': dict(DEFAULT_PREFERENCES)}
         if keep_time:
-            data.update(playtime_seconds=self.playtime_seconds, playtime_history=self.playtime_history, playtime_history_started=self.playtime_history_started)
+            data.update(playtime_seconds=self.playtime_seconds, playtime_history=self.playtime_history, playtime_history_started=self.playtime_history_started, playtime_session_stats=self.playtime_session_stats)
         if keep_characters: data['armory'] = self.armory
         try:
             self.replace_stored_settings(data)

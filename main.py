@@ -3,17 +3,15 @@
 from collections import deque
 import io
 import math
+import multiprocessing
 from datetime import date, datetime, timedelta
 import json
-from html.parser import HTMLParser
-from html import unescape
 import os
 from pathlib import Path
 import plistlib
 import queue
 import re
 import shlex
-import ssl
 import subprocess
 import sys
 import threading
@@ -33,6 +31,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
 from addon_manager import AddonManager, Overlay
 from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager, install_overlay_animation
 from launcher_updates import LauncherUpdateController
+from launcher_news_services import cached_entry, fetch_feed, fetch_article, fetch_reader_image
 
 AddonManager = backup_addon_manager(AddonManager)
 install_overlay_animation(Overlay)
@@ -304,16 +303,6 @@ WOW_CLASSIC_NEWS_URL = "https://worldofwarcraft.blizzard.com/en-us/classic"
 NEWS_TEXT_WIDTH = 395
 NEWS_CARD_COUNT = 3   # news cards shown, on every platform (font metrics differ per OS)
 NEWS_ID_PATTERN = re.compile(r"/news/(\d+)")
-GENERIC_NEWS_TITLES = {"learn more", "read more", "view all", "read more stories", "more"}
-VOID_TAGS = frozenset((
-	"area", "base", "br", "col", "embed", "hr", "img", "input",
-	"link", "meta", "source", "track", "wbr"))
-NEWS_HEADERS = {
-	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-		"(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-	"Accept": "text/html,application/xhtml+xml",
-	"Accept-Language": "en-US,en;q=0.9",
-}
 GAME_NEWS_TERMS = {
 	"WoW Forever Beta": ("forever", "beta"),
 	"Retail": ("midnight", "retail", "hotfix", "world of warcraft"),
@@ -332,21 +321,31 @@ GAME_NEWS_TERMS = {
 def news_article_games(article):
 	"""Use explicit edition names; general news stays in All Games."""
 	patterns = {
-		"WoW Forever Beta": r"\b(?:wow[ :]*forever|world of warcraft[ :]*forever)\b",
+		"WoW Forever Beta": r"\b(?:wow|world of warcraft)(?: classic)?[ :]*forever\b",
 		"Retail": r"\b(?:retail|midnight|the war within|dragonflight)\b",
 		"Classic Era": r"\b(?:classic era|hardcore|season of discovery|wow classic|world of warcraft classic)\b",
-		"Mists of Pandaria Classic": r"\b(?:mists of pandaria|pandaria classic|mop classic)\b",
-		"TBC Anniversary": r"\b(?:burning crusade|tbc|bcc|outland|classic anniversary|anniversary edition)\b",
+		"Mists of Pandaria Classic": r"\b(?:mists of pandaria classic|pandaria classic|mop classic)\b",
+		"TBC Anniversary": r"\b(?:burning crusade classic|tbc(?: classic| anniversary)?|bcc|classic anniversary|anniversary edition)\b",
 	}
 	def editions(text):
 		text = text.casefold().replace("–", " ").replace("—", " ")
 		games = [game for game, pattern in patterns.items() if re.search(pattern, text)]
+		if re.search(r"\bclassic\b", text) and re.search(r"\bmists of pandaria\b", text):
+			if "Mists of Pandaria Classic" not in games:
+				games.append("Mists of Pandaria Classic")
+		if re.search(r"\bclassic\b", text) and re.search(r"\bburning crusade\b", text):
+			if "TBC Anniversary" not in games:
+				games.append("TBC Anniversary")
 		# "WoW Classic" in an expansion's name isn't also Classic Era.
-		if "Classic Era" in games and any(game in games for game in ("Mists of Pandaria Classic", "TBC Anniversary")):
+		if "Classic Era" in games and any(game in games for game in ("Mists of Pandaria Classic", "TBC Anniversary", "WoW Forever Beta")):
 			if not re.search(r"\b(?:classic era|hardcore|season of discovery)\b", text):
 				games.remove("Classic Era")
 		return games
-	return editions(article.get("title", "")) or editions(article.get("summary", ""))
+	title = article.get("title", "")
+	games = editions(title)
+	if games and games != ["Classic Era"]:
+		return games
+	return editions(title + " " + article.get("summary", ""))
 
 
 def resource_path(*parts):
@@ -930,225 +929,9 @@ def style_option_menu(widget, theme):
         font=widget.cget("font"), relief="flat", bd=0)
 
 
-class NewsArticleParser(HTMLParser):
-	"""Extract readable blocks without relying on a site's CSS or JavaScript."""
-	SKIP = {"script", "style", "nav", "footer", "aside", "noscript", "svg", "button", "form"}
-	BLOCKS = {"p", "h1", "h2", "h3", "h4", "li", "blockquote", "pre", "td", "th"}
-	VOID = {"img", "br", "hr", "meta", "link", "input", "source", "wbr", "area", "base", "embed", "param", "track", "col"}
-
-	def __init__(self, url):
-		super().__init__(convert_charrefs=True)
-		self.url = url
-		self.stack = []
-		self.blocks = []
-		self.current = None
-		self.title_parts = []
-
-	def handle_starttag(self, tag, attrs):
-		attributes = dict(attrs)
-		classes = (attributes.get("class", "") + " " + attributes.get("id", "")).casefold()
-		priority = 3 if any(name in classes for name in
-			("articledetail-body", "article-detail-body", "article-body", "article-content", "news-content", "newsarticle-content")) else (2 if tag == "article" else (1 if tag == "main" else 0))
-		skipped = tag in self.SKIP or any(item[2] for item in self.stack)
-		if tag not in self.VOID:
-			self.stack.append((tag, priority, skipped))
-		if skipped:
-			return
-		if tag in self.BLOCKS:
-			self.finish_block()
-			self.current = {"kind": tag, "parts": [], "links": [],
-				"priority": max((item[1] for item in self.stack), default=0)}
-		elif tag == "br" and self.current is not None:
-			self.current["parts"].append("\n")
-		elif tag == "a" and self.current is not None:
-			target = urljoin(self.url, attributes.get("href", ""))
-			if urlparse(target).scheme in ("http", "https"):
-				self.current["links"].append(target)
-
-	def handle_endtag(self, tag):
-		if tag in self.BLOCKS and self.current is not None and self.current["kind"] == tag:
-			self.finish_block()
-		for index in range(len(self.stack) - 1, -1, -1):
-			if self.stack[index][0] == tag:
-				del self.stack[index:]
-				break
-
-	def handle_data(self, data):
-		if any(item[2] for item in self.stack):
-			return
-		if any(item[0] == "title" for item in self.stack):
-			self.title_parts.append(data)
-		if self.current is not None:
-			self.current["parts"].append(data)
-
-	def finish_block(self):
-		if self.current is None:
-			return
-		block = self.current
-		block["text"] = " ".join("".join(block.pop("parts")).split())
-		if block["text"]:
-			self.blocks.append(block)
-		self.current = None
-
-	def result(self):
-		self.finish_block()
-		for priority in (3, 2, 1, 0):
-			blocks = [block for block in self.blocks if block["priority"] >= priority]
-			if sum(len(block["text"]) for block in blocks) >= 120:
-				return " ".join("".join(self.title_parts).split()), blocks
-		raise ValueError("This page did not provide readable article text. It may require JavaScript or block embedded access.")
-
-
-def news_ssl_context():
-	"""Verify HTTPS with native OS certificate trust when truststore is installed."""
-	try:
-		import truststore
-	except ImportError:
-		return ssl.create_default_context()
-	return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-
-
-def fetch_news_article(url):
-	request = Request(url, headers=NEWS_HEADERS)
-	with urlopen(request, timeout=15, context=news_ssl_context()) as response:
-		content_type = response.headers.get("Content-Type", "").casefold()
-		if content_type and not any(kind in content_type for kind in ("text/html", "application/xhtml")):
-			raise ValueError("This link is not an HTML article")
-		raw = response.read(4_000_001)
-		if len(raw) > 4_000_000:
-			raise ValueError("This page is too large for the news reader")
-		encoding = response.headers.get_content_charset() or "utf-8"
-		resolved_url = response.geturl()
-	parser = NewsArticleParser(resolved_url)
-	parser.feed(raw.decode(encoding, "replace"))
-	parser.close()
-	title, blocks = parser.result()
-	return resolved_url, title, blocks
-
-
-class OfficialNewsParser(HTMLParser):
-	"""Extract official WoW article cards (ArticleTile divs or blz-card elements)."""
-
-	def __init__(self):
-		super().__init__(convert_charrefs=True)
-		self.items = []
-		self.current = None
-		self.root_tag = None
-		self.tile_depth = 0
-		self.capture_name = None
-		self.capture_tag = None
-		self.capture_depth = 0
-		self.capture_parts = []
-
-	def handle_starttag(self, tag, attrs):
-		attributes = dict(attrs)
-		classes = set((attributes.get("class") or "").split())
-		if self.current is None:
-			if tag == "div" and "ArticleTile" in classes:
-				self.current = {"title": "", "summary": "", "url": ""}
-				self.root_tag = "div"
-				self.tile_depth = 1
-			elif tag == "blz-card":
-				self.current = {"title": "", "summary": "", "url": ""}
-				self.root_tag = "blz-card"
-				self.tile_depth = 1
-			return
-		if tag in VOID_TAGS:
-			return
-		if tag == self.root_tag:
-			self.tile_depth += 1
-		if self.capture_name is not None:
-			self.capture_depth += 1
-		href = attributes.get("href") or ""
-		if tag == "a" and "ArticleTile-link" in classes and href:
-			self.current["url"] = href
-		elif (tag in ("a", "blz-button") and NEWS_ID_PATTERN.search(href)
-				and not self.current["url"]):
-			self.current["url"] = href
-
-		field = None
-		if tag == "div" and "ArticleTile-title" in classes:
-			field = "title"
-		elif tag == "div" and "ArticleTile-subtitle" in classes:
-			field = "summary"
-		elif tag == "span" and attributes.get("slot") == "heading":
-			field = "title"
-		elif tag == "span" and attributes.get("slot") == "description":
-			field = "summary"
-		if field:
-			self.capture_name = field
-			self.capture_tag = tag
-			self.capture_depth = 0
-			self.capture_parts = []
-
-	def handle_endtag(self, tag):
-		if self.current is None or tag in VOID_TAGS:
-			return
-		if self.capture_name is not None:
-			if tag == self.capture_tag and self.capture_depth == 0:
-				self.current[self.capture_name] = " ".join(
-					" ".join(self.capture_parts).split())
-				self.capture_name = None
-				self.capture_tag = None
-				self.capture_parts = []
-			elif self.capture_depth:
-				self.capture_depth -= 1
-		if tag == self.root_tag:
-			self.tile_depth -= 1
-			if self.tile_depth <= 0:
-				if self.current["title"] and self.current["url"]:
-					self.items.append(self.current)
-				self.current = None
-				self.root_tag = None
-				self.capture_name = None
-
-	def handle_data(self, data):
-		if self.current is not None and self.capture_name is not None:
-			self.capture_parts.append(data)
-
-
-class NewsLinkParser(HTMLParser):
-	"""Fallback: collect any link to /news/<id> together with its visible text."""
-
-	def __init__(self):
-		super().__init__(convert_charrefs=True)
-		self.items = []
-		self.tag = None
-		self.depth = 0
-		self.href = ""
-		self.label = ""
-		self.parts = []
-
-	def handle_starttag(self, tag, attrs):
-		if tag in VOID_TAGS:
-			return
-		if self.tag is not None:
-			if tag == self.tag:
-				self.depth += 1
-			return
-		attributes = dict(attrs)
-		href = attributes.get("href") or ""
-		if tag in ("a", "blz-button") and NEWS_ID_PATTERN.search(href):
-			self.tag = tag
-			self.depth = 0
-			self.href = href
-			self.label = attributes.get("aria-label") or attributes.get("title") or ""
-			self.parts = []
-
-	def handle_endtag(self, tag):
-		if tag != self.tag:
-			return
-		if self.depth:
-			self.depth -= 1
-			return
-		title = " ".join(" ".join(self.parts).split()) or " ".join(self.label.split())
-		if title and title.casefold() not in GENERIC_NEWS_TITLES and not title.isdigit():
-			self.items.append({"title": title, "summary": "", "url": self.href})
-		self.tag = None
-
-	def handle_data(self, data):
-		if self.tag is not None:
-			self.parts.append(data)
+def fetch_news_article(url, cache_dir=None, force=False):
+	result, _warning = fetch_article(url, cache_dir or settings_dir() / "news-cache", force=force)
+	return result
 
 
 BUTTON_STONE = "#626663"
@@ -1192,12 +975,14 @@ class StoneButton(tk.Canvas):
 		self.bind("<Button-1>", lambda _event: self.focus_set(), add="+")
 		self.bind("<FocusIn>", self.redraw)
 		self.bind("<FocusOut>", self.redraw)
+		self.bind("<Destroy>", self.cancel_hover_animation, add="+")
 		self.configure(
 			width=self.button_font.measure(text) + padx * 2 + 24 + BUTTON_SHADOW_PAD * 2,
 			height=self.button_font.metrics("linespace") + pady * 2 + 18 + BUTTON_SHADOW_PAD * 2)
 		self.redraw()
 
 	def redraw(self, _event=None):
+		self.cancel_hover_animation()
 		if not self.winfo_exists():
 			return
 		width, height = self.winfo_width(), self.winfo_height()
@@ -1326,14 +1111,62 @@ class StoneButton(tk.Canvas):
 							 fill=BUTTON_TEXT_OUTLINE, font=self.button_font)
 		self.create_text(x, y, text=self.label, fill=text_color, font=self.button_font)
 
-	def on_enter(self, _event=None):
-		self.hovered = True
+	def cancel_hover_animation(self, event=None):
+		if event is not None and event.widget is not self:
+			return
+		timer = getattr(self, "_hover_timer", None)
+		if timer is not None:
+			self.after_cancel(timer)
+			self._hover_timer = None
+
+	def animate_hover(self, active):
+		self.cancel_hover_animation()
+		owner = self.master
+		while owner is not None and not hasattr(owner, "launcher"):
+			owner = getattr(owner, "master", None)
+		app = getattr(owner, "launcher", None)
+		before = []
+		for item in self.find_all():
+			kind = self.type(item)
+			option = "fill" if kind == "text" else "outline" if kind == "polygon" else None
+			if option:
+				before.append((kind, option, self.itemcget(item, option)))
+		self.hovered = active
+		if not active:
+			self.pressed = False
 		self.redraw()
+		if self.disabled or app is None or not app.preferences.get("animations_enabled", True):
+			return
+		transitions = []
+		index = 0
+		for item in self.find_all():
+			kind = self.type(item)
+			option = "fill" if kind == "text" else "outline" if kind == "polygon" else None
+			if option:
+				old_kind, old_option, start = before[index] if index < len(before) else (None, None, "")
+				index += 1
+				end = self.itemcget(item, option)
+				if old_kind == kind and start.startswith("#") and end.startswith("#") and start != end:
+					transitions.append((item, option, start, end))
+		started = time.monotonic()
+		def step():
+			self._hover_timer = None
+			if not self.winfo_exists():
+				return
+			progress = min(1, (time.monotonic()-started)/.12)
+			if not app.preferences.get("animations_enabled", True):
+				progress = 1
+			for item, option, start, end in transitions:
+				self.itemconfigure(item, **{option: blend_hex(start, end, 1-(1-progress)**2)})
+			if progress < 1 and transitions:
+				self._hover_timer = self.after(16, step)
+		step()
+
+	def on_enter(self, _event=None):
+		self.animate_hover(True)
 
 	def on_leave(self, _event=None):
-		self.hovered = False
-		self.pressed = False
-		self.redraw()
+		self.animate_hover(False)
 
 	def on_press(self, _event=None):
 		if self.disabled:
@@ -1521,6 +1354,21 @@ class GradientSurface:
 		return self.image.crop((x, y, x + width, y + height)).convert("RGBA")
 
 
+
+def _download_news_worker(sources, connection, cache_dir, force=False):
+	"""Download and parse news without sharing the GUI's Python interpreter."""
+	try:
+		launcher = LauncherUI.__new__(LauncherUI)
+		launcher._news_page_cache = {}
+		launcher.settings_path = Path(cache_dir).parent / "launcher_settings.json"
+		launcher._news_source_errors = {}
+		with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
+			results = list(pool.map(lambda url: launcher.news_source_articles(url, True, force=force), sources))
+		connection.send((results, launcher._news_page_cache, launcher._news_source_errors))
+	finally:
+		connection.close()
+
+
 class LauncherUI(LauncherPreferencesMixin):
 	def __init__(self, root):
 		self.root = root
@@ -1544,28 +1392,18 @@ class LauncherUI(LauncherPreferencesMixin):
 		root.configure(bg=BG)
 		self._startup_screen = tk.Frame(root, bg=BG)
 		self._startup_screen.place(relwidth=1, relheight=1)
-		outline = tk.Frame(self._startup_screen, bg=palette["border"], padx=1, pady=1)
-		outline.place(relx=.5, rely=.5, anchor="center")
-		center = tk.Frame(outline, bg=palette["surface"], padx=42, pady=36)
-		center.pack()
-		self._startup_title = tk.Label(center, text="WORLD OF WARCRAFT", bg=palette["surface"],
-			fg=palette["accent"], font=self.ui_font(26, bold=True))
-		self._startup_title.pack(pady=(0, 6))
-		self._startup_subtitle = tk.Label(center, text="LAUNCHER", bg=palette["surface"],
-			fg=palette["text"], font=self.ui_font(14, bold=True))
-		self._startup_subtitle.pack(pady=(0, 22))
-		tk.Frame(center, bg=palette["border"], height=1).pack(fill="x", pady=(0, 22))
-		self._startup_status = tk.Label(center, text="Starting launcher…", bg=palette["surface"],
-			fg=palette["text"], font=self.ui_font(11, bold=True))
-		self._startup_status.pack(pady=(0, 14))
-		self._startup_progress = tk.Canvas(center, width=360, height=10, bg=palette["control"],
-			bd=0, highlightthickness=1, highlightbackground=palette["border"])
-		self._startup_progress.pack()
-		self._startup_bar = self._startup_progress.create_rectangle(2, 2, 14, 8,
-			fill=palette["accent"], outline="")
-		self._startup_hint = tk.Label(center, text="Preparing your games, artwork, and news", bg=palette["surface"],
-			fg=palette["muted"], font=self.ui_font(9))
-		self._startup_hint.pack(pady=(14, 0))
+		self._startup_canvas = tk.Canvas(self._startup_screen, bg=BG, bd=0, highlightthickness=0)
+		self._startup_canvas.pack(fill="both", expand=True)
+		self._startup_ring = self._startup_canvas.create_oval(0, 0, 0, 0,
+			outline=palette["border"], width=3)
+		self._startup_spinner = self._startup_canvas.create_arc(0, 0, 0, 0,
+			style="arc", start=90, extent=90, outline=palette["accent"], width=4)
+		self._startup_status = self._startup_canvas.create_text(0, 0, text="Loading…",
+			fill=palette["text"], font=self.ui_font(11))
+		self._startup_spinner_timer = None
+		self._startup_spinner_started = time.monotonic()
+		self._startup_canvas.bind("<Configure>", self._position_startup_spinner)
+		self._startup_spinner_timer = root.after(33, self._animate_startup_spinner)
 		self._startup_steps = self._initialize(root)
 		# Map the loading screen before starting expensive initialization.
 		root.after(50, self._advance_startup)
@@ -1577,17 +1415,30 @@ class LauncherUI(LauncherPreferencesMixin):
 			message, progress = next(self._startup_steps)
 		except StopIteration:
 			self._startup_complete = True
-			self._startup_status.config(text="Loading news…")
+			self._startup_canvas.itemconfigure(self._startup_status, text="Loading news…")
 			if self._startup_news_ready:
 				self._finish_startup()
 			else:
-				# News errors and slow/offline connections must not block the launcher.
 				self._startup_news_timeout = self.root.after(8000, self._finish_startup)
 			return
-		self._startup_status.config(text=message)
-		self._startup_progress.coords(self._startup_bar, 2, 2, 2 + round(356 * progress), 8)
+		self._startup_canvas.itemconfigure(self._startup_status, text=message)
 		self._startup_screen.lift()
 		self.root.after(25, self._advance_startup)
+
+	def _position_startup_spinner(self, event):
+		x, y = event.width / 2, event.height / 2 - 12
+		for item in (self._startup_ring, self._startup_spinner):
+			self._startup_canvas.coords(item, x-30, y-30, x+30, y+30)
+		self._startup_canvas.coords(self._startup_status, x, y+56)
+
+	def _animate_startup_spinner(self):
+		self._startup_spinner_timer = None
+		if self._closing or self._startup_screen is None or not self._startup_screen.winfo_exists():
+			return
+		if getattr(self, "preferences", {}).get("animations_enabled", True):
+			angle = 90 - (time.monotonic()-self._startup_spinner_started) * 240
+			self._startup_canvas.itemconfigure(self._startup_spinner, start=angle % 360)
+		self._startup_spinner_timer = self.root.after(33, self._animate_startup_spinner)
 
 	def _load_startup_backdrop(self):
 		"""Use the opening game's artwork behind the loading panel."""
@@ -1605,12 +1456,15 @@ class LauncherUI(LauncherPreferencesMixin):
 			method=Image.Resampling.BILINEAR).filter(ImageFilter.GaussianBlur(10))
 		backdrop = backdrop.resize((width, height), Image.Resampling.BILINEAR).convert("RGBA")
 		backdrop = Image.alpha_composite(backdrop, Image.new("RGBA", backdrop.size, (0, 0, 0, 65)))
-		photo = ImageTk.PhotoImage(backdrop, master=self.root)
-		background = tk.Label(self._startup_screen, image=photo, bg=BG, bd=0,
-			highlightthickness=0)
-		background.image = photo
-		background.place(relwidth=1, relheight=1)
-		background.lower()
+		self._startup_backdrop_photo = ImageTk.PhotoImage(backdrop, master=self.root)
+		self._startup_canvas.delete("startup_background")
+		background = self._startup_canvas.create_image(0, 0, image=self._startup_backdrop_photo,
+			anchor="nw", tags="startup_background")
+		self._startup_canvas.tag_lower(background)
+		palette = GAME_THEMES.get(version, self.theme)
+		self._startup_canvas.itemconfigure(self._startup_ring, outline=palette["border"])
+		self._startup_canvas.itemconfigure(self._startup_spinner, outline=palette["accent"])
+		self._startup_canvas.itemconfigure(self._startup_status, fill=palette["text"])
 
 	def _finish_startup(self):
 		if not self._startup_complete:
@@ -1618,6 +1472,9 @@ class LauncherUI(LauncherPreferencesMixin):
 		if self._startup_news_timeout is not None:
 			self.root.after_cancel(self._startup_news_timeout)
 			self._startup_news_timeout = None
+		if self._startup_spinner_timer is not None:
+			self.root.after_cancel(self._startup_spinner_timer)
+			self._startup_spinner_timer = None
 		if self._startup_screen is not None:
 			self._startup_screen.destroy()
 			self._startup_screen = None
@@ -1690,6 +1547,7 @@ class LauncherUI(LauncherPreferencesMixin):
 					"game_paths": self.game_paths,
 					"playtime_seconds": self.playtime_seconds,
 					"playtime_history": self.playtime_history,
+				"playtime_session_stats": self.playtime_session_stats,
 					"playtime_history_started": self.playtime_history_started,
 					"setup_complete": self.setup_complete,
 					"preferences": self.preferences,
@@ -1724,10 +1582,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		yield "Loading fonts…", .3
 		self.register_friz_fonts()
 		self.refresh_friz_font()
-		self._startup_title.config(font=self.ui_font(26, bold=True))
-		self._startup_subtitle.config(font=self.ui_font(14, bold=True))
-		self._startup_status.config(font=self.ui_font(11, bold=True))
-		self._startup_hint.config(font=self.ui_font(9))
+		self._startup_canvas.itemconfigure(self._startup_status, font=self.ui_font(11))
 		self.game_logos = {}
 		self.game_backgrounds = {}
 		self._background_cache = {}
@@ -2168,6 +2023,9 @@ class LauncherUI(LauncherPreferencesMixin):
 	def load_settings(self):
 		self.playtime_seconds = {version: 0.0 for version in ALL_VERSIONS}
 		self.playtime_history = {}  # local ISO date -> version -> seconds
+		self.playtime_session_stats = {}
+		self._session_game = None
+		self._session_seconds = 0.0
 		self.playtime_history_started = date.today().isoformat()
 		self.enabled_extras = set()
 		self.learned_clients = {}
@@ -2193,6 +2051,17 @@ class LauncherUI(LauncherPreferencesMixin):
 				for version, value in saved_playtime.items():
 					if isinstance(value, (int, float)) and not isinstance(value, bool):
 						self.playtime_seconds[version] = max(0.0, float(value))
+			session_stats = data.get("playtime_session_stats", {})
+			if isinstance(session_stats, dict):
+				for game, stats in session_stats.items():
+					if not isinstance(game, str) or not isinstance(stats, dict):
+						continue
+					count, total, longest = (stats.get(key, 0) for key in ("count", "total", "longest"))
+					if (isinstance(count, int) and not isinstance(count, bool) and count > 0
+						and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+							and math.isfinite(v) and v >= 0 for v in (total, longest))):
+						self.playtime_session_stats[game] = {"count": count, "total": float(total),
+							"longest": min(float(longest), float(total))}
 			history = data.get("playtime_history", {})
 			if isinstance(history, dict):
 				for day, versions in history.items():
@@ -2508,60 +2377,75 @@ class LauncherUI(LauncherPreferencesMixin):
 
 	NEWS_CACHE_SECONDS = 600
 
-	def news_source_articles(self, source_url, allow_network, force=False):
-		"""(articles, failed) for one news page, cached for a few minutes. Returns None
-		when a download would be needed but is not allowed."""
+	def news_source_articles(self, source_url, allow_network, force=False, allow_stale=False):
+		"""Return plain feed data; disk/network work runs only in news threads/workers."""
 		cached = self._news_page_cache.get(source_url)
-		if not force and cached is not None and time.monotonic() - cached[0] < self.NEWS_CACHE_SECONDS:
+		if not force and cached is not None and (allow_stale or time.monotonic() - cached[0] < self.NEWS_CACHE_SECONDS):
 			return [dict(article) for article in cached[1]], False
 		if not allow_network:
 			return None
-		try:
-			request = Request(source_url, headers=NEWS_HEADERS)
-			with urlopen(request, timeout=8, context=news_ssl_context()) as response:
-				page = response.read(2_000_000).decode("utf-8", "replace")
-		except Exception as exc:
-			self.__dict__.setdefault("_news_source_errors", {})[source_url] = str(exc)
-			return [], True
-		found = []
-		for parser_class in (OfficialNewsParser, NewsLinkParser):
-			parser = parser_class()
-			try:
-				parser.feed(page)
-				parser.close()
-			except Exception:
-				pass
-			found.extend(parser.items)
-		# Older archive pages publish cards in the embedded JSON model.
-		model_match = re.search(r'<script[^>]*\bid=["\']model["\'][^>]*>\s*model\s*=\s*(\{.*?\})\s*;?\s*</script>', page, re.DOTALL)
-		if model_match:
-			try:
-				model = json.loads(model_match.group(1))
-				for blog in model.get("blogList", {}).get("blogs", []):
-					if isinstance(blog, dict) and blog.get("title") and blog.get("url"):
-						found.append({"id": str(blog.get("id") or ""), "title": unescape(blog["title"]),
-							"summary": unescape(re.sub(r"<[^>]+>", " ", blog.get("description") or "")).strip(), "url": blog["url"]})
-			except (ValueError, TypeError, AttributeError):
-				pass
-		if found:
-			self._news_page_cache[source_url] = (time.monotonic(), found)
-		return [dict(article) for article in found], not found
+		entry, error = fetch_feed(source_url, self.settings_path.parent / "news-cache", force=force)
+		if error:
+			self.__dict__.setdefault("_news_source_errors", {})[source_url] = error
+		if entry:
+			stamp = time.monotonic() - max(0, time.time() - entry["saved"])
+			self._news_page_cache[source_url] = (stamp, entry["data"])
+			return [dict(article) for article in entry["data"]], bool(error)
+		return ([dict(article) for article in cached[1]] if cached else []), True
 
-	def build_news(self, version, allow_network=True, force=False, limit=6, archive_pages=1):
-		"""(selected articles, error count, matched) or None if it needs the network."""
+	def download_news_sources(self, sources, force=False):
+		"""Called by news threads; only plain data crosses the process boundary."""
+		results = [self.news_source_articles(url, False, force=force) for url in sources]
+		missing = [url for url, result in zip(sources, results) if result is None]
+		if not missing:
+			return results
+		context = multiprocessing.get_context("spawn")
+		receiver, sender = context.Pipe(duplex=False)
+		process = context.Process(target=_download_news_worker, args=(missing, sender, str(self.settings_path.parent / "news-cache"), force), daemon=True)
+		try:
+			process.start()
+			sender.close()
+			deadline = time.monotonic() + max(15, ((len(missing)+3)//4)*12)
+			while not receiver.poll(.1):
+				if self._closing or not process.is_alive() or time.monotonic() >= deadline:
+					raise TimeoutError("News loading was interrupted or timed out.")
+			fetched, cache, errors = receiver.recv()
+			self._news_page_cache.update(cache)
+			self.__dict__.setdefault("_news_source_errors", {}).update(errors)
+			fresh = iter(fetched)
+			return [next(fresh) if result is None else result for result in results]
+		except Exception as error:
+			self.__dict__.setdefault("_news_source_errors", {}).update({url: str(error) for url in missing})
+			return [([dict(article) for article in self._news_page_cache.get(url, (0, []))[1]], True)
+				if result is None else result for url, result in zip(sources, results)]
+		finally:
+			sender.close()
+			receiver.close()
+			if process.pid is not None:
+				process.join(.2)
+				if process.is_alive():
+					process.terminate()
+					process.join(1)
+
+	def news_archive_sources(self, version, pages=10):
 		sources = self.news_sources_for(version)
-		if WOW_NEWS_URL in sources and archive_pages > 1:
-			sources = [*sources, *(f"{WOW_NEWS_URL}?page={page}" for page in range(2, archive_pages + 1))]
+		if WOW_NEWS_URL in sources:
+			sources = [*sources, *(f"{WOW_NEWS_URL}?page={page}" for page in range(2, pages + 1))]
+		return sources
+
+	def build_news(self, version, allow_network=True, force=False, limit=6, archive_pages=1, allow_partial=False):
+		"""(selected articles, error count, matched) or None if it needs the network."""
+		sources = self.news_archive_sources(version, archive_pages)
 		if not sources:
 			return [], 0, False
 		if allow_network:
-			with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
-				results = list(pool.map(
-					lambda url: self.news_source_articles(url, True, force=force), sources))
+			results = self.download_news_sources(sources, force=force)
 		else:
-			results = [self.news_source_articles(url, False) for url in sources]
+			results = [self.news_source_articles(url, False, allow_stale=True) for url in sources]
 			if any(result is None for result in results):
-				return None
+				if not allow_partial:
+					return None
+				results = [result if result is not None else ([], False) for result in results]
 		articles = {}
 		feed_errors = 0
 		for source_url, (found, failed) in zip(sources, results):
@@ -2579,19 +2463,8 @@ class LauncherUI(LauncherPreferencesMixin):
 		if version == "Crusader Storm":
 			return list(articles.values())[:limit], feed_errors, bool(articles)
 
-		ranked = []
-		for article in articles.values():
-			if version in news_article_games(article):
-				ranked.append((0, article))
-		ranked.sort(key=lambda item: item[0])
-		matched = bool(ranked)
-		selected = [article for _rank, article in ranked][:limit]
-		for article in articles.values():
-			if len(selected) >= limit:
-				break
-			if article not in selected:
-				selected.append(article)
-		return selected, feed_errors, matched
+		selected = [article for article in articles.values() if version in news_article_games(article)][:limit]
+		return selected, feed_errors, bool(selected)
 
 	def news_hub_versions(self):
 		"""Return every game represented by the launcher, without duplicates."""
@@ -2601,7 +2474,7 @@ class LauncherUI(LauncherPreferencesMixin):
 	def open_news_hub(self):
 		"""Open the all-games news home page with a game filter."""
 		if self.show_first_use_hint('News',
-			'Filter news by game and select an article to read it inside the launcher. News and article loading require an internet connection.', self.open_news_hub):
+			'Filter news by game and select an article to read it inside the launcher. Fresh news requires an internet connection; saved news and articles can be read offline.', self.open_news_hub):
 			return
 		existing = getattr(self, "news_hub", None)
 		if existing is not None and existing.winfo_exists():
@@ -2773,8 +2646,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			*(f"{WOW_NEWS_URL}?page={page}" for page in range(2, 11))]
 		articles = {}
 		failures = {}
-		with ThreadPoolExecutor(max_workers=4) as pool:
-			results = list(pool.map(lambda url: self.news_source_articles(url, True, force=force), sources))
+		results = self.download_news_sources(sources, force=force)
 		for source_url, (found, failed) in zip(sources, results):
 			if failed:
 				message = self.__dict__.get("_news_source_errors", {}).get(source_url, "A news source could not be reached or parsed.")
@@ -2858,7 +2730,31 @@ class LauncherUI(LauncherPreferencesMixin):
 	def fetch_game_news(self, version, generation, force=False):
 		selected, errors, matched = [], 1, False
 		try:
-			selected, errors, matched = self.build_news(version, force=force)
+			# Include saved archives in the immediate preview, even if some pages are missing.
+			sources = self.news_archive_sources(version, 10)
+			for source in sources:
+				entry = cached_entry(self.settings_path.parent / "news-cache", "feed", source)
+				if entry and source not in self._news_page_cache:
+					stamp = time.monotonic() - max(0, time.time() - entry["saved"])
+					self._news_page_cache[source] = (stamp, entry["data"])
+			preview = self.build_news(version, allow_network=False, archive_pages=10, allow_partial=True)
+			if preview is not None and preview[0]:
+				selected, errors, matched = preview
+				if not force and len(selected) >= 6 and all(
+						time.monotonic() - self._news_page_cache[url][0] < self.NEWS_CACHE_SECONDS
+						for url in sources if url in self._news_page_cache):
+					return
+				self.news_queue.put((generation, version, *preview))
+			if force:
+				selected, errors, matched = self.build_news(version, force=True, archive_pages=10)
+			else:
+				latest = self.build_news(version)
+				if latest[0]:
+					self.news_queue.put((generation, version, *latest))
+				if len(latest[0]) < 6:
+					selected, errors, matched = self.build_news(version, archive_pages=10)
+				else:
+					selected, errors, matched = latest
 		except Exception:
 			pass
 		finally:
@@ -2931,7 +2827,7 @@ class LauncherUI(LauncherPreferencesMixin):
 	NEWS_FALLBACK_SUMMARY = "Read the full story on the official World of Warcraft site."
 
 	def open_news_browser(self, url):
-		"""Read article text in a native panel, independent of website rendering."""
+		"""Read news articles and forum posts inside the native reader."""
 		# When an article is opened from the all-games news home, close the
 		# home panel so the article reader becomes the active news view.
 		hub = getattr(self, "news_hub", None)
@@ -2953,10 +2849,11 @@ class LauncherUI(LauncherPreferencesMixin):
 		body.config(bg=panel)
 		header = tk.Frame(body, bg=panel)
 		header.pack(fill="x", pady=(0, 8))
-		tk.Label(header, text="NEWS BROWSER", bg=panel, fg=theme["accent"],
+		tk.Label(header, text="ARTICLE READER", bg=panel, fg=theme["accent"],
 			font=self.ui_font(14, bold=True)).pack(side="left")
 		state = {"history": [], "index": -1, "url": url, "frame": None,
-			"generation": 0, "results": queue.Queue(), "poll": None, "closed": False}
+			"generation": 0, "results": queue.Queue(), "poll": None, "closed": False,
+			"images": [], "image_results": queue.Queue(), "render": 0, "image_slots": {}}
 
 		def close():
 			window.destroy()
@@ -2964,6 +2861,8 @@ class LauncherUI(LauncherPreferencesMixin):
 		def destroyed(event):
 			if event.widget is window:
 				state["closed"] = True
+				state["images"].clear()
+				state["image_slots"].clear()
 				if state["poll"] is not None:
 					self.root.after_cancel(state["poll"])
 					state["poll"] = None
@@ -3021,8 +2920,9 @@ class LauncherUI(LauncherPreferencesMixin):
 			state["generation"] += 1
 			generation = state["generation"]
 			status.config(text="Loading article…", fg=theme["muted"])
+			state["article_result"] = None
 			show_text("Loading article…", [])
-			threading.Thread(target=download, args=(target, generation), daemon=True).start()
+			threading.Thread(target=download, args=(target, generation, force), daemon=True).start()
 
 		def travel(direction):
 			index = state["index"] + direction
@@ -3030,16 +2930,28 @@ class LauncherUI(LauncherPreferencesMixin):
 				state["index"] = index
 				navigate(state["history"][index], record=False)
 
-		def download(target, generation):
+		def download(target, generation, force=False):
+			cache_dir = self.settings_path.parent / "news-cache"
+			cached = cached_entry(cache_dir, "article", target)
 			try:
-				result = fetch_news_article(target)
-				state["results"].put((generation, result, None))
+				if cached:
+					state["results"].put((generation, cached["data"], None, "Saved article • Updating…"))
+				result, warning = fetch_article(target, cache_dir, force=force)
+				message = "Saved article • Could not refresh; showing the saved copy." if warning else None
+				state["results"].put((generation, result, None, message))
 			except Exception as error:
-				state["results"].put((generation, None, str(error)))
+				state["results"].put((generation, None, str(error), None))
 
 		def show_text(title, blocks):
+			state["render"] += 1
+			render = state["render"]
+			for marks in state["image_slots"].values():
+				reader.mark_unset(*marks)
+			state["image_slots"].clear()
+			jobs = []
 			reader.config(state="normal")
 			reader.delete("1.0", "end")
+			state["images"].clear()
 			for tag in reader.tag_names():
 				if tag.startswith("article_link_"):
 					reader.tag_delete(tag)
@@ -3048,8 +2960,22 @@ class LauncherUI(LauncherPreferencesMixin):
 			link_number = 0
 			for block in blocks:
 				kind = block["kind"]
+				if kind == "image":
+					if len(jobs) >= 24 or not block.get("url"):
+						continue
+					key = len(jobs)
+					reader.insert("end", "\n", "article_image")
+					start, end = f"reader_image_{render}_{key}_start", f"reader_image_{render}_{key}_end"
+					reader.mark_set(start, "end-1c")
+					reader.mark_gravity(start, "left")
+					reader.insert("end", "Loading image…\n\n", "article_image")
+					reader.mark_set(end, "end-1c")
+					reader.mark_gravity(end, "left")
+					state["image_slots"][key] = (start, end)
+					jobs.append((key, block["url"], block.get("text", "")))
+					continue
 				text = ("• " if kind == "li" else "") + block["text"]
-				reader.insert("end", text + "\n\n", kind if kind in ("h1", "h2", "h3", "h4") else "paragraph")
+				reader.insert("end", text + "\n\n", kind if kind in ("h1", "h2", "h3", "h4", "caption", "blockquote", "pre") else "paragraph")
 				for target in dict.fromkeys(block["links"]):
 					tag = f"article_link_{link_number}"
 					link_number += 1
@@ -3062,6 +2988,49 @@ class LauncherUI(LauncherPreferencesMixin):
 					reader.insert("end", "\n")
 			reader.config(state="disabled")
 			reader.yview_moveto(0)
+			if jobs:
+				width = max(200, min(900, reader.winfo_width() - 80))
+				threading.Thread(target=load_images, args=(jobs, render, width), daemon=True).start()
+
+		def load_images(jobs, render, width):
+			def load(job):
+				key, target, alt = job
+				if state["closed"] or render != state["render"]:
+					return
+				try:
+					image = fetch_reader_image(target, self.settings_path.parent / "news-cache", width)
+					# Flatten alpha off-thread so scrolling draws an opaque bitmap.
+					flat = Image.new("RGB", image.size, theme["surface"])
+					flat.paste(image, (0, 0), image.getchannel("A"))
+					image = flat
+					state["image_results"].put((render, key, image, alt))
+				except Exception:
+					state["image_results"].put((render, key, None, alt))
+			with ThreadPoolExecutor(max_workers=3) as pool:
+				list(pool.map(load, jobs))
+
+		def apply_image(render, key, image):
+			if render != state["render"]:
+				return
+			marks = state["image_slots"].pop(key, None)
+			if marks is None:
+				return
+			start, end = marks
+			reader.mark_set("reader_view_anchor", reader.index("@0,0"))
+			reader.mark_gravity("reader_view_anchor", "left")
+			reader.config(state="normal")
+			try:
+				reader.delete(start, end)
+				if image is not None:
+					photo = ImageTk.PhotoImage(image, master=reader)
+					state["images"].append(photo)
+					reader.image_create(start, image=photo, align="center")
+					reader.insert(f"{start}+1c", "\n\n", "article_image")
+					reader.tag_add("article_image", start, f"{start}+3c")
+				reader.yview("reader_view_anchor")
+			finally:
+				reader.mark_unset(start, end, "reader_view_anchor")
+				reader.config(state="disabled")
 
 		def poll():
 			state["poll"] = None
@@ -3069,7 +3038,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				return
 			while True:
 				try:
-					generation, result, error = state["results"].get_nowait()
+					generation, result, error, message = state["results"].get_nowait()
 				except queue.Empty:
 					break
 				if generation != state["generation"]:
@@ -3082,13 +3051,22 @@ class LauncherUI(LauncherPreferencesMixin):
 					resolved, title, blocks = result
 					state["url"] = resolved
 					state["history"][state["index"]] = resolved
-					show_text(title or "World of Warcraft News", blocks)
-					status.config(text="Reader view • Article text and links. Original layout and media: OPEN IN BROWSER.",
+					if result != state.get("article_result"):
+						state["article_result"] = result
+						show_text(title or "World of Warcraft News", blocks)
+					status.config(text=message or "Reader view • Article text and links. Images load automatically below.",
 						fg=theme["muted"])
+			# Upload one bitmap per tick so a burst of images does not stall scrolling.
+			try:
+				render, key, image, alt = state["image_results"].get_nowait()
+			except queue.Empty:
+				pass
+			else:
+				apply_image(render, key, image)
 			state["poll"] = self.root.after(100, poll)
 
 		reader = tk.Text(content, wrap="word", bg=theme["surface"], fg=theme["text"],
-			font=self.ui_font(11), padx=24, pady=20, bd=0, highlightthickness=0,
+			font=self.ui_font(12), padx=36, pady=26, bd=0, highlightthickness=0,
 			selectbackground=theme["control_active"], selectforeground=theme["bright"],
 			cursor="xterm", spacing1=3, spacing3=8)
 		scroll = ttk.Scrollbar(content, orient="vertical", command=reader.yview)
@@ -3098,6 +3076,11 @@ class LauncherUI(LauncherPreferencesMixin):
 		reader.tag_configure("h1", font=self.ui_font(18, bold=True), foreground=theme["accent"], spacing3=12)
 		for heading in ("h2", "h3", "h4"):
 			reader.tag_configure(heading, font=self.ui_font(13, bold=True), foreground=theme["bright"], spacing1=10)
+		reader.tag_configure("paragraph", spacing1=4, spacing3=12)
+		reader.tag_configure("article_image", justify="center", spacing1=8, spacing3=8)
+		reader.tag_configure("caption", font=self.ui_font(9, italic=True), foreground=theme["muted"], justify="center")
+		reader.tag_configure("blockquote", lmargin1=18, lmargin2=18, foreground=theme["muted"])
+		reader.tag_configure("pre", font=("Courier", 10), lmargin1=12, lmargin2=12)
 		window.navigate = navigate
 		window.bind("<Escape>", lambda _event: close())
 		navigate(url)
@@ -3120,7 +3103,8 @@ class LauncherUI(LauncherPreferencesMixin):
 			return minimum, 1
 		summary_font = self.ui_font(8)
 		natural = [self.fit_text(self.news_summary(article), summary_font,
-								 NEWS_TEXT_WIDTH, 10).count("\n") + 1 for article in articles]
+								 NEWS_TEXT_WIDTH, 2).count("\n") + 1
+			for article in articles[:minimum]]
 		best, best_score = (minimum, 0), None
 		for count in range(minimum, min(len(articles), NEWS_CARD_COUNT) + 1):
 			for lines in (0, 1, 2):
@@ -3220,6 +3204,10 @@ class LauncherUI(LauncherPreferencesMixin):
 		"""Fade each news card in, staggered top to bottom."""
 		self.news_anim_generation += 1
 		generation = self.news_anim_generation
+		if not self.preferences.get("animations_enabled", True):
+			for record in cards:
+				self.set_news_card_progress(record, 1)
+			return
 		steps, stagger, frame_ms = 5, 45, 20
 
 		def run(record, step):
@@ -3239,6 +3227,10 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.news_anim_generation += 1  # cancels any animation still running
 		self.clear_children(self.news_items_frame)
 		if not articles:
+			if not errors:
+				self.news_status_label.config(text="NO RECENT NEWS", fg=self.theme["muted"])
+				self.show_news_message(f"No recent articles matched {version}. Use MORE for all news.")
+				return
 			self.news_status_label.config(text="OFFLINE", fg=self.theme["warning"])
 			source_url = self.news_sources_for(version)[0]
 			detail = self.__dict__.get("_news_source_errors", {}).get(source_url, "Check your connection.")
@@ -3442,6 +3434,15 @@ class LauncherUI(LauncherPreferencesMixin):
 		"""Use monotonic elapsed seconds; split history at local midnight."""
 		if self.preferences["playtime_paused"] or not math.isfinite(seconds) or seconds <= 0:
 			return
+		if self._session_game != version:
+			self._session_game = version
+			self._session_seconds = 0.0
+			stats = self.playtime_session_stats.setdefault(version, {"count": 0, "total": 0.0, "longest": 0.0})
+			stats["count"] += 1
+		stats = self.playtime_session_stats[version]
+		self._session_seconds += seconds
+		stats["total"] += seconds
+		stats["longest"] = max(stats["longest"], self._session_seconds)
 		end = time.time() if end_timestamp is None else end_timestamp
 		cursor = end - seconds
 		self.playtime_seconds[version] = self.playtime_seconds.get(version, 0.0) + seconds
@@ -3464,6 +3465,172 @@ class LauncherUI(LauncherPreferencesMixin):
 			series.append((day, seconds if day.isoformat() >= self.playtime_history_started else None))
 		return series
 
+	def playtime_insights(self, version, today=None):
+		"""Calendar totals use dated history; session values use recorded samples."""
+		today = today or date.today()
+		all_games = version == "All versions"
+		def day_total(day):
+			values = self.playtime_history.get(day.isoformat(), {})
+			return sum(values.values()) if all_games else values.get(version, 0.0)
+		recent = sum(day_total(today-timedelta(days=i)) for i in range(7))
+		previous = sum(day_total(today-timedelta(days=i)) for i in range(7, 14))
+		complete = self.playtime_history_started <= (today-timedelta(days=13)).isoformat()
+		if not complete:
+			comparison = "Need 14 tracked days"
+		elif previous:
+			difference = (recent-previous)/previous*100
+			comparison = f"{difference:+.0f}% vs previous 7 days"
+		else:
+			comparison = "No change" if recent == 0 else "Up from no playtime"
+		lifetime = [(name, seconds) for name, seconds in self.playtime_seconds.items()
+			if seconds > 0 and (all_games or name == version)]
+		favorite = max(lifetime, key=lambda pair: pair[1], default=None)
+		dated = [(day, sum(values.values()) if all_games else values.get(version, 0.0))
+			for day, values in self.playtime_history.items() if day <= today.isoformat()]
+		busiest = max(dated, key=lambda pair: pair[1], default=None)
+		stats = [stats for name, stats in self.playtime_session_stats.items() if all_games or name == version]
+		count = sum(stats["count"] for stats in stats)
+		total = sum(stats["total"] for stats in stats)
+		longest = max((stats["longest"] for stats in stats), default=0)
+		return {"recent": recent, "previous": previous, "comparison": comparison,
+			"partial": self.playtime_history_started > (today-timedelta(days=6)).isoformat(),
+			"favorite": favorite, "busiest": busiest if busiest and busiest[1] > 0 else None,
+			"session_count": count, "session_average": total/count if count else None,
+			"longest_session": longest if count else None}
+
+	def open_playtime_insights(self, initial_version="All versions"):
+		theme = dict(self.theme)
+		panel, surface = theme["panel"], theme["surface"]
+		window = Overlay(self.root, 940, 620)
+		body = window.make_body()
+		body.configure(bg=panel)
+		state = {"timer": None, "insights": None}
+		# Reserve the note first so it remains visible at smaller window sizes.
+		tk.Label(body, text="Session stats cover time tracked since this update, including the current session. Paused time is excluded.",
+			bg=panel, fg=theme["muted"], font=self.ui_font(8), justify="left", anchor="w",
+			wraplength=830).pack(side="bottom", fill="x", pady=(10, 0))
+		header = tk.Frame(body, bg=panel)
+		header.pack(fill="x", pady=(0, 12))
+		titles = tk.Frame(header, bg=panel)
+		titles.pack(side="left", fill="x", expand=True)
+		tk.Label(titles, text="PLAYTIME INSIGHTS", bg=panel, fg=theme["accent"],
+			font=self.ui_font(16, bold=True), anchor="w").pack(fill="x")
+		tk.Label(titles, text="Your recent activity and playing habits", bg=panel, fg=theme["muted"],
+			font=self.ui_font(10), anchor="w").pack(fill="x", pady=(3, 0))
+		StoneButton(header, text="CLOSE", command=window.destroy, font=self.ui_font(9, bold=True),
+			bg=panel, theme_provider=lambda: theme, style="subtle", padx=10, pady=5).pack(side="right")
+		toolbar = tk.Frame(body, bg=panel)
+		toolbar.pack(fill="x", pady=(0, 12))
+		versions = list(dict.fromkeys(["All versions", *self.game_versions, *self.playtime_seconds]))
+		selected = tk.StringVar(value=initial_version if initial_version in versions else "All versions")
+		menu = GameOptionMenu(toolbar, selected, *versions, command=lambda _: refresh())
+		menu.configure(font=self.ui_font(9), width=30)
+		style_option_menu(menu, theme)
+		menu.pack(side="left")
+		period = tk.Label(toolbar, bg=panel, fg=theme["muted"], font=self.ui_font(9), anchor="e")
+		period.pack(side="right")
+		weekly = tk.Frame(body, bg=panel, height=150)
+		weekly.pack(fill="x", pady=(0, 12))
+		weekly.grid_propagate(False)
+		weekly.columnconfigure(0, weight=2, uniform="weekly")
+		weekly.columnconfigure(1, weight=3, uniform="weekly")
+		weekly.rowconfigure(0, weight=1)
+		total_card = tk.Frame(weekly, bg=surface)
+		total_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+		total_content = tk.Frame(total_card, bg=surface)
+		total_content.pack(fill="both", expand=True, padx=16, pady=12)
+		tk.Label(total_content, text="LAST 7 DAYS", bg=surface, fg=theme["muted"],
+			font=self.ui_font(10, bold=True)).pack(anchor="w")
+		recent_value = tk.Label(total_content, bg=surface, fg=theme["bright"], font=self.ui_font(28, bold=True))
+		recent_value.pack(anchor="w", pady=(8, 3))
+		recent_note = tk.Label(total_content, bg=surface, fg=theme["muted"], font=self.ui_font(9), anchor="w")
+		recent_note.pack(fill="x")
+		comparison_card = tk.Frame(weekly, bg=surface)
+		comparison_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+		comparison_content = tk.Frame(comparison_card, bg=surface)
+		comparison_content.pack(fill="both", expand=True, padx=16, pady=12)
+		comparison_value = tk.Label(comparison_content, bg=surface, fg=theme["text"],
+			font=self.ui_font(13, bold=True), anchor="w")
+		comparison_value.pack(fill="x", pady=(0, 6))
+		comparison_canvas = tk.Canvas(comparison_content, bg=surface, height=74, bd=0, highlightthickness=0)
+		comparison_canvas.pack(fill="both", expand=True)
+		for card in (total_card, comparison_card):
+			self.add_rounded_surface(card, "surface", radius=8)
+		grid = tk.Frame(body, bg=panel)
+		grid.pack(fill="both", expand=True)
+		cards = []
+		for index, caption in enumerate(("MOST PLAYED", "AVERAGE SESSION", "LONGEST SESSION", "BUSIEST DAY")):
+			row, column = divmod(index, 2)
+			grid.columnconfigure(column, weight=1, uniform="insights")
+			grid.rowconfigure(row, weight=1, uniform="insights")
+			card = tk.Frame(grid, bg=surface)
+			card.grid(row=row, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0), pady=(0, 8) if row == 0 else 0)
+			content = tk.Frame(card, bg=surface)
+			content.pack(fill="both", expand=True, padx=14, pady=10)
+			tk.Label(content, text=caption, bg=surface, fg=theme["muted"],
+				font=self.ui_font(9, bold=True)).pack(anchor="w")
+			value = tk.Label(content, bg=surface, fg=theme["bright"], font=self.ui_font(15, bold=True),
+				anchor="w", justify="left")
+			value.pack(fill="x", pady=(5, 2))
+			detail = tk.Label(content, bg=surface, fg=theme["muted"], font=self.ui_font(9), anchor="w")
+			detail.pack(fill="x")
+			# Let long game names wrap to the actual card width on either platform.
+			card.bind("<Configure>", lambda event, value=value, detail=detail:
+				(value.configure(wraplength=max(100, event.width-28)), detail.configure(wraplength=max(100, event.width-28))))
+			cards.append((value, detail))
+			self.add_rounded_surface(card, "surface", radius=8)
+
+		def draw_comparison(event=None):
+			insights = state["insights"]
+			if insights is None:
+				return
+			comparison_canvas.delete("all")
+			width = max(180, comparison_canvas.winfo_width())
+			start, end = 102, width-76
+			peak = max(insights["recent"], insights["previous"], 1)
+			for index, (caption, seconds, color) in enumerate((
+				("Last 7 days", insights["recent"], theme["accent"]),
+				("Previous 7", insights["previous"], theme["muted"]))):
+				y = 18+index*32
+				comparison_canvas.create_text(0, y, text=caption, anchor="w", fill=theme["muted"], font=self.ui_font(9))
+				comparison_canvas.create_rectangle(start, y-4, end, y+4, fill=theme["control"], outline="")
+				if seconds > 0:
+					comparison_canvas.create_rectangle(start, y-4, start+(end-start)*seconds/peak, y+4, fill=color, outline="")
+				comparison_canvas.create_text(width, y, text=self.format_total_time(seconds), anchor="e", fill=theme["text"], font=self.ui_font(9))
+
+		def refresh():
+			insights = self.playtime_insights(selected.get())
+			state["insights"] = insights
+			today = date.today()
+			period.configure(text=f"{today-timedelta(days=6):%b %d} – {today:%b %d, %Y}")
+			recent_value.configure(text=self.format_total_time(insights["recent"]))
+			recent_note.configure(text="Partial history available" if insights["partial"] else "Today and the previous 6 days")
+			comparison_value.configure(text=insights["comparison"], fg=theme["accent"]
+				if insights["comparison"].startswith("+") else theme["text"])
+			favorite, busiest = insights["favorite"], insights["busiest"]
+			average, longest = insights["session_average"], insights["longest_session"]
+			count = insights["session_count"]
+			values = [
+				(favorite[0] if favorite else "No playtime yet", self.format_total_time(favorite[1]) + " lifetime" if favorite else "Launch a game to begin"),
+				(self.format_session_time(average) if average is not None else "Not recorded yet", f'{count} tracked session' + ("" if count == 1 else "s")),
+				(self.format_session_time(longest) if longest is not None else "Not recorded yet", "Time tracked in a single session"),
+				(date.fromisoformat(busiest[0]).strftime("%b %d, %Y") if busiest else "No dated playtime", self.format_total_time(busiest[1]) + " played" if busiest else "Daily history needed")]
+			for index, ((value, detail), (text, subtitle)) in enumerate(zip(cards, values)):
+				value.configure(text=text, font=self.ui_font(12 if index == 0 else 15, bold=True))
+				detail.configure(text=subtitle)
+			draw_comparison()
+		def tick():
+			if window.winfo_exists():
+				refresh()
+				state["timer"] = self.root.after(15000, tick)
+		def cleanup(event):
+			if event.widget is window and state["timer"] is not None:
+				self.root.after_cancel(state["timer"])
+				state["timer"] = None
+		comparison_canvas.bind("<Configure>", draw_comparison)
+		window.bind("<Destroy>", cleanup, add="+")
+		tick()
+
 	def open_playtime_viewer(self):
 		"""A responsive native graph; hover details stay inside the panel."""
 		if self.show_first_use_hint('Playtime',
@@ -3482,6 +3649,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		tk.Label(top, text="PLAYTIME", bg=panel, fg=theme["accent"],
 			font=self.ui_font(15, bold=True)).pack(side="left")
 		button(top, "CLOSE", window.destroy).pack(side="right")
+		button(top, "INSIGHTS", lambda: self.open_playtime_insights(selected.get())).pack(side="right", padx=8)
 		controls = tk.Frame(body, bg=panel)
 		controls.pack(fill="x", pady=(0, 12))
 		selected = tk.StringVar(value=self.version.get())
@@ -3498,11 +3666,28 @@ class LauncherUI(LauncherPreferencesMixin):
 		menu["menu"].config(bg=theme["control"], fg=theme["text"], font=self.ui_font(8))
 		style_option_menu(menu, self.theme)
 		menu.pack(side="left", padx=(0, 12))
-		state = {"days": 30, "end": date.today(), "timer": None, "series": []}
+		state = {"days": 30, "end": date.today(), "timer": None, "series": [], "graph_timer": None, "graph_key": None}
 		navigation = tk.Frame(body, bg=panel)
 		navigation.pack(fill="x", pady=(0, 12))
+		range_tabs = {}
 		for days in (7, 30, 90, 365):
-			button(navigation, f"{days} DAYS", lambda value=days: choose_range(value)).pack(side="left", padx=2)
+			tab = tk.Label(navigation, text=f"{days} DAYS", bg=panel, fg=theme["muted"],
+				font=self.ui_font(9, bold=True), padx=10, pady=8, cursor="hand2", takefocus=True)
+			for sequence in ("<Button-1>", "<Return>", "<space>"):
+				tab.bind(sequence, lambda _event, value=days: choose_range(value))
+			tab.bind("<Enter>", lambda _event, target=tab: target.configure(fg=theme["accent"]))
+			tab.bind("<Leave>", lambda _event: style_range_tabs())
+			tab.bind("<FocusIn>", lambda _event, target=tab:
+				target.configure(highlightthickness=1, highlightbackground=theme["accent"]))
+			tab.bind("<FocusOut>", lambda _event, target=tab: target.configure(highlightthickness=0))
+			tab.pack(side="left", padx=(0, 4))
+			range_tabs[days] = tab
+		def style_range_tabs():
+			for days, tab in range_tabs.items():
+				active = days == state["days"]
+				tab.configure(bg=theme["control"] if active else panel,
+					fg=theme["accent"] if active else theme["muted"])
+		style_range_tabs()
 		nav_buttons = []
 		for caption, direction in (("TODAY", 0), ("NEXT ›", 1), ("‹ PREVIOUS", -1)):
 			control = button(navigation, caption, lambda value=direction: move(value))
@@ -3517,11 +3702,13 @@ class LauncherUI(LauncherPreferencesMixin):
 		summary.pack(fill="x", pady=(0, 12))
 		metrics = []
 		for caption in ("PERIOD TOTAL", "AVERAGE / TRACKED DAY", "DAYS PLAYED", "LIFETIME TOTAL"):
-			card = tk.Frame(summary, bg=theme["surface"], padx=10, pady=8)
+			card = tk.Frame(summary, bg=theme["surface"])
 			card.pack(side="left", fill="both", expand=True, padx=(0, 6))
-			tk.Label(card, text=caption, bg=theme["surface"], fg=theme["muted"],
+			content = tk.Frame(card, bg=theme["surface"])
+			content.pack(fill="both", expand=True, padx=10, pady=8)
+			tk.Label(content, text=caption, bg=theme["surface"], fg=theme["muted"],
 				font=self.ui_font(7, bold=True)).pack(anchor="w")
-			value = tk.Label(card, bg=theme["surface"], fg=theme["text"], font=self.ui_font(12, bold=True))
+			value = tk.Label(content, bg=theme["surface"], fg=theme["text"], font=self.ui_font(12, bold=True))
 			value.pack(anchor="w")
 			metrics.append(value)
 			self.add_rounded_surface(card, "surface", radius=7)
@@ -3545,6 +3732,7 @@ class LauncherUI(LauncherPreferencesMixin):
 
 		def choose_range(days):
 			state["days"] = days
+			style_range_tabs()
 			draw()
 
 		def move(direction):
@@ -3555,6 +3743,12 @@ class LauncherUI(LauncherPreferencesMixin):
 		def draw(event=None):
 			if not canvas.winfo_exists():
 				return
+			if state["graph_timer"] is not None:
+				self.root.after_cancel(state["graph_timer"])
+				state["graph_timer"] = None
+			key = (selected.get(), state["days"], state["end"])
+			animate = key != state["graph_key"] and self.preferences.get("animations_enabled", True)
+			state["graph_key"] = key
 			series = self.playtime_series(selected.get(), state["days"], state["end"])
 			state["series"] = series
 			known = [seconds for _, seconds in series if seconds is not None]
@@ -3590,19 +3784,19 @@ class LauncherUI(LauncherPreferencesMixin):
 					for name, duration in daily_parts(day):
 						segment_top = stack_y - duration / ceiling * (bottom - top)
 						canvas.create_rectangle(x - step_width * .34, segment_top,
-							x + step_width * .34, stack_y, fill=game_color(name), outline="")
+							x + step_width * .34, stack_y, fill=game_color(name), outline="", tags="chart_data")
 						stack_y = segment_top
 				elif state["days"] <= 30:
 					if seconds > 0:
 						canvas.create_rectangle(x - step_width * .34, y, x + step_width * .34, bottom,
-							fill=game_color(selected.get()), outline="")
+							fill=game_color(selected.get()), outline="", tags="chart_data")
 				else:
 					points.extend((x, y))
 			if len(points) >= 4:
-				canvas.create_line(*points, fill=theme["accent"], width=2)
+				canvas.create_line(*points, fill=theme["accent"], width=2, tags="chart_data")
 			elif points:
 				x, y = points
-				canvas.create_oval(x-3, y-3, x+3, y+3, fill=theme["accent"], outline="")
+				canvas.create_oval(x-3, y-3, x+3, y+3, fill=theme["accent"], outline="", tags="chart_data")
 			label_indices = range(len(series)) if state["days"] == 7 else sorted(
 				{0, len(series)//4, len(series)//2, 3*len(series)//4, len(series)-1})
 			for index in label_indices:
@@ -3613,6 +3807,39 @@ class LauncherUI(LauncherPreferencesMixin):
 					text="No recorded playtime in this period.", fill=theme["muted"], font=self.ui_font(11))
 			hover.config(text="Move over the graph for daily playtime.")
 
+			if animate:
+				targets = [(item, canvas.coords(item)) for item in canvas.find_withtag("chart_data")]
+				started = time.monotonic()
+				def grow():
+					state["graph_timer"] = None
+					if not canvas.winfo_exists():
+						return
+					progress = min(1, (time.monotonic()-started)/.2)
+					if not self.preferences.get("animations_enabled", True):
+						progress = 1
+					eased = 1-(1-progress)**3
+					for item, coordinates in targets:
+						canvas.coords(item, *[value if index%2 == 0 else bottom+(value-bottom)*eased
+							for index, value in enumerate(coordinates)])
+					if progress < 1 and targets:
+						state["graph_timer"] = self.root.after(16, grow)
+				grow()
+
+		def position_tooltip(event):
+			geometry = state.get("tooltip_geometry")
+			if geometry is None:
+				return
+			tip_w, tip_h, old_x, old_y = geometry
+			tip_x, tip_y = event.x + 14, event.y + 12
+			if tip_x + tip_w > canvas.winfo_width() - 4:
+				tip_x = event.x - tip_w - 14
+			if tip_y + tip_h > canvas.winfo_height() - 4:
+				tip_y = event.y - tip_h - 12
+			tip_x = max(4, min(tip_x, canvas.winfo_width() - tip_w - 4))
+			tip_y = max(4, min(tip_y, canvas.winfo_height() - tip_h - 4))
+			canvas.move("tooltip", tip_x - old_x, tip_y - old_y)
+			state["tooltip_geometry"] = (tip_w, tip_h, tip_x, tip_y)
+
 		def inspect(event):
 			if "bounds" not in state:
 				return
@@ -3622,6 +3849,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				return
 			index = min(len(state["series"])-1, int((event.x-left)/(right-left)*len(state["series"])))
 			if state.get("hover_index") == index:
+				position_tooltip(event)
 				return
 			state["hover_index"] = index
 			canvas.delete("cursor")
@@ -3646,17 +3874,15 @@ class LauncherUI(LauncherPreferencesMixin):
 			if box is None:
 				return
 			tip_w, tip_h = box[2]-box[0]+20, box[3]-box[1]+14
-			# Keep the card at the opposite side of the hovered bar, rather than
-			# chasing the pointer and jumping around while it moves within a day.
-			tip_x = right-tip_w if x < (left+right)/2 else left
-			tip_x = max(4, min(tip_x, canvas.winfo_width()-tip_w-4))
-			tip_y = max(4, min(top, canvas.winfo_height()-tip_h-4))
-			canvas.move(tip_text, tip_x+10-box[0], tip_y+7-box[1])
-			card = canvas.create_rectangle(tip_x, tip_y, tip_x+tip_w, tip_y+tip_h,
+			canvas.move(tip_text, 10-box[0], 7-box[1])
+			card = canvas.create_rectangle(0, 0, tip_w, tip_h,
 				fill=theme["control"], outline=theme["border"], tags="tooltip")
 			canvas.tag_lower(card, tip_text)
+			state["tooltip_geometry"] = (tip_w, tip_h, 0, 0)
+			position_tooltip(event)
 
 		def leave(event):
+			state.pop("tooltip_geometry", None)
 			state["hover_index"] = None
 			canvas.delete("tooltip")
 			canvas.delete("cursor")
@@ -3668,9 +3894,11 @@ class LauncherUI(LauncherPreferencesMixin):
 				state["timer"] = self.root.after(15000, tick)
 
 		def cleanup(event):
-			if event.widget is body and state["timer"] is not None:
-				self.root.after_cancel(state["timer"])
-				state["timer"] = None
+			if event.widget is body:
+				for key in ("timer", "graph_timer"):
+					if state[key] is not None:
+						self.root.after_cancel(state[key])
+						state[key] = None
 
 		canvas.bind("<Configure>", draw)
 		canvas.bind("<Motion>", inspect)
@@ -3719,6 +3947,8 @@ class LauncherUI(LauncherPreferencesMixin):
 			elif value != self.running_version:
 				if self.running_version is not None:
 					self.persist_settings()
+				self._session_game = None
+				self._session_seconds = 0.0
 				self.running_version = value
 				self.session_started_at = now if value is not None else None
 		if not self.scan_running and now - self.last_scan_request >= 2.0:
@@ -3737,6 +3967,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				"game_paths": self.game_paths,
 				"playtime_seconds": self.playtime_seconds,
 				"playtime_history": self.playtime_history,
+				"playtime_session_stats": self.playtime_session_stats,
 				"playtime_history_started": self.playtime_history_started,
 				"setup_complete": self.setup_complete,
 				"preferences": self.preferences,
@@ -4383,7 +4614,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.open_preferences(StoneButton, Overlay, GameOptionMenu, self.game_versions)
 
 	def open_game_options(self, parent=None, window=None):
-		extra_height = 66  # how much the panel grows for each extra row
+		extra_height = 42  # how much the panel grows for each extra row
 		shown_extras = sum(1 for name in EXTRA_VERSIONS if name in self.enabled_extras)
 		embedded = parent is not None
 		if not embedded:
@@ -4405,7 +4636,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				 text="Point each game at its folder. A green READY tag means the launcher "
 					  "found the game there.",
 				 bg="#211c18", fg="#c7baa0", font=self.ui_font(9)
-				 ).pack(anchor="w", pady=(3, 10))
+				 ).pack(anchor="w", pady=(3, 6))
 		tk.Frame(body, bg="#78613c", height=1).pack(fill="x", pady=(0, 6))
 
 		entries = {}
@@ -4413,7 +4644,7 @@ class LauncherUI(LauncherPreferencesMixin):
 
 		# Bottom first so it is never pushed off the panel: buttons, then the status line.
 		footer = tk.Frame(body, bg="#211c18")
-		footer.pack(fill="x", side="bottom", pady=(10, 0))
+		footer.pack(fill="x", side="bottom", pady=(6, 0))
 		setup_controls = tk.Frame(body, bg="#211c18")
 		if not embedded:
 			setup_controls.pack(side="bottom", fill="x", pady=(8, 0))
@@ -4437,55 +4668,10 @@ class LauncherUI(LauncherPreferencesMixin):
 				  size=9, padx=12).pack(side="right")
 			stone(footer, "CANCEL", window.destroy).pack(side="right", padx=(0, 8))
 
-		# Give rows their requested height inside a scrollable viewport. Packing
-		# them directly into a short tab clips later installations and buttons.
-		viewport = tk.Frame(body, bg=self.theme["panel"])
-		viewport.pack(fill="both", expand=True)
-		rows_canvas = tk.Canvas(viewport, bg=self.theme["panel"], bd=0,
-								 highlightthickness=0, height=320)
-		style = ttk.Style(window)
-		serial = self.root.tk.call("incr", "::wow_launcher_scroll_style_serial")
-		scroll_style = f"GameOptions{serial}.Vertical.TScrollbar"
-		trough, thumb = scroll_style + ".trough", scroll_style + ".thumb"
-		style.element_create(trough, "from", "clam", "Vertical.Scrollbar.trough")
-		style.element_create(thumb, "from", "clam", "Vertical.Scrollbar.thumb")
-		style.layout(scroll_style, [(trough, {"sticky": "ns", "children": [
-			(thumb, {"sticky": "nswe", "expand": True})]})])
-		style.configure(scroll_style, background=self.theme["border"],
-			troughcolor=self.theme["control"], bordercolor=self.theme["border"],
-			lightcolor=self.theme["border"], darkcolor=self.theme["border"], width=12)
-		style.map(scroll_style, background=[("active", self.theme["accent"])])
-		rows_scroll = ttk.Scrollbar(viewport, orient="vertical",
-			command=rows_canvas.yview, style=scroll_style)
-		rows_scroll.pack(side="right", fill="y", padx=(6, 0))
-		rows_canvas.pack(side="left", fill="both", expand=True)
-		rows_canvas.configure(yscrollcommand=rows_scroll.set)
-		rows_frame = tk.Frame(rows_canvas, bg=self.theme["panel"])
-		rows_item = rows_canvas.create_window(0, 0, window=rows_frame, anchor="nw")
-		rows_frame.bind("<Configure>", lambda event:
-			rows_canvas.configure(scrollregion=rows_canvas.bbox("all")))
-		rows_canvas.bind("<Configure>", lambda event:
-			rows_canvas.itemconfigure(rows_item, width=event.width))
-
-		def scroll_rows(event):
-			if rows_frame.winfo_reqheight() <= rows_canvas.winfo_height():
-				return
-			if getattr(event, "num", None) in (4, 5):
-				units = -1 if event.num == 4 else 1
-			else:
-				delta = event.delta
-				if not delta:
-					return
-				units = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
-			rows_canvas.yview_scroll(units, "units")
-			return "break"
-
-		def bind_row_scroll(widget):
-			for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-				widget.bind(sequence, scroll_rows, add="+")
-			for child in widget.winfo_children():
-				bind_row_scroll(child)
-		bind_row_scroll(rows_canvas)
+		# Compact rows share the available space; every installation stays visible.
+		rows_frame = tk.Frame(body, bg=self.theme["panel"])
+		rows_frame.pack(fill="both", expand=True)
+		rows_frame.columnconfigure(0, weight=1)
 
 		def refresh_chip(version, path_var, chip):
 			text = path_var.get().strip()
@@ -4497,27 +4683,34 @@ class LauncherUI(LauncherPreferencesMixin):
 				chip.config(text="\u25cf NOT SET", fg=self.theme["disabled"])
 
 		def add_row(version, path=None):
-			row = tk.Frame(rows_frame, bg="#181614", padx=8, pady=5)
-			row._button_backdrop_role = "surface"
-			row.pack(fill="x", pady=3)
-			tk.Label(row, text=version, width=24, anchor="w", bg="#181614",
+			index = len(entries)
+			rows_frame.rowconfigure(index, weight=1, uniform="game_installations")
+			row = tk.Frame(rows_frame, bg="#181614")
+			row.grid(row=index, column=0, sticky="nsew", pady=2)
+			content = tk.Frame(row, bg="#181614")
+			content._button_backdrop_role = "surface"
+			content.pack(fill="both", expand=True, padx=8, pady=3)
+			tk.Label(content, text=version, width=24, anchor="w", bg="#181614",
 					 fg=TEXT, font=self.ui_font(9, bold=True)).pack(side="left", padx=(2, 8))
 			path_var = tk.StringVar(
 				value=self.game_paths.get(version, "") if path is None else path)
-			entry = tk.Entry(row, textvariable=path_var, bg="#171512", fg=TEXT,
+			entry = tk.Entry(content, textvariable=path_var, bg="#171512", fg=TEXT,
 							 insertbackground=TEXT, relief="flat", bd=1,
 							 highlightthickness=1, highlightbackground="#51432f",
 							 highlightcolor="#806b42", font=self.ui_font(9))
-			entry.pack(side="left", fill="x", expand=True, padx=4, ipady=4)
-			chip = tk.Label(row, text="", width=12, anchor="w", bg="#181614",
+			entry.pack(side="left", fill="x", expand=True, padx=4, ipady=2)
+			chip = tk.Label(content, text="", width=12, anchor="w", bg="#181614",
 							fg=MUTED, font=self.ui_font(7, bold=True))
 			chip.pack(side="left", padx=(6, 0))
-			stone(row, "BROWSE", lambda variable=path_var: self.browse_folder(
-				window, variable), pady=2).pack(side="left", padx=(6, 2))
+			browse_button = stone(content, "BROWSE", lambda variable=path_var: self.browse_folder(
+				window, variable), pady=2)
+			browse_button.configure(height=max(30, self.ui_font(8, bold=True).metrics("linespace")+16))
+			browse_button.pack(side="left", padx=(6, 2))
 			args_var = tk.StringVar(value=self.launch_args.get(version, ""))
 			args_button = stone(
-				row, "ARGS \u25cf", lambda v=version, var=args_var: self.edit_launch_args(
+				content, "ARGS \u25cf", lambda v=version, var=args_var: self.edit_launch_args(
 					window, v, var), pady=2)
+			args_button.configure(height=max(30, self.ui_font(8, bold=True).metrics("linespace")+16))
 			args_button.pack(side="left", padx=(2, 2))
 
 			def refresh_args(*_a, var=args_var, button=args_button):
@@ -4532,7 +4725,6 @@ class LauncherUI(LauncherPreferencesMixin):
 			refresh_chip(version, path_var, chip)
 			entries[version] = path_var
 			self.style_popup_row(row)
-			bind_row_scroll(row)
 			return row
 
 		for version in self.game_versions:
@@ -4965,10 +5157,12 @@ class LauncherUI(LauncherPreferencesMixin):
 			tk.Label(ready_page, text="You can revisit setup from OPTIONS at any time.", bg="#211c18", fg=MUTED,
 				font=self.ui_font(9)).pack(anchor="w", pady=(16, 0))
 			self.apply_theme(self.version.get(), subtree=window)
+			self.animate_content(ready_page)
 
 		def show_welcome():
 			body.pack_forget()
 			welcome.pack(fill="both", expand=True)
+			self.animate_content(welcome)
 
 		footer = tk.Frame(body, bg="#211c18")
 		footer.pack(fill="x", side="bottom", pady=(12, 0))
@@ -5000,6 +5194,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			ready_page.pack_forget()
 			welcome.pack_forget()
 			body.pack(fill="both", expand=True)
+			self.animate_content(body)
 			if not state["scan_started"]:
 				start_scan()
 
@@ -5532,6 +5727,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			window.resize(420)
 			search_page.pack(fill="both", expand=True)
 			name_entry.focus_set()
+			self.animate_content(search_page)
 
 		def view_character():
 			requested = {"version": version_var.get(),
@@ -5545,6 +5741,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			window.resize(700)
 			character_page.pack(fill="both", expand=True)
 			render_details()
+			self.animate_content(character_page)
 
 		profile_summary = tk.Frame(character_page, bg=panel)
 		profile_summary.pack(fill="x", pady=(0, 6))
@@ -5717,6 +5914,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			filter_var.set("")
 			if state["result"]:
 				render_details()
+				self.animate_content(state["content"])
 
 		def schedule_details():
 			if state["result"] and body.winfo_exists():
@@ -6951,6 +7149,7 @@ def set_windows_app_id():
 
 
 if __name__ == "__main__":
+	multiprocessing.freeze_support()
 	set_windows_app_id()
 	app = tk.Tk()
 	LauncherUI(app)
