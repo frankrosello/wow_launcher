@@ -7,6 +7,8 @@ import threading
 import time
 from urllib.parse import urljoin, urlparse
 
+from launcher_models import validate_news
+
 NEWS_TTL = 600
 ARTICLE_TTL = 3600
 ARTICLE_FORMAT = 2
@@ -34,7 +36,7 @@ def _http_client():
                 context = ssl.create_default_context()
             _client = httpx.Client(
                 headers=_HEADERS, verify=context, follow_redirects=True,
-                timeout=httpx.Timeout(12, connect=5, pool=5),
+                timeout=httpx.Timeout(8, connect=3, pool=3),
                 limits=httpx.Limits(max_connections=8, max_keepalive_connections=4))
     return _client
 
@@ -52,7 +54,7 @@ def is_forum_link(url):
     return host == "forums.blizzard.com" or host.endswith(".forums.blizzard.com")
 
 
-def download_html(url, limit, json_response=False):
+def _download_html(url, limit, json_response=False):
     if urlparse(url).scheme not in ("https", "http"):
         raise ValueError("Only HTTP and HTTPS news links are supported")
     headers = {"Accept": "application/json"} if json_response else None
@@ -82,6 +84,19 @@ def download_html(url, limit, json_response=False):
         return str(response.url), text
 
 
+# The launcher supplies its retry policy from main.py; no helper-module dependency.
+_retry_download = _download_html
+
+
+def configure_network_retry(policy):
+    global _retry_download
+    _retry_download = policy(_download_html)
+
+
+def download_html(url, limit, json_response=False):
+    return _retry_download(url, limit, json_response=json_response)
+
+
 def cached_entry(cache_dir, kind, url):
     """Stale entries are retained for offline use. Cache failures are nonfatal."""
     try:
@@ -93,7 +108,7 @@ def cached_entry(cache_dir, kind, url):
                 data = entry["data"]
                 if not isinstance(data, list):
                     return None
-                filtered = [article for article in data if isinstance(article, dict)
+                filtered = [article for article in validate_news(data) if isinstance(article, dict)
                             and is_news_article_link(urljoin(url, str(article.get("url") or "")))]
                 if not filtered:
                     return None
@@ -170,7 +185,7 @@ def parse_feed(html, base_url):
     for link in soup.select("a[href], blz-button[href]"):
         if _ID.search(link["href"]):
             add(_text(link) or link.get("aria-label", ""), "", link["href"])
-    return list(articles.values())
+    return validate_news(list(articles.values()))
 
 
 def fetch_feed(url, cache_dir, force=False):

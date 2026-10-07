@@ -26,12 +26,33 @@ from urllib.request import Request, urlopen
 import webbrowser
 
 import psutil
+import httpx
+from platformdirs import user_cache_path, user_config_path, user_data_path
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
+from launcher_models import validate_settings
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
+
+def transient_error(error):
+    return isinstance(error, httpx.TransportError) or (
+        isinstance(error, httpx.HTTPStatusError) and error.response.status_code in (500, 502, 503, 504)
+    )
+
+
+network_retry = retry(
+    retry=retry_if_exception(transient_error),
+    stop=stop_after_attempt(2),
+    wait=wait_random_exponential(multiplier=0.3, max=0.6),
+    reraise=True,
+)
+
 
 from addon_manager import AddonManager, Overlay
 from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager, install_overlay_animation
 from launcher_updates import LauncherUpdateController
-from launcher_news_services import cached_entry, fetch_feed, fetch_article, fetch_reader_image
+from launcher_qt_reader import run_reader, install_scroll_capture
+from launcher_news_services import cached_entry, fetch_feed, fetch_article, fetch_reader_image, configure_network_retry
+
+configure_network_retry(network_retry)
 
 AddonManager = backup_addon_manager(AddonManager)
 install_overlay_animation(Overlay)
@@ -362,50 +383,51 @@ def app_dir():
 
 
 def settings_dir():
-	"""Per-user settings, independent of the launcher installation or bundle."""
-	if sys.platform == "win32":
-		base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
-		return base / "WoWLauncher"
-	if sys.platform == "darwin":
-		return Path.home() / "Library" / "Application Support" / "WoWLauncher"
-	configured = os.environ.get("XDG_CONFIG_HOME", "")
-	base = Path(configured) if configured and Path(configured).is_absolute() else Path.home() / ".config"
-	return base / "WoWLauncher"
+    if sys.platform in ("win32", "darwin"):
+        return user_data_path("WoWLauncher", appauthor=False, roaming=True)
+    return user_config_path("WoWLauncher", appauthor=False)
+
+
+def news_cache_dir(settings_path=None):
+    # Existing caches remain usable without a large copy at application startup.
+    legacy = Path(settings_path).parent / "news-cache" if settings_path else settings_dir() / "news-cache"
+    return legacy if legacy.exists() else user_cache_path("WoWLauncher", appauthor=False) / "news-cache"
 
 
 def write_settings_json(path, data):
-	"""Replace settings atomically so an interrupted save keeps the previous file."""
-	path.parent.mkdir(parents=True, exist_ok=True)
-	temporary = None
-	try:
-		with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-			prefix=".launcher_settings-", suffix=".tmp", delete=False) as output:
-			temporary = Path(output.name)
-			json.dump(data, output, indent=2)
-			output.flush()
-			os.fsync(output.fileno())
-		os.replace(temporary, path)
-	finally:
-		if temporary is not None:
-			temporary.unlink(missing_ok=True)
+    path = Path(path)
+    data = validate_settings(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".launcher_settings-",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(data, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
-def read_settings_json(path):
-	"""Prefer the user settings; migrate a valid legacy file only on first use."""
-	if path.exists():
-		data = json.loads(path.read_text(encoding="utf-8"))
-	else:
-		legacy = app_dir() / "launcher_settings.json"
-		data = json.loads(legacy.read_text(encoding="utf-8"))
-		if not isinstance(data, dict):
-			raise ValueError("Launcher settings must contain a JSON object")
-		try:
-			write_settings_json(path, data)
-		except OSError:
-			pass  # Use the legacy data this session; normal saves report any write error.
-	if not isinstance(data, dict):
-		raise ValueError("Launcher settings must contain a JSON object")
-	return data
+def read_settings_json(path, legacy_path=None):
+    path = Path(path)
+    source = path if path.exists() else Path(legacy_path or app_dir() / "launcher_settings.json")
+    data = validate_settings(json.loads(source.read_text(encoding="utf-8")))
+    if source != path:
+        try:
+            write_settings_json(path, data)
+        except OSError:
+            pass
+    return data
 
 
 def in_official_install(path):
@@ -930,7 +952,7 @@ def style_option_menu(widget, theme):
 
 
 def fetch_news_article(url, cache_dir=None, force=False):
-	result, _warning = fetch_article(url, cache_dir or settings_dir() / "news-cache", force=force)
+	result, _warning = fetch_article(url, cache_dir or news_cache_dir(), force=force)
 	return result
 
 
@@ -1361,6 +1383,7 @@ def _download_news_worker(sources, connection, cache_dir, force=False):
 		launcher = LauncherUI.__new__(LauncherUI)
 		launcher._news_page_cache = {}
 		launcher.settings_path = Path(cache_dir).parent / "launcher_settings.json"
+		launcher._news_cache_dir = Path(cache_dir)
 		launcher._news_source_errors = {}
 		with ThreadPoolExecutor(max_workers=min(4, len(sources))) as pool:
 			results = list(pool.map(lambda url: launcher.news_source_articles(url, True, force=force), sources))
@@ -2384,7 +2407,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			return [dict(article) for article in cached[1]], False
 		if not allow_network:
 			return None
-		entry, error = fetch_feed(source_url, self.settings_path.parent / "news-cache", force=force)
+		entry, error = fetch_feed(source_url, getattr(self, "_news_cache_dir", None) or news_cache_dir(self.settings_path), force=force)
 		if error:
 			self.__dict__.setdefault("_news_source_errors", {})[source_url] = error
 		if entry:
@@ -2401,11 +2424,11 @@ class LauncherUI(LauncherPreferencesMixin):
 			return results
 		context = multiprocessing.get_context("spawn")
 		receiver, sender = context.Pipe(duplex=False)
-		process = context.Process(target=_download_news_worker, args=(missing, sender, str(self.settings_path.parent / "news-cache"), force), daemon=True)
+		process = context.Process(target=_download_news_worker, args=(missing, sender, str(news_cache_dir(self.settings_path)), force), daemon=True)
 		try:
 			process.start()
 			sender.close()
-			deadline = time.monotonic() + max(15, ((len(missing)+3)//4)*12)
+			deadline = time.monotonic() + max(25, ((len(missing)+3)//4)*20)
 			while not receiver.poll(.1):
 				if self._closing or not process.is_alive() or time.monotonic() >= deadline:
 					raise TimeoutError("News loading was interrupted or timed out.")
@@ -2472,172 +2495,18 @@ class LauncherUI(LauncherPreferencesMixin):
 			if version != "Crusader Storm"]
 
 	def open_news_hub(self):
-		"""Open the all-games news home page with a game filter."""
+		"""Open the Qt news library inside the launcher's reader panel."""
 		if self.show_first_use_hint('News',
-			'Filter news by game and select an article to read it inside the launcher. Fresh news requires an internet connection; saved news and articles can be read offline.', self.open_news_hub):
+			'Filter news by game, search article titles, and select a headline to read it inside the launcher. Saved news is available offline.', self.open_news_hub):
 			return
-		existing = getattr(self, "news_hub", None)
-		if existing is not None and existing.winfo_exists():
-			existing.lift()
-			return
-
-		theme = dict(self.theme)
-		window = self.news_hub = Overlay(self.root, 980, 650)
-		body = window.make_body()
-		body.config(bg=theme["panel"])
-
-		header = tk.Frame(body, bg=theme["panel"])
-		header.pack(fill="x", pady=(0, 8))
-		tk_label = tk.Label(header, text="NEWS", bg=theme["panel"], fg=theme["accent"],
-			font=self.ui_font(15, bold=True))
-		tk_label.pack(side="left")
-
-		filter_frame = tk.Frame(header, bg=theme["panel"])
-		filter_frame.pack(side="right")
-		tk.Label(filter_frame, text="GAME", bg=theme["panel"], fg=theme["muted"],
-			font=self.ui_font(7, bold=True)).pack(side="left", padx=(0, 6))
-		filter_var = tk.StringVar(value="ALL GAMES")
-		versions = ["ALL GAMES", *self.news_hub_versions()]
-		filter_menu = GameOptionMenu(filter_frame, filter_var, *versions)
-		filter_menu.config(bg=theme["control"], fg=theme["text"], activebackground=theme["control_active"],
-			activeforeground=theme["bright"], relief="raised", bd=1,
-			font=self.ui_font(8, bold=True), padx=8, pady=2)
-		filter_menu["menu"].config(bg=theme["control"], fg=theme["text"],
-			activebackground=theme["control_active"], activeforeground=theme["bright"])
-		style_option_menu(filter_menu, self.theme)
-		filter_menu.pack(side="left")
-
-		status = tk.Label(body, text="Loading news…", bg=theme["panel"], fg=theme["muted"],
-			font=self.ui_font(8), anchor="w")
-		status.pack(fill="x", pady=(0, 7))
-
-		content = tk.Frame(body, bg=theme["surface"])
-		content.pack(fill="both", expand=True)
-		scroll = tk.Scrollbar(content, orient="vertical")
-		scroll.pack(side="right", fill="y")
-		canvas = tk.Canvas(content, bg=theme["surface"], highlightthickness=0,
-			bd=0, yscrollcommand=scroll.set)
-		canvas.pack(side="left", fill="both", expand=True)
-		scroll.config(command=canvas.yview)
-		list_frame = tk.Frame(canvas, bg=theme["surface"])
-		window_id = canvas.create_window((0, 0), window=list_frame, anchor="nw")
-
-		state = {"articles": [], "filter": "ALL GAMES", "closed": False}
-		state["status"] = status
-		window._news_hub_state = state
-
-		def close():
-			window.destroy()
-
-		def destroyed(event):
-			if event.widget is window:
-				state["closed"] = True
-				self.news_hub = None
-
-		window.bind("<Destroy>", destroyed, add="+")
-
-		def close_button(parent, caption, command):
-			button = StoneButton(parent, text=caption, command=command,
-				font=self.ui_font(8, bold=True), padx=7, pady=3, bg=theme["panel"],
-				theme_provider=lambda: self.theme, style="subtle", version_colored=True)
-			button.pack(side="right", padx=(6, 0))
-			return button
-
-		close_button(header, "CLOSE", close)
-		close_button(header, "RELOAD", lambda: self.load_news_hub(force=True))
-
-		def resize_canvas(_event=None):
-			try:
-				canvas.itemconfigure(window_id, width=canvas.winfo_width())
-				canvas.configure(scrollregion=canvas.bbox("all"))
-			except tk.TclError:
-				pass
-		list_frame.bind("<Configure>", resize_canvas)
-		canvas.bind("<Configure>", resize_canvas)
-
-		def render():
-			if state["closed"] or not window.winfo_exists():
-				return
-			self.clear_children(list_frame)
-			selected = state["filter"]
-			articles = state["articles"]
-			if selected != "ALL GAMES":
-				articles = [item for item in articles if selected in item.get("games", [])]
-			status.config(text=f"{len(articles)} article{'s' if len(articles) != 1 else ''} • {selected}")
-			failure = state.get("failures", {}).get(selected)
-			if failure and not articles:
-				status.config(text=f"News unavailable • {selected}")
-				tk.Label(list_frame, text="Could not load news: " + failure,
-					bg=theme["surface"], fg=theme["warning"], font=self.ui_font(9),
-					wraplength=780, justify="left").pack(anchor="w", padx=14, pady=16)
-				link = tk.Label(list_frame, text="Open source website", cursor="hand2",
-					bg=theme["surface"], fg=theme["accent"], font=self.ui_font(9))
-				link.pack(anchor="w", padx=14)
-				link.bind("<Button-1>", lambda _event: webbrowser.open(self.news_sources_for(selected)[0]))
-				resize_canvas()
-				return
-			if not articles:
-				tk.Label(list_frame, text="No news available for this game.", bg=theme["surface"],
-					fg=theme["muted"], font=self.ui_font(9, italic=True)).pack(anchor="w", padx=14, pady=16)
-				resize_canvas()
-				return
-			for article in articles:
-				card = tk.Frame(list_frame, bg=theme["panel"], highlightbackground=theme["control"],
-					highlightthickness=1, padx=10, pady=8, cursor="hand2")
-				card.pack(fill="x", padx=10, pady=4)
-				meta = tk.Label(card, text=article.get("game", "World of Warcraft").upper(),
-					bg=theme["panel"], fg=theme["accent"], font=self.ui_font(7, bold=True), anchor="w")
-				meta.pack(fill="x")
-				title = tk.Label(card, text=article["title"], bg=theme["panel"], fg=theme["bright"],
-					font=self.ui_font(10, bold=True), anchor="w", justify="left", wraplength=780)
-				title.pack(fill="x", pady=(2, 2))
-				summary = tk.Label(card, text=self.news_summary(article), bg=theme["panel"], fg=theme["muted"],
-					font=self.ui_font(8), anchor="w", justify="left", wraplength=780)
-				summary.pack(fill="x")
-				widgets = (card, meta, title, summary)
-				def hover(active, widgets=widgets, meta=meta):
-					bg = theme["control"] if active else theme["panel"]
-					for widget in widgets:
-						widget.configure(bg=bg)
-					meta.configure(fg=theme["bright"] if active else theme["accent"])
-				for widget in widgets:
-					widget.bind("<Button-1>", lambda _event, url=article["url"]: self.open_news_browser(url))
-					widget.bind("<Enter>", lambda _event, hover=hover: hover(True))
-					widget.bind("<Leave>", lambda _event, hover=hover: hover(False))
-			resize_canvas()
-
-		def filter_changed(*_args):
-			state["filter"] = filter_var.get()
-			render()
-
-		filter_var.trace_add("write", filter_changed)
-		window.bind("<Escape>", lambda _event: close())
-		state["render"] = render
-		window._news_hub_render = render
-		self.load_news_hub_window(window, state, status, render)
-
-	def load_news_hub_window(self, window, state, status, render):
-		self.news_hub_generation += 1
-		generation = self.news_hub_generation
-		status.config(text="Loading news for all games…", fg=self.theme["muted"])
-		threading.Thread(target=self.fetch_news_hub, args=(generation,), daemon=True).start()
-		self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
+		self.open_news_browser("launcher:news")
 
 	def load_news_hub(self, force=False):
-		window = getattr(self, "news_hub", None)
-		if window is None or not window.winfo_exists():
+		window = getattr(self, "news_browser", None)
+		if window is None or not window.winfo_exists() or not hasattr(window, "_qt_news_hub_refresh"):
 			self.open_news_hub()
 			return
-		state = getattr(window, "_news_hub_state", None)
-		if state is None:
-			return
-		self.news_hub_generation += 1
-		generation = self.news_hub_generation
-		status = state["status"]
-		render = state["render"]
-		status.config(text="Refreshing all game news…", fg=self.theme["muted"])
-		threading.Thread(target=self.fetch_news_hub, args=(generation, force), daemon=True).start()
-		self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
+		window._qt_news_hub_refresh(force)
 
 	def fetch_news_hub(self, generation, force=False):
 		# Fetch each source once, then classify each unique article once.
@@ -2666,22 +2535,6 @@ class LauncherUI(LauncherPreferencesMixin):
 			article["game"] = " / ".join(article["games"]) or "World of Warcraft"
 			all_articles.append(article)
 		self.news_hub_queue.put((generation, all_articles, failures))
-
-	def poll_news_hub(self, window, state, status, render, generation):
-		if state.get("closed") or not window.winfo_exists():
-			return
-		try:
-			result_generation, articles, failures = self.news_hub_queue.get_nowait()
-		except queue.Empty:
-			self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
-			return
-		if result_generation != generation:
-			self.root.after(100, lambda: self.poll_news_hub(window, state, status, render, generation))
-			return
-		state["articles"] = articles
-		state["failures"] = failures
-		status.config(text=f"{len(articles)} articles • ALL GAMES", fg=self.theme["muted"])
-		render()
 
 	def load_game_news(self, force=False):
 		self.schedule_news_refresh()
@@ -2733,7 +2586,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			# Include saved archives in the immediate preview, even if some pages are missing.
 			sources = self.news_archive_sources(version, 10)
 			for source in sources:
-				entry = cached_entry(self.settings_path.parent / "news-cache", "feed", source)
+				entry = cached_entry(news_cache_dir(self.settings_path), "feed", source)
 				if entry and source not in self._news_page_cache:
 					stamp = time.monotonic() - max(0, time.time() - entry["saved"])
 					self._news_page_cache[source] = (stamp, entry["data"])
@@ -2827,7 +2680,155 @@ class LauncherUI(LauncherPreferencesMixin):
 	NEWS_FALLBACK_SUMMARY = "Read the full story on the official World of Warcraft site."
 
 	def open_news_browser(self, url):
-		"""Read news articles and forum posts inside the native reader."""
+		"""Display Qt's reader surface inside the launcher's existing overlay."""
+		existing = getattr(self, "news_browser", None)
+		if existing is not None and existing.winfo_exists():
+			if hasattr(existing, "navigate"):
+				existing.navigate(url)
+				existing.lift()
+				return
+		hub = getattr(self, "news_hub", None)
+		if hub is not None and hub.winfo_exists():
+			hub.destroy()
+		window = self.news_browser = Overlay(self.root, 1040, 660)
+		body = window.make_body()
+		body.configure(bg=self.theme["panel"])
+		canvas = tk.Canvas(body, bg=self.theme["panel"], highlightthickness=0, takefocus=True)
+		canvas.pack(fill="both", expand=True)
+		placeholder = canvas.create_text(24, 24, anchor="nw", text="Loading article…",
+			fill=self.theme["text"], font=self.ui_font(14))
+		image_item = canvas.create_image(0, 0, anchor="nw")
+		context = multiprocessing.get_context("spawn")
+		commands, inputs, frames = context.Queue(), context.Queue(256), context.Queue(2)
+		process = context.Process(target=run_reader, args=(url, dict(self.theme),
+			str(news_cache_dir(self.settings_path)), str(resource_path("fonts")), commands,
+			(inputs, frames)), daemon=True)
+		state = {"closed": False, "poll": None, "photo": None, "home": False,
+			"motion": None, "resize": None, "ready": False, "scroll": 0.0}
+
+		def send(event):
+			if state["closed"]:
+				return
+			try:
+				inputs.put_nowait(event)
+			except queue.Full:
+				pass
+
+		def refresh_hub(force=False):
+			if state["closed"] or (state.get("hub_loading") and not force):
+				return
+			self.news_hub_generation += 1
+			state["hub_generation"] = self.news_hub_generation
+			state["hub_loading"] = True
+			versions = self.news_hub_versions()
+			if hasattr(self, "_qt_hub_articles"):
+				send(("hub_data", self._qt_hub_articles, {}, versions))
+			send(("hub_loading", versions))
+			threading.Thread(target=self.fetch_news_hub,
+				args=(state["hub_generation"], force), daemon=True).start()
+		window._qt_news_hub_refresh = refresh_hub
+		window.navigate = lambda target: send(("navigate", target))
+		canvas.bind("<Configure>", lambda event: state.update(resize=("resize", event.width, event.height)))
+		canvas.bind("<Motion>", lambda event: state.update(motion=("move", event.x, event.y)))
+		def press(event):
+			canvas.focus_set()
+			send(("press", event.x, event.y))
+		canvas.bind("<ButtonPress-1>", press)
+		canvas.bind("<ButtonRelease-1>", lambda event: send(("release", event.x, event.y)))
+		def add_scroll(pixels):
+			if not state["closed"]:
+				state["scroll"] += pixels
+		cleanup_scroll = install_scroll_capture(self.root, window, add_scroll, sys.platform)
+		canvas.bind("<Enter>", lambda _event: canvas.focus_set())
+		def key(event):
+			send(("key", event.keysym, event.char, event.state))
+			return "break"
+		canvas.bind("<KeyPress>", key)
+
+		def destroyed(event):
+			if event.widget is not window or state["closed"]:
+				return
+			send(("close",))
+			state["closed"] = True
+			state["photo"] = None
+			cleanup_scroll()
+			if state["poll"] is not None:
+				self.root.after_cancel(state["poll"])
+			# Give Qt a moment to exit without blocking Tk or its close animation.
+			def reap():
+				if process.pid is not None:
+					if process.is_alive():
+						process.terminate()
+					process.join(0)
+				for channel in (commands, inputs, frames):
+					channel.cancel_join_thread()
+					channel.close()
+			self.root.after(200, reap)
+		window.bind("<Destroy>", destroyed, add="+")
+
+		def poll():
+			state["poll"] = None
+			if state["closed"] or self._closing:
+				return
+			for name in ("resize", "motion"):
+				if state[name] is not None:
+					send(state[name])
+					state[name] = None
+			if state["scroll"]:
+				send(("scroll_pixels", state["scroll"]))
+				state["scroll"] = 0.0
+			frame = None
+			try:
+				while True:
+					frame = frames.get_nowait()
+			except queue.Empty:
+				pass
+			if frame is not None:
+				_, width, height, stride, pixels, cursor = frame
+				image = Image.frombytes("RGB", (width, height), pixels, "raw", "RGB", stride)
+				state["photo"] = ImageTk.PhotoImage(image, master=canvas)
+				canvas.itemconfigure(image_item, image=state["photo"])
+				canvas.itemconfigure(placeholder, text="")
+				canvas.configure(cursor={13: "hand2", 4: "xterm"}.get(cursor, ""))
+				state["ready"] = True
+			try:
+				while True:
+					command = commands.get_nowait()
+					if command == "home":
+						refresh_hub()
+					elif command == "refresh_home":
+						refresh_hub(force=True)
+					elif command == "closed":
+						window.destroy()
+						return
+			except queue.Empty:
+				pass
+			try:
+				while True:
+					generation, articles, failures = self.news_hub_queue.get_nowait()
+					if generation == state.get("hub_generation"):
+						state["hub_loading"] = False
+						self._qt_hub_articles = articles
+						send(("hub_data", articles, failures, self.news_hub_versions()))
+			except queue.Empty:
+				pass
+			if not process.is_alive():
+				canvas.itemconfigure(placeholder, text="Article reader stopped. Close and reopen to retry.")
+				canvas.tag_raise(placeholder)
+				return
+			state["poll"] = self.root.after(40, poll)
+
+		try:
+			process.start()
+			self._qt_readers = [item for item in getattr(self, "_qt_readers", []) if item.is_alive()]
+			self._qt_readers.append(process)
+			state["poll"] = self.root.after(40, poll)
+		except Exception as error:
+			window.destroy()
+			messagebox.showerror("Article reader", str(error), parent=self.root)
+
+	def open_tk_news_browser(self, url):
+		"""Compatibility reader retained while the launcher UI remains in Tk."""
 		# When an article is opened from the all-games news home, close the
 		# home panel so the article reader becomes the active news view.
 		hub = getattr(self, "news_hub", None)
@@ -2931,7 +2932,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				navigate(state["history"][index], record=False)
 
 		def download(target, generation, force=False):
-			cache_dir = self.settings_path.parent / "news-cache"
+			cache_dir = news_cache_dir(self.settings_path)
 			cached = cached_entry(cache_dir, "article", target)
 			try:
 				if cached:
@@ -2998,7 +2999,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				if state["closed"] or render != state["render"]:
 					return
 				try:
-					image = fetch_reader_image(target, self.settings_path.parent / "news-cache", width)
+					image = fetch_reader_image(target, news_cache_dir(self.settings_path), width)
 					# Flatten alpha off-thread so scrolling draws an opaque bitmap.
 					flat = Image.new("RGB", image.size, theme["surface"])
 					flat.paste(image, (0, 0), image.getchannel("A"))
@@ -3986,6 +3987,10 @@ class LauncherUI(LauncherPreferencesMixin):
 
 	def close_launcher(self):
 		self._closing = True
+		for process in getattr(self, "_qt_readers", []):
+			if process.is_alive():
+				process.terminate()
+			process.join(.1)
 		self.stop_tray()
 		self.updates.shutdown()
 		if self.running_version is not None:

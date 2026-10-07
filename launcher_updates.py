@@ -4,6 +4,8 @@ import queue
 import re
 import threading
 import webbrowser
+
+from packaging.version import Version
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from tkinter import messagebox
@@ -17,7 +19,7 @@ def version_key(value):
     match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?', str(value).strip())
     if not match:
         raise ValueError('Release version must use a stable vMAJOR.MINOR.PATCH tag.')
-    return tuple(map(int, match.groups()))
+    return Version(".".join(match.groups()))
 
 
 def fetch_latest_release():

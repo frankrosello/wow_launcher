@@ -18,6 +18,7 @@ import uuid
 import zipfile
 import webbrowser
 from launcher_updates import LAUNCHER_VERSION, RELEASES_URL
+from launcher_models import clean_preferences
 
 DEFAULT_PREFERENCES = {
     'launch_behavior': 'Keep open', 'news_refresh_minutes': 30,
@@ -148,18 +149,6 @@ def install_overlay_animation(overlay_class):
     overlay_class._opening_animation_installed = True
 
 
-def clean_preferences(value):
-    result = dict(DEFAULT_PREFERENCES)
-    if not isinstance(value, dict):
-        return result
-    if value.get('launch_behavior') in ('Keep open', 'Minimize', 'Minimize to tray'):
-        result['launch_behavior'] = value['launch_behavior']
-    if type(value.get('news_refresh_minutes')) is int and value['news_refresh_minutes'] in NEWS_CHOICES.values():
-        result['news_refresh_minutes'] = value['news_refresh_minutes']
-    for key in ('animations_enabled', 'addon_backups_enabled', 'playtime_paused', 'launcher_update_checks'):
-        if type(value.get(key)) is bool:
-            result[key] = value[key]
-    return result
 
 
 def backup_directory(settings_path, version):
