@@ -183,10 +183,17 @@ class Widget:
         p=self._qt.palette();p.setColor(G.QPalette.ColorRole.Window,color(self._opts.get('bg')));p.setColor(G.QPalette.ColorRole.WindowText,color(self._opts.get('fg')))
         p.setColor(G.QPalette.ColorRole.Base,color(self._opts.get('bg')));p.setColor(G.QPalette.ColorRole.Text,color(self._opts.get('fg')))
         p.setColor(G.QPalette.ColorRole.Highlight,color(self._opts.get('selectbackground',self._opts.get('activebackground','#473a27'))));p.setColor(G.QPalette.ColorRole.HighlightedText,color(self._opts.get('selectforeground','#fff1c7')))
+        # Match text/background in active and inactive windows; keep disabled
+        # controls readable rather than inheriting the OS grey palette.
+        for group in (G.QPalette.ColorGroup.Active,G.QPalette.ColorGroup.Inactive,G.QPalette.ColorGroup.Disabled):
+            for role in (G.QPalette.ColorRole.Window,G.QPalette.ColorRole.Base,G.QPalette.ColorRole.Button):
+                p.setColor(group,role,color(self._opts['bg']))
+            for role in (G.QPalette.ColorRole.WindowText,G.QPalette.ColorRole.Text,G.QPalette.ColorRole.ButtonText):
+                p.setColor(group,role,color(self._opts.get('disabledforeground',self._opts['fg']) if group==G.QPalette.ColorGroup.Disabled else self._opts['fg']))
         self._qt.setPalette(p);self._qt.setAutoFillBackground(True)
         if type(self._qt) is W.QWidget:
             edge=self._opts.get('highlightbackground',self._opts.get('bg'));bd=int(self._opts.get('highlightthickness',0)) or int(self._opts.get('bd',0))
-            self._qt.setStyleSheet(f'QWidget#{self._w} {{border:{bd}px solid {edge};}}')
+            self._qt.setStyleSheet(f'QWidget#{self._w} {{background-color:{self._opts["bg"]};color:{self._opts["fg"]};border:{bd}px solid {edge};}}')
     def cget(self,key):return self._opts.get({'background':'bg','foreground':'fg'}.get(key,key),'')
     def __getitem__(self,key):return self.cget(key)
     def __setitem__(self,key,value):self.configure(**{key:value})
@@ -424,10 +431,15 @@ class Label(Widget):
     def _apply(self):
         super()._apply();o=self._opts;self._qt.setText(str(o.get('text','')));self._qt.setWordWrap(bool(o.get('wraplength')))
         a=o.get('anchor','center');a='' if a=='center' else a;alignment=C.Qt.AlignmentFlag.AlignLeft if 'w' in a else C.Qt.AlignmentFlag.AlignRight if 'e' in a else C.Qt.AlignmentFlag.AlignHCenter
+        # Tk's justify controls wrapped lines independently of the label anchor.
+        # Honour it explicitly so existing descriptions stay left aligned.
+        if o.get('wraplength') or '\n' in str(o.get('text','')):
+            if o.get('justify')=='left':alignment=C.Qt.AlignmentFlag.AlignLeft
+            elif o.get('justify')=='right':alignment=C.Qt.AlignmentFlag.AlignRight
         alignment|=C.Qt.AlignmentFlag.AlignTop if 'n' in a else C.Qt.AlignmentFlag.AlignBottom if 's' in a else C.Qt.AlignmentFlag.AlignVCenter;self._qt.setAlignment(alignment)
         if o.get('image'):self._qt.setPixmap(o['image'].qt)
-        self._qt.setMargin(int(o.get('padx',0)))
-        bd=int(o.get('highlightthickness',0)) or int(o.get('bd',0));self._qt.setStyleSheet(f'QLabel#{self._w} {{border:{bd}px solid {o.get("highlightbackground",o["bg"])};}}')
+        self._qt.setMargin(0)
+        bd=int(o.get('highlightthickness',0)) or int(o.get('bd',0));self._qt.setStyleSheet(f'QLabel#{self._w} {{background-color:{o["bg"]};color:{o["fg"]};padding:{int(o.get("pady",0))}px {int(o.get("padx",0))}px;border:{bd}px solid {o.get("highlightbackground",o["bg"])};}}')
     def _request(self):
         o=self._opts;fm=G.QFontMetrics(self._qt.font());text=str(o.get('text',''));wrap=int(o.get('wraplength') or 0);w=max((fm.horizontalAdvance(l) for l in text.split('\n')),default=0);h=max(1,len(text.split('\n')))*fm.height()
         if wrap and w>wrap:
@@ -475,6 +487,10 @@ class Checkbutton(Button):
         Widget._apply(self);o=self._opts;self._qt.setText(str(o.get('text','')));self._qt.setStyleSheet(f'QCheckBox {{background:{o["bg"]};color:{o["fg"]};spacing:8px;}} QCheckBox::indicator {{width:14px;height:14px;background:{o.get("selectcolor",o["bg"])};border:1px solid {o.get("activeforeground",o["fg"])};}} QCheckBox::indicator:checked {{background:{o.get("activeforeground",o["fg"])};}}')
 class Radiobutton(Checkbutton):
     native=W.QRadioButton
+    def _apply(self):
+        Widget._apply(self);o=self._opts;self._qt.setText(str(o.get('text','')))
+        ink=o.get('activeforeground',o['fg']);face=o.get('selectcolor',o['bg'])
+        self._qt.setStyleSheet(f'QRadioButton {{background:{o["bg"]};color:{o["fg"]};spacing:8px;}} QRadioButton::indicator {{width:14px;height:14px;border-radius:7px;background:{face};border:1px solid {ink};}} QRadioButton::indicator:checked {{background:{ink};}}')
     def __init__(self,master=None,**kw):
         # radio variables carry strings rather than boolean values
         Button.__init__(self,master,**kw);var=kw.get('variable');value=kw.get('value');self._qt.setAutoExclusive(False)
@@ -526,15 +542,18 @@ class NativeCombo(W.QComboBox):
         self.view().viewport().removeEventFilter(self._disabled_filter)
         self.view().viewport().installEventFilter(self._disabled_filter)
 
-    def paintEvent(self,event):
-        super().paintEvent(event)
-        p=G.QPainter(self);p.setRenderHint(G.QPainter.RenderHint.Antialiasing);p.setPen(C.Qt.PenStyle.NoPen);p.setBrush(self.palette().color(G.QPalette.ColorRole.Text));x=self.width()-15;y=self.height()/2
-        p.drawPolygon(G.QPolygonF([C.QPointF(x-4,y-2),C.QPointF(x+4,y-2),C.QPointF(x,y+3)]))
 
 class ComboBox(Widget):
     native=NativeCombo
     def __init__(self,master=None,**kw):
+        theme=getattr(getattr(master._root,'launcher',None),'theme',{}) if master else {}
+        for key,role in (('bg','control'),('fg','text'),('bordercolor','border'),('focusbordercolor','accent'),('activebackground','control_active'),('activeforeground','bright'),('disabledforeground','disabled')):
+            if role in theme:kw.setdefault(key,theme[role])
         super().__init__(master,**kw);self._variable=kw.get('textvariable')
+        self._qt.setView(W.QListView(self._qt))
+        self._qt.view().setUniformItemSizes(True)
+        self._qt.setMaxVisibleItems(12)
+        self._apply()
         if self._variable:self._variable.trace_add('write',lambda *a:self.set(self._variable.get()) if self.winfo_exists() else None);self.set(self._variable.get())
         self._qt.activated.connect(self._selected)
     def _apply(self):
@@ -542,7 +561,20 @@ class ComboBox(Widget):
         if 'values' in o:
             old=self._qt.currentText();self._qt.blockSignals(True);self._qt.clear();self._qt.addItems([str(v) for v in o['values']]);self._qt.setCurrentText(old);self._qt.blockSignals(False)
         bg=o.get('bg','#20313d');fg=o.get('fg','#e8dfcb');border=o.get('bordercolor','#435360');active=o.get('activebackground','#2d4655')
-        self._qt.setStyleSheet(f'QComboBox {{background:{bg};color:{fg};border:1px solid {border};padding:4px 28px 4px 8px;}} QComboBox::drop-down {{border:none;width:22px;}} QComboBox::down-arrow {{image:none;}} QComboBox QAbstractItemView {{background:{bg};color:{fg};border:1px solid {border};selection-background-color:{active};outline:none;}}')
+        bright=o.get('activeforeground',fg);muted=o.get('disabledforeground','#77736c');focus=o.get('focusbordercolor',border)
+        # Keep Qt's standard arrow and popup behavior. Scope the stylesheet to
+        # this combo and theme the QListView explicitly on every platform.
+        self._qt.setStyleSheet(f'QComboBox#{self._w} {{background:{bg};color:{fg};border:1px solid {border};padding:4px 24px 4px 8px;}} QComboBox#{self._w}:focus {{border-color:{focus};}} QComboBox#{self._w}:disabled {{color:{muted};}}')
+        view=self._qt.view()
+        view.setStyleSheet(f'QListView {{background:{bg};color:{fg};border:1px solid {border};outline:none;}} QListView::item {{padding:5px 8px;}} QListView::item:selected {{background:{active};color:{bright};}} QListView::item:disabled {{color:{muted};}} QScrollBar:vertical {{background:{bg};width:10px;}} QScrollBar::handle:vertical {{background:{border};min-height:20px;}} QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {{height:0;}} QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical {{background:{bg};}}')
+        palette=view.palette()
+        for group in (G.QPalette.ColorGroup.Active,G.QPalette.ColorGroup.Inactive,G.QPalette.ColorGroup.Disabled):
+            palette.setColor(group,G.QPalette.ColorRole.Base,color(bg))
+            palette.setColor(group,G.QPalette.ColorRole.Text,color(muted if group==G.QPalette.ColorGroup.Disabled else fg))
+            palette.setColor(group,G.QPalette.ColorRole.Highlight,color(active))
+            palette.setColor(group,G.QPalette.ColorRole.HighlightedText,color(bright))
+        view.setPalette(palette);view.viewport().setPalette(palette)
+        view.setHorizontalScrollBarPolicy(C.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._qt.setEditable(False)
     def _request(self):s=self._qt.sizeHint();return max(120,s.width()),max(28,s.height())
     def _selected(self,index):
@@ -641,11 +673,11 @@ class Canvas(Widget):
             dx,dy=_anchor(item.get('anchor','center'),w,h);return C.QRectF(p[0]-dx,p[1]-dy,w,h)
         xs=p[::2];ys=p[1::2];return C.QRectF(min(xs),min(ys),max(xs)-min(xs),max(ys)-min(ys))
     def _paint(self):
-        painter=G.QPainter(self._qt);painter.setRenderHint(G.QPainter.RenderHint.Antialiasing);painter.translate(-self._offset[0],-self._offset[1])
+        painter=G.QPainter(self._qt);painter.fillRect(self._qt.rect(),color(self._opts['bg']));painter.setRenderHint(G.QPainter.RenderHint.Antialiasing);painter.translate(-self._offset[0],-self._offset[1])
         for item in tuple(self.items.values()):
             if item.get('state')=='hidden':continue
             kind=item['kind'];p=item['coords'];r=self._bounds(item);fill=item.get('fill','');outline=item.get('outline','');pen=G.QPen(color(outline or fill),float(item.get('width',1)) if kind!='text' else 1)
-            if kind!='line' and not outline:pen=G.QPen(C.Qt.PenStyle.NoPen)
+            if kind not in ('line','arc') and not outline:pen=G.QPen(C.Qt.PenStyle.NoPen)
             if item.get('dash'):pen.setStyle(C.Qt.PenStyle.DashLine)
             painter.setPen(pen);painter.setBrush(G.QBrush(color(fill)) if fill else C.Qt.BrushStyle.NoBrush)
             if kind=='rectangle':painter.drawRect(r)
@@ -713,7 +745,7 @@ class Style:
     def configure(self,name,**kw):
         _styles.setdefault(name,{}).update(kw)
         for widget in tuple(_registry.values()):
-            if widget.cget('style')==name:widget._apply()
+            if widget.cget('style')==name or widget.cget('style')+'.Heading'==name:widget._apply()
     def map(self,name,**kw):
         for option,values in kw.items():
             for state,value in values:
@@ -731,7 +763,7 @@ class Treeview(Widget):
         self._qt.itemSelectionChanged.connect(lambda:self.event_generate('<<TreeviewSelect>>'));self._qt.itemExpanded.connect(lambda item:self.event_generate('<<TreeviewOpen>>'))
         self._qt.header().sectionClicked.connect(self._heading_click);self._qt.verticalScrollBar().valueChanged.connect(self._scroll);self._qt.verticalScrollBar().rangeChanged.connect(self._scroll);self._qt.horizontalScrollBar().valueChanged.connect(self._scroll_x);self._qt.horizontalScrollBar().rangeChanged.connect(self._scroll_x)
     def _apply(self):
-        super()._apply();o=self._opts;s=_styles.get(o.get('style'),{});bg=s.get('background',o['bg']);fg=s.get('foreground',o['fg']);self._qt.setColumnCount(len(self._cols)+(0 if o.get('show')=='headings' else 1));self._qt.setFont(qfont(s.get('font',o['font'])));self._qt.setStyleSheet(f'QTreeWidget {{background:{bg};color:{fg};border:none;outline:none;}} QTreeWidget::item {{height:{s.get("rowheight",28)}px;}} QTreeWidget::item:selected {{background:{s.get('selectionbackground','#473a27')};color:{s.get('selectionforeground','#fff1c7')};}} QHeaderView::section {{background:{s.get("fieldbackground",bg)};color:{fg};border:none;padding:6px;}}');self._qt.setHorizontalScrollBarPolicy(C.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        super()._apply();o=self._opts;s=_styles.get(o.get('style'),{});bg=s.get('background',o['bg']);fg=s.get('foreground',o['fg']);heading=_styles.get(o.get('style','')+'.Heading',{});self._qt.setColumnCount(len(self._cols)+(0 if o.get('show')=='headings' else 1));self._qt.setFont(qfont(s.get('font',o['font'])));self._qt.setStyleSheet(f'QTreeWidget {{background:{bg};color:{fg};border:none;outline:none;}} QTreeWidget::item {{height:{s.get("rowheight",28)}px;}} QTreeWidget::item:selected {{background:{s.get('selectionbackground','#473a27')};color:{s.get('selectionforeground','#fff1c7')};}} QHeaderView::section {{background:{heading.get("background",bg)};color:{heading.get("foreground",fg)};border:none;padding:6px;}}');self._qt.setHorizontalScrollBarPolicy(C.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._qt.setVerticalScrollBarPolicy(C.Qt.ScrollBarPolicy.ScrollBarAlwaysOff if o.get('yscrollcommand') else C.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         heading=_styles.get(o.get('style','')+'.Heading',{});self._qt.headerItem().setFont(0,qfont(heading.get('font',s.get('font',o['font']))))
     def _col(self,c):
