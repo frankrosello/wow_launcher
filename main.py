@@ -48,6 +48,7 @@ network_retry = retry(
 
 from addon_manager import AddonManager, Overlay
 from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager, install_overlay_animation
+from launcher_window_chrome import StoneWindowChrome
 from launcher_updates import LauncherUpdateController
 from launcher_news_services import cached_entry, fetch_feed, fetch_article, fetch_reader_image, configure_network_retry
 
@@ -1032,19 +1033,19 @@ class StoneButton(tk.Canvas):
 				width - inset - cut, height - inset, inset + cut, height - inset,
 				inset, height - inset - cut, inset, inset + cut)
 		self.paint_backdrop(width, height, shape, background)
-		self.create_polygon(*shape, fill=BUTTON_STONE_DARK, outline=BUTTON_STONE_DARK)
-		self.create_polygon(
-			inset + cut + 1, inset + 3, width - inset - cut - 1, inset + 3,
-			width - inset - 3, inset + cut + 1,
-			width - inset - 3, height - inset - cut - 1,
-			width - inset - cut - 1, height - inset - 3,
-			inset + cut + 1, height - inset - 3,
-			inset + 3, height - inset - cut - 1,
-			inset + 3, inset + cut + 1,
-			fill=BUTTON_STONE, outline=BUTTON_STONE_LIGHT, width=1)
-		self.create_line(inset + cut + 2, inset + 4,
-					 width - inset - cut - 2, inset + 4,
-					 fill="#a2a49f", width=1)
+		owner = self.winfo_toplevel()
+		chrome = getattr(getattr(owner, "launcher", None), "window_chrome", None)
+		if chrome is not None:
+			self._stone_photo = ImageTk.PhotoImage(chrome.stone_border_image(width, height, shape), master=self)
+			self.create_image(0, 0, image=self._stone_photo, anchor="nw")
+			self.create_polygon(*shape, fill="", outline="#777b73", width=1)
+			self.create_line(inset + cut + 1, inset + 2, width - inset - cut - 1, inset + 2,
+				fill="#a0a097", width=1)
+			self.create_line(width - inset - 2, inset + cut, width - inset - 2,
+				height - inset - cut, width - inset - cut, height - inset - 2,
+				inset + cut, height - inset - 2, fill="#151816", width=2)
+		else:
+			self.create_polygon(*shape, fill=BUTTON_STONE, outline=BUTTON_STONE_LIGHT)
 		face_points = (
 			inset + cut + 2, inset + 6, width - inset - cut - 2, inset + 6,
 			width - inset - 6, inset + cut + 2, width - inset - 6,
@@ -1412,10 +1413,15 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.register_friz_fonts()
 		self.refresh_friz_font()
 		root.configure(bg=BG)
-		self._startup_screen = tk.Frame(root, bg=BG)
+		self.theme = palette
+		self.window_chrome = StoneWindowChrome(root, APP_TITLE, lambda: self.theme,
+			self.ui_font(9, bold=True), self.request_window_close, button_class=StoneButton)
+		self.content = self.window_chrome.content
+		self._startup_screen = tk.Frame(self.content, bg=BG)
 		self._startup_screen.place(relwidth=1, relheight=1)
 		self._startup_canvas = tk.Canvas(self._startup_screen, bg=BG, bd=0, highlightthickness=0)
 		self._startup_canvas.pack(fill="both", expand=True)
+		self.window_chrome.attach_drag_surface(self._startup_canvas)
 		self._startup_ring = self._startup_canvas.create_oval(0, 0, 0, 0,
 			outline=palette["border"], width=3)
 		self._startup_spinner = self._startup_canvas.create_arc(0, 0, 0, 0,
@@ -1531,9 +1537,6 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.root = root
 		root.launcher = self   # lets popups read the current theme
 		root.title(APP_TITLE)
-		root.geometry("1100x700")
-		root.minsize(860, 580)
-		root.resizable(False, False)
 		root.configure(bg=BG)
 		self._app_icons = []
 		self._win_icons = None
@@ -1639,9 +1642,10 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.art_transition_generation = 0
 		self.slideshow_after_id = None
 
-		self.background = tk.Canvas(root, bg=BG, highlightthickness=0)
+		self.background = tk.Canvas(self.content, bg=BG, highlightthickness=0)
 		self.background.place(relwidth=1, relheight=1)
 		self.background.bind("<Configure>", self.draw_background)
+		self.window_chrome.attach_drag_surface(self.background)
 
 		yield "Building the launcher…", .65
 		self.build_header()
@@ -1650,7 +1654,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.updates = UpdateController(self, excluded=LOADER_VERSIONS)
 		if self.slideshow_images and self.preferences["animations_enabled"]:
 			self.slideshow_after_id = self.root.after(5000, self.advance_slideshow)
-		self.status = tk.Label(root, text="Launcher ready", bg=BG, fg=MUTED,
+		self.status = tk.Label(self.content, text="Launcher ready", bg=BG, fg=MUTED,
 							   font=self.ui_font(8))
 		self.status.place(relx=.046, rely=.985, anchor="sw")
 		self.root.protocol("WM_DELETE_WINDOW", self.close_launcher)
@@ -1784,7 +1788,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		position = (frame.winfo_x(), frame.winfo_y())
 		if section.get("backdrop") is not None:
 			base_image = section["backdrop"]()
-		elif frame.master is self.root:
+		elif frame.master in (self.root, getattr(self, "content", None)):
 			base_image = self.displayed_background
 		else:
 			base_image = None
@@ -1794,6 +1798,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			return
 		canvas.configure(bg=section["outside"], width=width, height=height)
 		canvas.delete("all")
+		backdrop = None
 		if base_image is not None:
 			x, y = frame.winfo_x(), frame.winfo_y()
 			x2 = min(x + width, base_image.width)
@@ -1824,6 +1829,9 @@ class LauncherUI(LauncherPreferencesMixin):
 		outline = Image.new("RGBA", (width, height), (*hex_rgb(border), 0))
 		outline.putalpha(masks[1])
 		image.alpha_composite(outline)
+		section["rendered_image"] = (backdrop.convert("RGBA") if backdrop is not None else
+			Image.new("RGBA", (width, height), section["outside"]))
+		section["rendered_image"].alpha_composite(image)
 		section["photo"] = ImageTk.PhotoImage(image, master=canvas)
 		canvas.create_image(0, 0, image=section["photo"], anchor="nw")
 		canvas.tk.call("lower", canvas._w)
@@ -1861,17 +1869,17 @@ class LauncherUI(LauncherPreferencesMixin):
 	def build_header(self):
 		self.launcher_updates = LauncherUpdateController(self)
 		self.launcher_update_button = StoneButton(
-			self.root, text="LAUNCHER UPDATE", command=self.launcher_updates.open_release,
+			self.content, text="LAUNCHER UPDATE", command=self.launcher_updates.open_release,
 			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
 			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme, style="subtle")
 		self.update_button = StoneButton(
-			self.root, text="UPDATE AVAILABLE", command=lambda: self.updates.check_selected(),
+			self.content, text="UPDATE AVAILABLE", command=lambda: self.updates.check_selected(),
 			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
 			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme,
 			style="subtle")
 		self.update_button.place(relx=.96, rely=.045, anchor="ne")
 		self.armory_button = StoneButton(
-			self.root, text="ARMORY", command=self.open_armory,
+			self.content, text="ARMORY", command=self.open_armory,
 			font=self.ui_font(8, bold=True), padx=10, pady=4, bg=BG,
 			background_provider=self.backdrop_patch, theme_provider=lambda: self.theme,
 			style="subtle")
@@ -1893,8 +1901,19 @@ class LauncherUI(LauncherPreferencesMixin):
 			return padded
 		return patch
 
+	def button_backdrop(self, widget, width, height):
+		ancestor = widget.master
+		while ancestor is not None:
+			for section in getattr(self, "rounded_sections", []):
+				if section["frame"] is ancestor and section.get("rendered_image") is not None:
+					x = widget.winfo_rootx() - ancestor.winfo_rootx()
+					y = widget.winfo_rooty() - ancestor.winfo_rooty()
+					return section["rendered_image"].crop((x, y, x+width, y+height))
+			ancestor = getattr(ancestor, "master", None)
+		return Image.new("RGBA", (width, height), self.theme["surface"])
+
 	def build_hero(self):
-		self.hero = tk.Frame(self.root, bg=PANEL, bd=0, highlightthickness=0)
+		self.hero = tk.Frame(self.content, bg=PANEL, bd=0, highlightthickness=0)
 		self.hero.place(**HERO_PLACE)
 
 		self.art = tk.Canvas(self.hero, bg="#211c18", highlightthickness=0)
@@ -1973,7 +1992,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.add_rounded_surface(self.hero, "panel", radius=10)
 
 	def build_footer(self):
-		footer = tk.Frame(self.root, bg="#181614", bd=0, highlightthickness=0)
+		footer = tk.Frame(self.content, bg="#181614", bd=0, highlightthickness=0)
 		footer.place(**FOOTER_PLACE)
 		self.footer = footer
 
@@ -2029,7 +2048,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				("OPTIONS", self.open_options)):
 			button = StoneButton(actions, text=label, command=command,
 						font=self.ui_font(8, bold=True), padx=7, pady=5,
-						bg="#181614", theme_provider=lambda: self.theme
+						bg="#181614", background_provider=self.button_backdrop, theme_provider=lambda: self.theme
 						)
 			button.pack(side="left", padx=3, expand=True)
 			if label == "OPTIONS":
@@ -2037,7 +2056,7 @@ class LauncherUI(LauncherPreferencesMixin):
 
 		self.play = StoneButton(footer, text="Play", command=self.play_game,
 							font=self.ui_font(16, bold=True), padx=22, pady=8,
-							bg="#181614", theme_provider=lambda: self.theme)
+							bg="#181614", background_provider=self.button_backdrop, theme_provider=lambda: self.theme)
 		self.play.place(relx=.98, rely=.5, relwidth=.2, relheight=.92, anchor="e")
 		self.playtime_surface = self.add_rounded_surface(playtime, "surface", radius=7)
 		self.add_rounded_surface(footer, "surface", radius=9)
@@ -2886,7 +2905,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				if tag.startswith("article_link_"):
 					reader.tag_delete(tag)
 			if title and not any(block["kind"] == "h1" for block in blocks):
-				reader.insert("end", title + "\n\n", "h1")
+				reader.insert("end", title + "\n", "h1")
 			link_number = 0
 			for block in blocks:
 				kind = block["kind"]
@@ -2906,21 +2925,20 @@ class LauncherUI(LauncherPreferencesMixin):
 					reader.insert("end", block["text"] + ("\n" if kind == "hub_game" else "\n\n"), kind)
 					continue
 				if kind == "image":
-					if len(jobs) >= 24 or not block.get("url"):
+					if not block.get("url"):
 						continue
 					key = len(jobs)
-					reader.insert("end", "\n", "article_image")
 					start, end = f"reader_image_{render}_{key}_start", f"reader_image_{render}_{key}_end"
 					reader.mark_set(start, "end-1c")
 					reader.mark_gravity(start, "left")
-					reader.insert("end", "Loading image…\n\n", "article_image")
+					reader.insert("end", "Loading image…\n", "article_image")
 					reader.mark_set(end, "end-1c")
 					reader.mark_gravity(end, "left")
 					state["image_slots"][key] = (start, end)
-					jobs.append((key, block["url"], block.get("text", "")))
+					jobs.append((key, list(dict.fromkeys([*block.get("sources", []), block["url"]])), block.get("text", "")))
 					continue
 				text = ("• " if kind == "li" else "") + block["text"]
-				reader.insert("end", text + "\n\n", kind if kind in ("h1", "h2", "h3", "h4", "caption", "blockquote", "pre") else "paragraph")
+				reader.insert("end", text + "\n", kind if kind in ("h1", "h2", "h3", "h4", "caption", "blockquote", "pre") else "paragraph")
 				for target in dict.fromkeys(block["links"]):
 					tag = f"article_link_{link_number}"
 					link_number += 1
@@ -2929,8 +2947,6 @@ class LauncherUI(LauncherPreferencesMixin):
 					reader.tag_bind(tag, "<Enter>", lambda _event: reader.config(cursor="hand2"))
 					reader.tag_bind(tag, "<Leave>", lambda _event: reader.config(cursor="xterm"))
 					reader.insert("end", target + "\n", tag)
-				if block["links"]:
-					reader.insert("end", "\n")
 			reader.config(state="disabled")
 			reader.yview_moveto(0)
 			if jobs:
@@ -2939,11 +2955,21 @@ class LauncherUI(LauncherPreferencesMixin):
 
 		def load_images(jobs, render, width):
 			def load(job):
-				key, target, alt = job
+				key, targets, alt = job
 				if state["closed"] or render != state["render"]:
 					return
 				try:
-					image = fetch_reader_image(target, news_cache_dir(self.settings_path), width)
+					image = None
+					for target in targets:
+						if state["closed"] or render != state["render"]:
+							return
+						try:
+							image = fetch_reader_image(target, news_cache_dir(self.settings_path), width)
+							break
+						except Exception:
+							continue
+					if image is None:
+						raise ValueError("No image source could be loaded")
 					# Flatten alpha off-thread so scrolling draws an opaque bitmap.
 					flat = Image.new("RGB", image.size, theme["surface"])
 					flat.paste(image, (0, 0), image.getchannel("A"))
@@ -2954,7 +2980,7 @@ class LauncherUI(LauncherPreferencesMixin):
 			with ThreadPoolExecutor(max_workers=3) as pool:
 				list(pool.map(load, jobs))
 
-		def apply_image(render, key, image):
+		def apply_image(render, key, image, alt):
 			if render != state["render"]:
 				return
 			marks = state["image_slots"].pop(key, None)
@@ -2970,8 +2996,11 @@ class LauncherUI(LauncherPreferencesMixin):
 					photo = ImageTk.PhotoImage(image, master=reader)
 					state["images"].append(photo)
 					reader.image_create(start, image=photo, align="center")
-					reader.insert(f"{start}+1c", "\n\n", "article_image")
-					reader.tag_add("article_image", start, f"{start}+3c")
+					reader.insert(f"{start}+1c", "\n", "article_image")
+					reader.tag_add("article_image", start, f"{start}+2c")
+				else:
+					reader.insert(start, (alt + " — " if alt else "") +
+						"Image unavailable. Use RELOAD to retry.\n", "caption")
 				reader.yview("reader_view_anchor")
 			finally:
 				reader.mark_unset(start, end, "reader_view_anchor")
@@ -3018,13 +3047,13 @@ class LauncherUI(LauncherPreferencesMixin):
 			except queue.Empty:
 				pass
 			else:
-				apply_image(render, key, image)
+				apply_image(render, key, image, alt)
 			state["poll"] = self.root.after(100, poll)
 
 		reader = tk.Text(content, wrap="word", bg=theme["surface"], fg=theme["text"],
 			font=self.ui_font(12), padx=36, pady=26, bd=0, highlightthickness=0,
 			selectbackground=theme["control_active"], selectforeground=theme["bright"],
-			cursor="xterm", spacing1=3, spacing3=8)
+			cursor="xterm", spacing1=0, spacing2=0, spacing3=0)
 		scroll_style = f"NewsReader{id(window)}.Vertical.TScrollbar"
 		style = ttk.Style(window)
 		style.layout(scroll_style, style.layout("Vertical.TScrollbar"))
@@ -3037,13 +3066,13 @@ class LauncherUI(LauncherPreferencesMixin):
 		reader.pack(fill="both", expand=True)
 		reader.tag_configure("h1", font=self.ui_font(18, bold=True), foreground=theme["accent"], spacing3=12)
 		for heading_tag in ("h2", "h3", "h4"):
-			reader.tag_configure(heading_tag, font=self.ui_font(13, bold=True), foreground=theme["bright"], spacing1=10)
+			reader.tag_configure(heading_tag, font=self.ui_font(13, bold=True), foreground=theme["bright"], spacing1=8, spacing3=6)
 		reader.tag_configure("hub_game", font=self.ui_font(8), foreground=theme["muted"],
 			justify="left", spacing1=4, spacing3=0)
 		reader.tag_configure("hub_summary", font=self.ui_font(10), foreground=theme["muted"],
 			spacing1=0, spacing3=2)
-		reader.tag_configure("paragraph", spacing1=4, spacing3=12)
-		reader.tag_configure("article_image", justify="center", spacing1=8, spacing3=8)
+		reader.tag_configure("paragraph", spacing1=0, spacing3=8)
+		reader.tag_configure("article_image", justify="center", spacing1=4, spacing3=6)
 		reader.tag_configure("caption", font=self.ui_font(9, italic=True), foreground=theme["muted"], justify="center")
 		reader.tag_configure("blockquote", lmargin1=18, lmargin2=18, foreground=theme["muted"])
 		reader.tag_configure("pre", font=("Courier", 10), lmargin1=12, lmargin2=12)
@@ -3954,6 +3983,16 @@ class LauncherUI(LauncherPreferencesMixin):
 			return False
 		return True
 
+	def request_window_close(self):
+		# The frame is interactive during startup, before update/tray state exists.
+		if getattr(self, "_startup_complete", False):
+			self.close_launcher()
+		else:
+			self._closing = True
+			if hasattr(self, "_background_executor"):
+				self._background_executor.shutdown(wait=False, cancel_futures=True)
+			self.root.destroy()
+
 	def close_launcher(self):
 		self._closing = True
 		self.stop_tray()
@@ -3990,6 +4029,8 @@ class LauncherUI(LauncherPreferencesMixin):
 		except tk.TclError:
 			return
 		self.theme = GAME_THEMES.get(version, GAME_THEMES[GAME_VERSIONS[0]])
+		if hasattr(self, "window_chrome"):
+			self.window_chrome.redraw()
 		color_roles = {color.casefold(): role
 					   for role, color in self.theme.items()}
 		for palette in GAME_THEMES.values():
@@ -4417,9 +4458,12 @@ class LauncherUI(LauncherPreferencesMixin):
 
 	def draw_background_frame(self, frame):
 		self.displayed_background = frame
+		if hasattr(self, "window_chrome"):
+			self.window_chrome.set_background(frame)
 		self._background_photo = ImageTk.PhotoImage(frame.convert("RGB"), master=self.root)
 		self.background.delete("all")
 		self.background.create_image(0, 0, image=self._background_photo, anchor="nw")
+		self.refresh_rounded_surfaces()
 		self.draw_credit()
 		if self.options_button is not None:
 			self.options_button.redraw()

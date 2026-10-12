@@ -11,7 +11,7 @@ from launcher_models import validate_news
 
 NEWS_TTL = 600
 ARTICLE_TTL = 3600
-ARTICLE_FORMAT = 2
+ARTICLE_FORMAT = 4
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -202,6 +202,48 @@ def fetch_feed(url, cache_dir, force=False):
         return cached, str(error)
 
 
+def article_image_sources(node, base_url):
+    """Prefer real lazy/responsive images and retain usable download fallbacks."""
+    candidates = []
+    picture = node.find_parent("picture") if node.name in ("img", "blz-image") else None
+    sources = [node, *(picture.find_all("source") if picture else [])]
+    responsive = []
+    for source in sources:
+        for attr in ("data-srcset", "srcset"):
+            for entry in str(source.get(attr, "")).split(","):
+                parts = entry.strip().split()
+                if not parts:
+                    continue
+                try:
+                    rank = float(parts[1].rstrip("wx")) if len(parts) > 1 else 0
+                except ValueError:
+                    rank = 0
+                responsive.append((rank, parts[0]))
+    # A lazy URL takes priority over a placeholder src.
+    for attr in (("data-src", "data-lazy-src", "data-original", "data-url")
+                 if node.name in ("img", "blz-image") else ()):
+        if node.get(attr):
+            candidates.append(node[attr])
+    candidates.extend(source for _, source in sorted(responsive, key=lambda item: item[0], reverse=True))
+    if node.name in ("img", "blz-image") and node.get("src"):
+        candidates.append(node["src"])
+    if node.name != "img":
+        for attr in ("data-background", "data-background-image", "data-bg"):
+            if node.get(attr):
+                candidates.append(node[attr])
+        candidates.extend(re.findall(r"background(?:-image)?\s*:[^;]*?url\(\s*['\"]?([^'\")]+)",
+                                     str(node.get("style", "")), re.I))
+    resolved = []
+    for source in candidates:
+        source = str(source).strip()
+        if not source or source.startswith(("data:", "blob:")):
+            continue
+        target = urljoin(base_url, source)
+        if urlparse(target).scheme in ("http", "https") and target not in resolved:
+            resolved.append(target)
+    return resolved
+
+
 def parse_article(html, base_url):
     soup = _soup(html)
     page_title = _text(soup.find("h1")) or _text(soup.title)
@@ -224,29 +266,26 @@ def parse_article(html, base_url):
                     pending.extend(v for v in obj.values() if isinstance(v, (dict, list)))
         except (ValueError, TypeError):
             pass
-    for element in soup.select("script, style, nav, footer, aside, noscript, svg, button, form, header"):
+    for element in soup.select("script, style, nav, footer, svg, button, form"):
         element.decompose()
     names = {"p", "h1", "h2", "h3", "h4", "li", "blockquote", "pre", "td", "th", "figcaption"}
 
     def blocks_from(body):
         blocks = []
-        for node in body.find_all(list(names | {"img"})):
-            if node.name == "img":
-                source = node.get("data-src") or node.get("src") or ""
-                srcset = node.get("data-srcset") or node.get("srcset")
-                if srcset:
-                    candidates = srcset.split(",")[-1].strip().split()
-                    if candidates:
-                        source = candidates[0]
-                if not source or source.startswith("data:"):
+        seen_images = set()
+        for node in body.find_all(list(names | {"img", "blz-image", "div", "section", "span", "a"})):
+            sources = article_image_sources(node, base_url) if node.name in ("img", "blz-image") or node.name not in names else []
+            if sources:
+                source = sources[0]
+                if source in seen_images:
                     continue
-                source = urljoin(base_url, source)
-                if urlparse(source).scheme not in ("http", "https"):
-                    continue
+                seen_images.add(source)
                 width, height = node.get("width", ""), node.get("height", "")
                 if str(width).isdigit() and str(height).isdigit() and int(width) <= 48 and int(height) <= 48:
                     continue
-                blocks.append({"kind": "image", "text": node.get("alt", ""), "url": source, "links": []})
+                blocks.append({"kind": "image", "text": node.get("alt", ""), "url": source, "sources": sources, "links": []})
+                continue
+            if node.name not in names:
                 continue
             parent = node.parent
             nested = False
@@ -279,7 +318,11 @@ def parse_article(html, base_url):
         return base_url, title, blocks
 
     # Match case and punctuation variants used by Blizzard's different layouts.
-    containers = []
+    # Blizzard's WoW layout uses .Blog .detail, with comparison media inside
+    # <aside class="center-block">. These asides belong to the article.
+    article_bodies = soup.select(".Blog .detail, .ArticleDetail-body, .ArticleDetail-content, [itemprop='articleBody']")
+    preferred = {id(node) for node in article_bodies}
+    containers = list(article_bodies)
     markers = ("articledetailbody", "articledetailcontent", "articlebody", "articlecontent",
                "newscontent", "newsarticlecontent", "blogbody", "postbody", "richtext",
                "articletext", "entrycontent", "blogcontent", "newsbody", "postcontent")
@@ -296,9 +339,9 @@ def parse_article(html, base_url):
         blocks = blocks_from(body)
         # A heading alone or empty wrapper should not hide another readable container.
         length = sum(len(block["text"]) for block in blocks if block["kind"] not in ("h1", "h2", "h3", "h4"))
-        priority = 3 if id(body) in explicit else (2 if body.name == "article" else 1)
+        priority = 4 if id(body) in preferred else (3 if id(body) in explicit else (2 if body.name == "article" else 1))
         score = (priority, length)
-        if length:
+        if length or any(block["kind"] == "image" for block in blocks):
             if best is None or score > best[0]:
                 best = (score, body, blocks)
         elif not blocks and _text(body):
@@ -441,7 +484,7 @@ def fetch_reader_image(url, cache_dir, max_width=900):
             with _http_client().stream("GET", url) as response:
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").lower()
-                if content_type and not content_type.startswith("image/"):
+                if content_type and not content_type.startswith("image/") and content_type.split(";", 1)[0].strip() not in ("application/octet-stream", "binary/octet-stream"):
                     raise ValueError("Not an image")
                 chunks, size = [], 0
                 for chunk in response.iter_bytes(chunk_size=65536):

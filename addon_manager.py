@@ -128,7 +128,14 @@ class Overlay(tk.Frame):
 		self.canvas = tk.Canvas(self, bg=OVERLAY_BG, highlightthickness=0, bd=0)
 		self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
 		self.build_backdrop()
-		self.grab_set()   # block clicks on the launcher underneath, like a modal window
+		chrome = getattr(getattr(root, "launcher", None), "window_chrome", None)
+		if chrome is not None:
+			# The scrim blocks the launcher. A root grab keeps its persistent
+			# window controls usable while this panel is modal.
+			root.grab_set()
+			chrome.push_overlay(self)
+		else:
+			self.grab_set()
 		self.focus_set()
 		self.bind("<Escape>", lambda _event: self.destroy())
 		self.bind("<Destroy>", self.remove_scrim, add="+")
@@ -205,6 +212,10 @@ class Overlay(tk.Frame):
 			self.backdrop_image = None   # plain dark margin
 
 	def remove_scrim(self, event):
+		if event.widget is self:
+			chrome = getattr(getattr(self.master, "launcher", None), "window_chrome", None)
+			if chrome is not None:
+				chrome.pop_overlay(self)
 		if event.widget is self and self.owns_scrim:
 			try:
 				self.scrim.destroy()
