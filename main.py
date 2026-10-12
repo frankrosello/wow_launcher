@@ -1551,6 +1551,7 @@ class LauncherUI(LauncherPreferencesMixin):
 				parent=root)
 		self.news_queue = queue.Queue()
 		self.news_generation = 0
+		self._news_request = None
 		self.news_anim_generation = 0
 		self.news_cards = []
 		self.hero_text_generation = 0
@@ -2558,11 +2559,19 @@ class LauncherUI(LauncherPreferencesMixin):
 	def load_game_news(self, force=False):
 		self.schedule_news_refresh()
 		version = self.version.get()
+		request = self._news_request
+		if request is not None and request[:2] == (version, self.news_generation):
+			# Repeated startup/selection/refresh callbacks share the active request.
+			# An explicit reload can supersede a normal request once.
+			if not force or request[2]:
+				return
 		self.news_generation += 1
 		generation = self.news_generation
 		if version == "Crusader Storm":
 			self.show_crusader_tools()
+			self._startup_news_ready = True
 			return
+		self._news_request = (version, generation, force)
 		self.news_title_label.config(text="◆  LATEST NEWS")
 		self.news_reload_button.pack(side="right", padx=(5, 0), before=self.news_status_label)
 		self.news_more_button.pack(side="right", padx=(5, 0), before=self.news_status_label)
@@ -2601,6 +2610,7 @@ class LauncherUI(LauncherPreferencesMixin):
 
 	def fetch_game_news(self, version, generation, force=False):
 		selected, errors, matched = [], 1, False
+		preview = None
 		try:
 			# Include saved archives in the immediate preview, even if some pages are missing.
 			sources = self.news_archive_sources(version, 10)
@@ -2617,24 +2627,22 @@ class LauncherUI(LauncherPreferencesMixin):
 						for url in sources if url in self._news_page_cache):
 					return
 				self.news_queue.put((generation, version, *preview))
-			if force:
-				selected, errors, matched = self.build_news(version, force=True, archive_pages=10)
-			else:
-				latest = self.build_news(version)
-				if latest[0]:
-					self.news_queue.put((generation, version, *latest))
-				if len(latest[0]) < 6:
-					selected, errors, matched = self.build_news(version, archive_pages=10)
-				else:
-					selected, errors, matched = latest
+			if self._closing or generation != self.news_generation:
+				return
+			# The dashboard needs the current feeds only. The MORE reader fetches
+			# all ten archive pages on demand; do not start a second archive worker
+			# as the loading screen disappears.
+			selected, errors, matched = self.build_news(version, force=force)
 		except Exception:
 			pass
 		finally:
 			self.news_queue.put((generation, version, selected, errors, matched))
+			self.news_queue.put((generation, version, None, None, None))
 
 	def poll_news_queue(self):
 		if not self.root.winfo_exists():
 			return
+		latest = None
 		while True:
 			try:
 				generation, version, articles, errors, matched = self.news_queue.get_nowait()
@@ -2642,7 +2650,15 @@ class LauncherUI(LauncherPreferencesMixin):
 				break
 			if generation != self.news_generation or version != self.version.get():
 				continue
-			self.render_game_news(version, articles, errors, matched)
+			if articles is None:
+				self._news_request = None
+				continue
+			latest = (version, articles, errors, matched)
+		# Cached preview and final results often arrive together and used to
+		# destroy/rebuild the same widgets twice in one Tk event-loop callback.
+		if latest is not None:
+			if latest != self.last_news:
+				self.render_game_news(*latest)
 			self._startup_news_ready = True
 			self._finish_startup()
 		self.update_news_age()
@@ -7173,5 +7189,8 @@ if __name__ == "__main__":
 	multiprocessing.freeze_support()
 	set_windows_app_id()
 	app = tk.Tk()
+	if sys.platform == "darwin":
+		# Font registration can process idle events before the custom chrome exists.
+		app.withdraw()
 	LauncherUI(app)
 	app.mainloop()

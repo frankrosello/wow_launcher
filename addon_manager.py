@@ -123,6 +123,7 @@ class Overlay(tk.Frame):
 		self.panel_size = (width, height)
 		self.backdrop_image = None
 		self._backdrop_photo = None
+		self._shadow_layer = None
 		theme = getattr(getattr(root, "launcher", None), "theme", None) or {}
 		self.fill = theme.get("panel", "#211c18")
 		self.edge = _blend(self.fill, theme.get("border", "#806b42"), .32)
@@ -186,29 +187,43 @@ class Overlay(tk.Frame):
 	def build_backdrop(self):
 		"""Paint blurred launcher + rounded shadow + rounded bordered panel in one image."""
 		width, height = self.panel_size
-		root_width, root_height = self.root_size
 		left, top = self.panel_origin
 		try:
 			from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 			shot = getattr(self.scrim, "_image", None)
-			if shot is not None:
-				image = shot.crop((left, top, left + width, top + height)).convert("RGBA")
-			else:
-				image = Image.new("RGBA", (width, height), (11, 11, 13, 255))
 			margin, radius = self.MARGIN, self.RADIUS
 			panel_w, panel_h = width - margin * 2, height - margin * 2
+			outer = _rounded_mask(panel_w, panel_h, radius)
+			# Render beyond the panel widget: a 10px margin clips the 9px
+			# Gaussian blur into a rectangular seam, especially below corners.
+			pad = max(int(blur * 4) + max(abs(dx), abs(dy))
+				for dx, dy, blur, _opacity in OVERLAY_SHADOW_LAYERS)
+			chrome = getattr(getattr(self.master, "launcher", None), "window_chrome", None)
+			b = chrome.BORDER if chrome is not None else 0
+			root_w, root_h = self.root_size
+			x0, y0 = max(b, left-pad), max(b, top-pad)
+			x1, y1 = min(root_w-b, left+width+pad), min(root_h-b, top+height+pad)
+			layer_size = (x1-x0, y1-y0)
+			if shot is not None:
+				image = shot.crop((x0, y0, x1, y1)).convert("RGBA")
+			else:
+				image = Image.new("RGBA", layer_size, (11, 11, 13, 255))
 			for offset_x, offset_y, blur, opacity in OVERLAY_SHADOW_LAYERS:
-				mask = Image.new("L", (width, height), 0)
-				ImageDraw.Draw(mask).rounded_rectangle(
-					(margin + offset_x, margin + offset_y,
-					 width - margin + offset_x - 1, height - margin + offset_y - 1),
-					radius=radius, fill=255)
+				mask = Image.new("L", layer_size, 0)
+				mask.paste(outer, (left-x0+margin+offset_x, top-y0+margin+offset_y))
 				mask = mask.filter(ImageFilter.GaussianBlur(blur)).point(
 					lambda value, opacity=opacity: int(value * opacity))
-				shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+				shadow = Image.new("RGBA", layer_size, (0, 0, 0, 0))
 				shadow.putalpha(mask)
 				image.alpha_composite(shadow)
-			outer = _rounded_mask(panel_w, panel_h, radius)
+			if self._shadow_layer is None:
+				self._shadow_layer = tk.Label(self.master, bd=0, highlightthickness=0)
+			self._shadow_photo = ImageTk.PhotoImage(image.convert("RGB"), master=self._shadow_layer)
+			self._shadow_layer.configure(image=self._shadow_photo)
+			self._shadow_layer.place(x=x0, y=y0, width=layer_size[0], height=layer_size[1])
+			# Keep the shadow immediately below its panel, including nested panels.
+			self._shadow_layer.lower(self)
+			image = image.crop((left-x0, top-y0, left-x0+width, top-y0+height))
 			inner = Image.new("L", (panel_w, panel_h), 0)
 			inner.paste(_rounded_mask(panel_w - 2, panel_h - 2, radius - 1), (1, 1))
 			panel = Image.new("RGBA", (panel_w, panel_h), (*_hex_rgb(self.fill), 255))
@@ -226,6 +241,8 @@ class Overlay(tk.Frame):
 
 	def remove_scrim(self, event):
 		if event.widget is self:
+			if self._shadow_layer is not None:
+				self._shadow_layer.destroy()
 			chrome = getattr(getattr(self.master, "launcher", None), "window_chrome", None)
 			if chrome is not None:
 				chrome.pop_overlay(self)

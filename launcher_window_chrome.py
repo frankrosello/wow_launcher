@@ -37,6 +37,10 @@ class StoneWindowChrome:
         self._restore_pending = None
         self._native_iconify = root.iconify
         self._native_deiconify = root.deiconify
+        # Aqua must receive the borderless style before any font/layout update
+        # maps the native window. Hide an already mapped root while changing it.
+        if sys.platform == 'darwin':
+            root.withdraw()
         root.resizable(False, False)
         root.overrideredirect(True)
         self._apply_macos_style()
@@ -88,6 +92,8 @@ class StoneWindowChrome:
         root.bind('<Alt-F4>', lambda e: self.close(), add='+')
         root.bind('<Map>', self._mapped, add='+')
         root.protocol('WM_DELETE_WINDOW', close)
+        if sys.platform == 'darwin':
+            self._native_deiconify()
         root.update_idletasks()
         if os.name == 'nt':
             self._apply_windows_taskbar()
@@ -103,7 +109,8 @@ class StoneWindowChrome:
         try:
             # Set Aqua's actual window style as well as Tk override-redirect.
             # This must be applied before the first map and after restoring.
-            self.root.tk.call('::tk::unsupported::MacWindowStyle','style',self.root._w,'document',('noTitleBar',))
+            self.root.tk.call('::tk::unsupported::MacWindowStyle',
+                              'style', self.root._w, 'plain', 'none')
         except tk.TclError:
             pass
 
@@ -479,9 +486,20 @@ class StoneWindowChrome:
         # Tk cannot iconify an override-redirect window. Restore management until
         # it is mapped again, then reapply the custom frame exactly once.
         self.root.overrideredirect(False)
+        if sys.platform == 'darwin':
+            # A plain Aqua window cannot be miniaturized. Restore the managed
+            # style while hidden/minimized; _restore_chrome removes it on map.
+            try:
+                self.root.tk.call('::tk::unsupported::MacWindowStyle',
+                                  'style', self.root._w, 'document', ())
+            except tk.TclError:
+                pass
         self._native_iconify()
 
     def deiconify(self):
+        if sys.platform == 'darwin':
+            self.root.overrideredirect(True)
+            self._apply_macos_style()
         self._native_deiconify()
         self._schedule_restore()
 
