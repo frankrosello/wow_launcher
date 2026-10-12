@@ -167,6 +167,21 @@ class Overlay(tk.Frame):
 			size = (root.winfo_width(), root.winfo_height())
 			shot = ImageGrab.grab(bbox=(left, top, left + size[0], top + size[1]))
 			shot = shot.convert("RGB").resize(size)
+			chrome = getattr(getattr(root, "launcher", None), "window_chrome", None)
+			artwork = getattr(chrome, "_background", None)
+			if chrome is not None and artwork is not None:
+				# Window controls stay above the scrim. Remove their captured
+				# pixels first so their glass/shadow is not drawn over itself.
+				b = chrome.BORDER
+				for control in chrome.controls:
+					if not control.winfo_exists():
+						continue
+					x, y = control.winfo_x(), control.winfo_y()
+					x0, y0 = max(b, x-8), max(b, y-8)
+					x1 = min(size[0]-b, b+artwork.width, x+control.winfo_width()+8)
+					y1 = min(size[1]-b, b+artwork.height, y+control.winfo_height()+8)
+					if x1 > x0 and y1 > y0:
+						shot.paste(artwork.crop((x0-b, y0-b, x1-b, y1-b)).convert("RGB"), (x0, y0))
 			shot = shot.filter(ImageFilter.GaussianBlur(5))
 			shot = Image.blend(shot, Image.new("RGB", size, (8, 8, 10)), .55)
 			scrim._image = shot
@@ -243,14 +258,16 @@ class Overlay(tk.Frame):
 		if event.widget is self:
 			if self._shadow_layer is not None:
 				self._shadow_layer.destroy()
+			# Remove the old backdrop before repainting the persistent window
+			# controls with the main artwork (or the next nested overlay).
+			if self.owns_scrim:
+				try:
+					self.scrim.destroy()
+				except tk.TclError:
+					pass
 			chrome = getattr(getattr(self.master, "launcher", None), "window_chrome", None)
 			if chrome is not None:
 				chrome.pop_overlay(self)
-		if event.widget is self and self.owns_scrim:
-			try:
-				self.scrim.destroy()
-			except tk.TclError:
-				pass
 
 	def resize(self, height):
 		height = min(height,self.master.winfo_height()-self._safe_top-self._safe_bottom)

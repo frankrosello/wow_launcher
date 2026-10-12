@@ -46,7 +46,9 @@ class StoneWindowChrome:
         self._apply_macos_style()
         root.geometry('1128x728')  # Original 1100x700 content plus frame/title bar.
         root.minsize(888, 608)
-        self.canvas = tk.Canvas(root, bg=STONE_DARK, bd=0, highlightthickness=0)
+        self.canvas = tk.Canvas(root,
+                                bg='systemTransparent' if sys.platform == 'darwin' else STONE_DARK,
+                                bd=0, highlightthickness=0)
         self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.content = tk.Frame(root, bg=theme_provider()['window'], bd=0)
         self.content.place(x=self.BORDER, y=self.BORDER+self.TITLE_HEIGHT,
@@ -64,8 +66,22 @@ class StoneWindowChrome:
                     self.configure(width=36, height=32)
 
                 def redraw(self, event=None):
+                    if not self.winfo_exists():
+                        return
+                    width, height = self.winfo_width(), self.winfo_height()
+                    if width < 4 or height < 4:
+                        return
+                    # Focus/Expose events during overlay cleanup often request
+                    # the same bitmap repeatedly. Keep the existing pixels.
+                    backdrop = owner._control_background(self, width, height)
+                    signature = (width, height, tuple(theme_provider().items()),
+                                 self.hovered, self.pressed, self.disabled,
+                                 backdrop.tobytes())
+                    if signature == getattr(self, '_control_render_signature', None):
+                        return
                     super().redraw(event)
                     owner._draw_icon(self, self.hovered, self.pressed)
+                    self._control_render_signature = signature
 
             for action in ('minimize', 'close'):
                 self.controls.append(WindowControl(action))
@@ -113,6 +129,10 @@ class StoneWindowChrome:
                               'style', self.root._w, 'plain', 'none')
         except tk.TclError:
             pass
+        # Aqua uses per-pixel transparency, rather than Windows/X11 regions.
+        # Both the native content area and its backing Tk surface must be clear.
+        self.root.attributes('-transparent', True)
+        self.root.configure(bg='systemTransparent')
 
     def _apply_windows_taskbar(self):
         """Use Tk's borderless mode; keep its native wrapper in the taskbar."""
@@ -177,7 +197,7 @@ class StoneWindowChrome:
             return
         self._signature = signature
         c = self.canvas
-        c.configure(bg='#080908')
+        c.configure(bg='systemTransparent' if sys.platform == 'darwin' else '#080908')
         if self.content.cget('bg') != t['window']:
             self.content.configure(bg=t['window'])
         c.delete('frame')
@@ -204,10 +224,20 @@ class StoneWindowChrome:
             for x in (7,w-8):
                 draw.ellipse((x-1,y-1,x+2,y+2),fill='#151815')
                 draw.point((x,y-1),fill='#92948a')
-        # Cut corners are opaque black, avoiding platform-dependent transparency.
+        # Windows/X11 clip these outer pixels with a native window region.
         for points in ([(0,0),(cut,0),(0,cut)],[(w,0),(w-cut,0),(w,cut)],
                        [(0,h),(cut,h),(0,h-cut)],[(w,h),(w-cut,h),(w,h-cut)]):
             draw.polygon(points,fill='#080908')
+        if sys.platform == 'darwin':
+            # Preserve the existing stone silhouette but reveal the desktop
+            # outside it. PhotoImage keeps this RGBA alpha channel intact.
+            scale = 4
+            mask = Image.new('L', (w*scale, h*scale), 0)
+            points = [(cut,0),(w-cut,0),(w,cut),(w,h-cut),
+                      (w-cut,h),(cut,h),(0,h-cut),(0,cut)]
+            ImageDraw.Draw(mask).polygon([(x*scale,y*scale) for x,y in points], fill=255)
+            frame = frame.convert('RGBA')
+            frame.putalpha(mask.resize((w,h), Image.Resampling.LANCZOS))
         self._frame_photo = ImageTk.PhotoImage(frame,master=c)
         c.create_image(0,0,image=self._frame_photo,anchor='nw',tags='frame')
         for i,control in enumerate(self.controls):
@@ -320,8 +350,9 @@ class StoneWindowChrome:
         info = control.place_info()
         x,y = int(info.get('x',control.winfo_x())),int(info.get('y',control.winfo_y()))
         source = self._background
-        if self._overlays:
-            scrim = self._overlays[-1].scrim
+        scrim = next((panel.scrim for panel in reversed(self._overlays)
+                      if panel.scrim.winfo_exists()), None)
+        if scrim is not None:
             source = getattr(scrim,'_image',None)
             if source is None:
                 return Image.new('RGBA',(width,height),str(scrim.cget('bg')))

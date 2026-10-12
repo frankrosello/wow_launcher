@@ -1538,7 +1538,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		self.root = root
 		root.launcher = self   # lets popups read the current theme
 		root.title(APP_TITLE)
-		root.configure(bg=BG)
+		root.configure(bg="systemTransparent" if sys.platform == "darwin" else BG)
 		self._app_icons = []
 		self._win_icons = None
 		self.set_app_icon()
