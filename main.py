@@ -48,6 +48,7 @@ network_retry = retry(
 
 from addon_manager import AddonManager, Overlay
 from launcher_options import LauncherPreferencesMixin, clean_preferences, backup_addon_manager, install_overlay_animation
+from launcher_themed_dropdown import ThemedOptionMenu
 from launcher_window_chrome import StoneWindowChrome
 from launcher_updates import LauncherUpdateController
 from launcher_news_services import cached_entry, fetch_feed, fetch_article, fetch_reader_image, configure_network_retry
@@ -2766,7 +2767,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		search_query = tk.StringVar(master=window)
 		tk.Label(hub_controls, text="GAME", bg=panel, fg=theme["muted"],
 			font=self.ui_font(8, bold=True)).pack(side="left", padx=(0, 8))
-		games = GameOptionMenu(hub_controls, game_filter, "All games", *self.news_hub_versions(),
+		games = ThemedOptionMenu(hub_controls, game_filter, "All games", *self.news_hub_versions(),
 			command=lambda _value: render_hub())
 		games.configure(bg=theme["control"], fg=theme["text"],
 			activebackground=theme["control_active"], activeforeground=theme["bright"],
@@ -3522,7 +3523,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		toolbar.pack(fill="x", pady=(0, 12))
 		versions = list(dict.fromkeys(["All versions", *self.game_versions, *self.playtime_seconds]))
 		selected = tk.StringVar(value=initial_version if initial_version in versions else "All versions")
-		menu = GameOptionMenu(toolbar, selected, *versions, command=lambda _: refresh())
+		menu = ThemedOptionMenu(toolbar, selected, *versions, command=lambda _: refresh())
 		menu.configure(font=self.ui_font(9), width=30)
 		style_option_menu(menu, theme)
 		menu.pack(side="left")
@@ -3654,7 +3655,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		selected = tk.StringVar(value=self.version.get())
 		versions = list(dict.fromkeys(["All versions", *self.game_versions,
 			*self.playtime_seconds, *(name for values in self.playtime_history.values() for name in values)]))
-		menu = GameOptionMenu(controls, selected, *versions, command=lambda _: draw())
+		menu = ThemedOptionMenu(controls, selected, *versions, command=lambda _: draw())
 		menu_font = self.ui_font(8)
 		# Reserve the longest title, so changing versions cannot squeeze other controls.
 		menu_width = math.ceil(max(menu_font.measure(name) for name in versions) /
@@ -4056,7 +4057,7 @@ class LauncherUI(LauncherPreferencesMixin):
 						widget.configure(**{option: self.theme[role]})
 					except tk.TclError:
 						pass
-			if isinstance(widget, GameOptionMenu):
+			if isinstance(widget, (GameOptionMenu, ThemedOptionMenu)):
 				style_option_menu(widget, self.theme)
 			if isinstance(widget, StoneButton):
 				widget.redraw()
@@ -4075,6 +4076,12 @@ class LauncherUI(LauncherPreferencesMixin):
 		for surface in self.surfaces:
 			if not surface.dead:
 				surface.schedule()
+
+		# Parent surfaces must finish adopting the palette before their button
+		# backdrop crops are repainted; otherwise old corners persist until hover.
+		for widget in widgets:
+			if isinstance(widget, StoneButton) and widget.winfo_exists():
+				widget.redraw()
 
 	def register_friz_fonts(self):
 		font_files = set(self.find_friz_files(resource_path("fonts")))
@@ -4625,7 +4632,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		if self.show_first_use_hint("Options",
 			"General controls startup, news, animation, and tracking. Games manages paths and launch arguments. Addons manages backups. Data provides exports and reset controls.", self.open_options):
 			return
-		self.open_preferences(StoneButton, Overlay, GameOptionMenu, self.game_versions)
+		self.open_preferences(StoneButton, Overlay, ThemedOptionMenu, self.game_versions)
 
 	def open_game_options(self, parent=None, window=None):
 		extra_height = 42  # how much the panel grows for each extra row
@@ -5520,7 +5527,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		top.pack(fill="x", pady=(0, 8))
 		tk.Label(top, text="GAME CONFIG", bg=panel, fg=self.theme["accent"],
 			font=self.ui_font(15, bold=True)).pack(side="left")
-		menu = GameOptionMenu(top, selected, *paths, command=lambda _: load())
+		menu = ThemedOptionMenu(top, selected, *paths, command=lambda _: load())
 		menu.config(bg=self.theme["control"], fg=self.theme["text"],
 			font=self.ui_font(9), bd=0, highlightthickness=0)
 		style_option_menu(menu, self.theme)
@@ -5653,7 +5660,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		top.pack(fill="x", pady=(0, 12))
 		tk.Label(top, text="CHARACTER ARMORY", bg=panel, fg=self.theme["accent"],
 				 font=self.ui_font(15, bold=True)).pack(side="left")
-		version_menu = GameOptionMenu(top, version_var,
+		version_menu = ThemedOptionMenu(top, version_var,
 			*(version for version in dict.fromkeys((*GAME_VERSIONS, *self.game_versions))
 			  if version in ARMORY_VERSIONS),
 			command=lambda _value: sync_version())
@@ -5677,7 +5684,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		tk.Label(region_box, text="Region", bg=self.theme["surface"], fg=self.theme["muted"],
 			font=self.ui_font(8, bold=True), anchor="w").pack(anchor="w", pady=(0, 6))
 		region_var = tk.StringVar(value=saved.get("region", "us") if saved.get("region", "us") in REGIONS else "us")
-		region_entry = GameOptionMenu(region_box, region_var, *REGIONS)
+		region_entry = ThemedOptionMenu(region_box, region_var, *REGIONS)
 		region_entry.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
 			font=self.ui_font(9), relief="flat", bd=0, highlightthickness=0, padx=10, pady=5)
@@ -5712,7 +5719,7 @@ class LauncherUI(LauncherPreferencesMixin):
 		library_row = tk.Frame(saved_card, bg=self.theme["surface"])
 		library_row.pack(fill="x")
 		saved_var = tk.StringVar(value="No saved characters")
-		character_picker = GameOptionMenu(library_row, saved_var, "No saved characters")
+		character_picker = ThemedOptionMenu(library_row, saved_var, "No saved characters")
 		character_picker.config(bg=self.theme["control"], fg=self.theme["text"],
 			activebackground=self.theme["control_active"], activeforeground=self.theme["bright"],
 			relief="flat", bd=0, highlightthickness=0, anchor="w", font=self.ui_font(9), padx=8, pady=5)

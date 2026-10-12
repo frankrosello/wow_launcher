@@ -109,8 +109,12 @@ class Overlay(tk.Frame):
 
 	def __init__(self, root, width, height, reuse_scrim=None):
 		root.update_idletasks()
-		width = min(width, max(200, root.winfo_width() - 20))
-		height = min(height, max(200, root.winfo_height() - 20))
+		chrome = getattr(getattr(root, "launcher", None), "window_chrome", None)
+		self._safe_side = chrome.BORDER + 8 if chrome is not None else 10
+		self._safe_top = chrome.BORDER + 44 if chrome is not None else 10
+		self._safe_bottom = chrome.BORDER + 8 if chrome is not None else 10
+		width = min(width, max(200, root.winfo_width() - self._safe_side*2))
+		height = min(height, max(200, root.winfo_height() - self._safe_top-self._safe_bottom))
 		# A panel opened over another panel shares its blurred backdrop instead of
 		# photographing the screen again (which would blur and darken it twice).
 		self.owns_scrim = reuse_scrim is None
@@ -123,7 +127,10 @@ class Overlay(tk.Frame):
 		self.fill = theme.get("panel", "#211c18")
 		self.edge = _blend(self.fill, theme.get("border", "#806b42"), .32)
 		super().__init__(root, bg=OVERLAY_BG)
-		self.place(relx=.5, rely=.5, anchor="center", width=width, height=height)
+		left = (root.winfo_width()-width)//2
+		top = self._safe_top+(root.winfo_height()-self._safe_top-self._safe_bottom-height)//2
+		self.panel_origin = (left,top)
+		self.place(x=left,y=top,width=width,height=height)
 		self.lift()
 		self.canvas = tk.Canvas(self, bg=OVERLAY_BG, highlightthickness=0, bd=0)
 		self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
@@ -163,10 +170,16 @@ class Overlay(tk.Frame):
 			shot = Image.blend(shot, Image.new("RGB", size, (8, 8, 10)), .55)
 			scrim._image = shot
 			scrim._photo = ImageTk.PhotoImage(shot, master=scrim)
+			chrome = getattr(getattr(root,"launcher",None),"window_chrome",None)
+			if chrome is not None:
+				b = chrome.BORDER
+				scrim._photo = ImageTk.PhotoImage(shot.crop((b,b,size[0]-b,size[1]-b)),master=scrim)
 			scrim.configure(image=scrim._photo)
 		except Exception:
 			pass  # no screen capture available: the plain dark layer is used instead
-		scrim.place(x=0, y=0, relwidth=1, relheight=1)
+		chrome = getattr(getattr(root,"launcher",None),"window_chrome",None)
+		b = chrome.BORDER if chrome is not None else 0
+		scrim.place(x=b,y=b,relwidth=1,relheight=1,width=-2*b,height=-2*b)
 		scrim.lift()
 		return scrim
 
@@ -174,7 +187,7 @@ class Overlay(tk.Frame):
 		"""Paint blurred launcher + rounded shadow + rounded bordered panel in one image."""
 		width, height = self.panel_size
 		root_width, root_height = self.root_size
-		left, top = (root_width - width) // 2, (root_height - height) // 2
+		left, top = self.panel_origin
 		try:
 			from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 			shot = getattr(self.scrim, "_image", None)
@@ -223,9 +236,11 @@ class Overlay(tk.Frame):
 				pass
 
 	def resize(self, height):
-		height = min(height, self.master.winfo_height() - 20)
-		self.panel_size = (self.panel_size[0], height)
-		self.place_configure(height=height)
+		height = min(height,self.master.winfo_height()-self._safe_top-self._safe_bottom)
+		self.panel_size = (self.panel_size[0],height)
+		top = self._safe_top+(self.master.winfo_height()-self._safe_top-self._safe_bottom-height)//2
+		self.panel_origin = (self.panel_origin[0],top)
+		self.place_configure(height=height,y=top)
 		self.build_backdrop()
 
 	def protocol(self, name=None, handler=None):

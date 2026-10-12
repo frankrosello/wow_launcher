@@ -39,6 +39,7 @@ class StoneWindowChrome:
         self._native_deiconify = root.deiconify
         root.resizable(False, False)
         root.overrideredirect(True)
+        self._apply_macos_style()
         root.geometry('1128x728')  # Original 1100x700 content plus frame/title bar.
         root.minsize(888, 608)
         self.canvas = tk.Canvas(root, bg=STONE_DARK, bd=0, highlightthickness=0)
@@ -95,6 +96,16 @@ class StoneWindowChrome:
         root.iconify = self.minimize
         root.deiconify = self.deiconify
         self.redraw()
+
+    def _apply_macos_style(self):
+        if sys.platform != 'darwin':
+            return
+        try:
+            # Set Aqua's actual window style as well as Tk override-redirect.
+            # This must be applied before the first map and after restoring.
+            self.root.tk.call('::tk::unsupported::MacWindowStyle','style',self.root._w,'document',('noTitleBar',))
+        except tk.TclError:
+            pass
 
     def _apply_windows_taskbar(self):
         """Use Tk's borderless mode; keep its native wrapper in the taskbar."""
@@ -488,6 +499,7 @@ class StoneWindowChrome:
             return
         if not self.root.overrideredirect():
             self.root.overrideredirect(True)
+        self._apply_macos_style()
         if os.name == 'nt':
             self._apply_windows_taskbar()
         self._apply_window_shape()
